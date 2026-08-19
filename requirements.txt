@@ -1,2 +1,4 @@
-numpy
-pandas
+# 研究/回放模式不依赖第三方数值框架。
+# 推荐使用：pip install -e ".[dev]"
+pytest>=8,<10
+tomli>=2.0; python_version < "3.11"

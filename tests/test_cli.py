@@ -1,0 +1,119 @@
+import pytest
+
+from afuture.cli import wait_for_fresh_snapshot
+
+
+def test_wait_for_fresh_snapshot_requires_both_generations_to_advance():
+    class FakeBroker:
+        def __init__(self):
+            self.calls = 0
+
+        def snapshot_marker(self):
+            return (2, 3)
+
+        def snapshot_ready(self, marker):
+            assert marker == (2, 3)
+            self.calls += 1
+            return self.calls >= 2
+
+    broker = FakeBroker()
+    wait_for_fresh_snapshot(broker, timeout_seconds=0.2, poll_interval=0.001)
+    assert broker.calls >= 2
+
+
+def test_wait_for_fresh_snapshot_times_out_without_complete_snapshot():
+    class FakeBroker:
+        def snapshot_marker(self):
+            return (0, 0)
+
+        def snapshot_ready(self, marker):
+            return False
+
+    with pytest.raises(RuntimeError, match="fresh CTP account/position snapshot"):
+        wait_for_fresh_snapshot(FakeBroker(), timeout_seconds=0.001, poll_interval=0.0001)
+
+
+def test_validate_recovery_positions_accepts_only_configured_balanced_pair():
+    from afuture.cli import validate_recovery_positions
+    from afuture.models import ContractPosition, PairConfig
+
+    pair = PairConfig("m_pair", "m2609", "m2701", "DCE", 1)
+    positions = [
+        ContractPosition("m2609", "DCE", long_yesterday=1),
+        ContractPosition("m2701", "DCE", short_yesterday=1),
+    ]
+
+    validate_recovery_positions([pair], positions)
+
+
+def test_validate_recovery_positions_rejects_unknown_or_unbalanced_positions():
+    from afuture.cli import validate_recovery_positions
+    from afuture.models import ContractPosition, PairConfig
+
+    pair = PairConfig("m_pair", "m2609", "m2701", "DCE", 1)
+    with pytest.raises(RuntimeError, match="not configured"):
+        validate_recovery_positions(
+            [pair], [ContractPosition("rb2610", "SHFE", long_today=1)]
+        )
+    with pytest.raises(RuntimeError, match="not a configured balanced spread"):
+        validate_recovery_positions(
+            [pair], [ContractPosition("m2609", "DCE", long_today=1)]
+        )
+
+
+def test_adopt_recovery_state_keeps_kill_switch_for_second_reconciliation(tmp_path):
+    from afuture.cli import adopt_recovery_state
+    from afuture.models import AccountSnapshot, ContractPosition
+    from afuture.state import RuntimeState, StateStore
+
+    store = StateStore(tmp_path / "state.json")
+    state = RuntimeState(
+        kill_switch=True,
+        kill_reason="position reconciliation failed",
+        trading_day="20260819",
+        day_start_equity=500000,
+        equity_high_watermark=520000,
+    )
+    account = AccountSnapshot(500000, 500000, 400000, 100000, 0, 0, "20260820")
+    positions = [ContractPosition("m2609", "DCE", long_yesterday=1)]
+
+    adopt_recovery_state(store, state, account, positions)
+
+    saved = store.load()
+    assert saved.kill_switch
+    assert not saved.reconciled
+    assert saved.trading_day == "20260820"
+    assert saved.day_start_equity == 500000
+    assert saved.equity_high_watermark == 520000
+    assert store.positions_from_state(saved)[0].long_yesterday == 1
+
+
+def test_drain_after_halt_waits_until_active_orders_are_gone():
+    from afuture.cli import drain_after_halt
+
+    class FakeBroker:
+        def __init__(self):
+            self.active = [type("Order", (), {"order_id": "o1"})()]
+            self.cancelled = []
+
+        def get_active_orders(self):
+            return list(self.active)
+
+        def cancel_order(self, order_id):
+            self.cancelled.append(order_id)
+
+    class FakeEngine:
+        def __init__(self, broker):
+            self.broker = broker
+            self.calls = 0
+
+        def run_once(self):
+            self.calls += 1
+            self.broker.active.clear()
+
+    broker = FakeBroker()
+    engine = FakeEngine(broker)
+
+    assert drain_after_halt(engine, broker, timeout_seconds=0.1, poll_interval=0.001)
+    assert broker.cancelled == ["o1"]
+    assert engine.calls >= 1

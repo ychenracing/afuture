@@ -1,29 +1,51 @@
-"""
-期货行情数据模块。
+"""CSV 行情读取与回放数据校验。"""
 
-当前阶段用于研究和回测，支持读取标准化后的历史行情数据。
-后续可以接入交易所行情接口。
-"""
+from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List
+import csv
+from datetime import datetime
+from pathlib import Path
 
-
-@dataclass
-class FuturesBar:
-    """期货K线数据。"""
-
-    date: str
-    contract: str
-    close: float
+from .models import Tick
 
 
-class MarketData:
-    """市场数据读取接口。"""
+_REQUIRED_COLUMNS = {
+    "timestamp",
+    "symbol",
+    "exchange",
+    "bid_price",
+    "ask_price",
+    "last_price",
+    "bid_volume",
+    "ask_volume",
+    "trading_day",
+}
 
-    def __init__(self, bars: List[FuturesBar]):
-        self.bars = bars
 
-    def prices(self, contract: str):
-        """获取指定合约收盘价序列。"""
-        return [bar.close for bar in self.bars if bar.contract == contract]
+def read_ticks(path: str | Path) -> list[Tick]:
+    """读取标准化 Tick CSV，并按时间排序。"""
+    path = Path(path)
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        missing = _REQUIRED_COLUMNS - set(reader.fieldnames or [])
+        if missing:
+            raise ValueError(f"missing columns: {sorted(missing)}")
+        ticks = [
+            Tick(
+                symbol=row["symbol"],
+                exchange=row["exchange"],
+                timestamp=datetime.fromisoformat(row["timestamp"]),
+                bid_price=float(row["bid_price"]),
+                ask_price=float(row["ask_price"]),
+                last_price=float(row["last_price"]),
+                bid_volume=float(row["bid_volume"]),
+                ask_volume=float(row["ask_volume"]),
+                trading_day=row["trading_day"],
+                limit_up=float(row.get("limit_up") or 0.0),
+                limit_down=float(row.get("limit_down") or 0.0),
+            )
+            for row in reader
+        ]
+    for tick in ticks:
+        tick.validate()
+    return sorted(ticks, key=lambda item: item.timestamp)

@@ -1,0 +1,76 @@
+# 安全失败的 CTP 测试柜台模板。复制为 config/live.toml 后再填写真实参数。
+# 本文件故意不填写 expiry_near/expiry_far；未补齐真实最后交易日前，validate 会拒绝通过。
+
+[system]
+mode = "live"
+initial_capital = 500000
+
+[ctp]
+environment = "test"
+td_address = "tcp://replace-with-broker-td-front"
+md_address = "tcp://replace-with-broker-md-front"
+
+[risk]
+max_margin_ratio = 0.35
+max_daily_loss_ratio = 0.01
+max_total_drawdown_ratio = 0.08
+max_open_pairs = 2
+max_contract_volume = 4
+max_quote_age_seconds = 5
+expiry_blackout_days = 5
+min_available_ratio = 0.50
+margin_estimate_buffer = 1.20
+max_orders_per_minute = 20
+
+[execution]
+slippage_ticks = 0
+aggressive_ticks = 1
+auto_flatten_imbalance = true
+legging_timeout_seconds = 2.0
+
+[paths]
+state = "runtime/live_state.json"
+log = "runtime/afuture-live.log"
+report = "runtime/live_report.json"
+journal = "runtime/live_audit.jsonl"
+
+# 以下静态参数只是结构示例，实盘前必须按期货公司当前参数替换。
+[[contracts]]
+symbol = "m2609"
+exchange = "DCE"
+multiplier = 10
+price_tick = 1
+margin_rate_long = 0.15
+margin_rate_short = 0.15
+
+[contracts.fee]
+open_fixed = 2.0
+close_fixed = 2.0
+close_today_fixed = 2.0
+
+[[contracts]]
+symbol = "m2701"
+exchange = "DCE"
+multiplier = 10
+price_tick = 1
+margin_rate_long = 0.15
+margin_rate_short = 0.15
+
+[contracts.fee]
+open_fixed = 2.0
+close_fixed = 2.0
+close_today_fixed = 2.0
+
+[[pairs]]
+pair_id = "m_calendar"
+near_symbol = "m2609"
+far_symbol = "m2701"
+exchange = "DCE"
+volume = 1
+lookback = 60
+entry_z = 2.0
+exit_z = 0.5
+stop_z = 4.0
+sample_seconds = 30
+# expiry_near = "请替换为真实最后交易日，格式 YYYY-MM-DD"
+# expiry_far = "请替换为真实最后交易日，格式 YYYY-MM-DD"

@@ -1,0 +1,67 @@
+[system]
+mode = "replay"
+initial_capital = 500000
+
+[risk]
+max_margin_ratio = 0.35
+max_daily_loss_ratio = 0.01
+max_total_drawdown_ratio = 0.08
+max_open_pairs = 2
+max_contract_volume = 4
+max_quote_age_seconds = 5
+expiry_blackout_days = 5
+min_available_ratio = 0.50
+margin_estimate_buffer = 1.20
+max_orders_per_minute = 20
+
+[execution]
+slippage_ticks = 0
+aggressive_ticks = 1
+auto_flatten_imbalance = true
+legging_timeout_seconds = 2.0
+
+[paths]
+state = "runtime/replay_state.json"
+log = "runtime/afuture.log"
+report = "runtime/replay_report.json"
+journal = "runtime/audit.jsonl"
+
+# 以下参数仅用于示例回放，不代表当前交易所或期货公司的实时保证金和手续费。
+# 实盘前必须用开户期货公司的最新参数逐项替换。
+[[contracts]]
+symbol = "m2609"
+exchange = "DCE"
+multiplier = 10
+price_tick = 1
+margin_rate_long = 0.15
+margin_rate_short = 0.15
+
+[contracts.fee]
+open_fixed = 2.0
+close_fixed = 2.0
+close_today_fixed = 2.0
+
+[[contracts]]
+symbol = "m2701"
+exchange = "DCE"
+multiplier = 10
+price_tick = 1
+margin_rate_long = 0.15
+margin_rate_short = 0.15
+
+[contracts.fee]
+open_fixed = 2.0
+close_fixed = 2.0
+close_today_fixed = 2.0
+
+[[pairs]]
+pair_id = "m_calendar"
+near_symbol = "m2609"
+far_symbol = "m2701"
+exchange = "DCE"
+volume = 1
+lookback = 3
+entry_z = 2.0
+exit_z = 1.0
+stop_z = 5.0
+sample_seconds = 30
