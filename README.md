@@ -1,40 +1,64 @@
 # afuture
 
-A futures arbitrage research and execution framework.
+个人期货套利研究系统。
 
-## Current scope
+本项目目标是构建一个适合个人投资者使用的期货套利平台，优先保证研究可靠性、风险控制和长期稳定性。
 
-The first version focuses on:
+当前阶段定位：研究系统和模拟交易基础，不直接连接真实账户自动交易。
 
-- Chinese futures calendar spread statistical arbitrage
-- Spread calculation and z-score signals
-- Backtest framework with fees and slippage placeholders
-- Risk controls for small accounts
-- Simulation-first architecture
+## 当前已实现功能
 
-This project is designed for research and paper trading first. It is not a live trading system yet.
+### 第一阶段：基础框架
 
-## Strategy
+- 价差计算
+- Z-score信号计算
+- 基础回测框架
+- 基础资金风险限制
 
-Initial strategy:
+### 第二阶段：研究系统
 
-1. Select two contracts of the same commodity.
-2. Build price spread.
-3. Calculate rolling mean and standard deviation.
-4. Open when spread deviates from historical range.
-5. Close when spread returns toward equilibrium.
+新增：
 
-## Risk principles
+- 标准化期货行情数据结构
+- 跨期套利数据接口
+- 商品期货跨期统计套利策略
+- 均值回归信号生成
 
-- Never use full margin.
-- Keep sufficient cash reserve.
-- Limit single commodity exposure.
-- Validate with realistic fees and slippage before live trading.
+## 核心策略
 
-## Roadmap
+当前主要研究方向：
 
-- Add CTP market data adapter
-- Add paper trading engine
-- Add order management
-- Add portfolio level risk control
-- Add production reports
+### 商品期货跨期套利
+
+例如：
+
+- 豆粕近月与远月
+- 螺纹钢近月与远月
+- PTA近月与远月
+
+基本流程：
+
+1. 获取同品种不同月份合约价格。
+2. 计算合约价差。
+3. 使用历史均值和波动判断异常。
+4. 价差极端偏离时产生套利信号。
+5. 价差恢复后退出。
+
+## 风控原则
+
+- 不满仓使用保证金。
+- 保留充足现金。
+- 限制单品种风险。
+- 实盘前必须验证手续费、滑点和成交影响。
+- 优先保证长期稳定，不追求高杠杆收益。
+
+## 项目规划
+
+后续计划：
+
+- 接入国内期货行情接口
+- 增加模拟交易环境
+- 增加订单管理模块
+- 增加组合风险控制
+- 增加交易报告系统
+- 最终支持小资金实盘运行
