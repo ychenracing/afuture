@@ -28,5 +28,5 @@ jobs:
           name: two-year-real-data-probe
           path: |
             runtime/realdata_probe.json
-            runtime/two_year_exchange_daily.csv
+            runtime/two_year_specific_contract_daily.csv
           retention-days: 7
