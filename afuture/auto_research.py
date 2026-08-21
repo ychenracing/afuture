@@ -60,6 +60,10 @@ class AutoPortfolioResearchResult:
 class AutoPortfolioRunner:
     """严格按时间顺序选择全局参数，并用完整 Auto 交易链执行 OOS。"""
 
+    # 这是研究搜索上限，不是生产默认值。它防止“为了命中收益目标”无边界放大杠杆。
+    MAX_RESEARCH_RISK_BUDGET = 0.02
+    MAX_RESEARCH_PAIR_VOLUME = 20
+
     def __init__(self, base_config) -> None:
         if not base_config.auto.enabled:
             raise ValueError("accept-auto requires auto.enabled=true")
@@ -71,8 +75,8 @@ class AutoPortfolioRunner:
     ) -> list[dict]:
         """返回预先限定的小型全局参数邻域，不做高维全空间搜索。
 
-        风险参数和仓位参数不参与收益优化；这里只对少量信号/候选参数做单变量邻域扰动，
-        让 Calibrator 能选择稳定区域，同时避免商品逐个调参造成自由度爆炸。
+        默认 CLI 不优化风险参数；两年真实数据研究可以显式传入受上限约束的
+        ``risk_budget_ratio``/``max_pair_volume``，并且仍只能用 Train+Validation 选择。
         """
         if research.parameter_grid:
             return [dict(row) for row in research.parameter_grid]
@@ -159,6 +163,8 @@ class AutoPortfolioRunner:
                     "min_net_edge",
                     "min_stationarity_score",
                     "max_half_life",
+                    "risk_budget_ratio",
+                    "max_pair_volume",
                 )
                 if key in selected
             }
@@ -300,12 +306,30 @@ class AutoPortfolioRunner:
                 engine.stop()
 
     def _config_with_parameters(self, parameters: dict):
-        allowed = {
+        """应用离线研究参数；风险缩放有硬上限，不能通过无边界杠杆追收益。"""
+        auto_values = {
             key: value
             for key, value in parameters.items()
             if key in self.base.auto.__dataclass_fields__
         }
-        return replace(self.base, auto=replace(self.base.auto, **allowed))
+        if "max_pair_volume" in auto_values:
+            volume = int(auto_values["max_pair_volume"])
+            if volume <= 0 or volume > self.MAX_RESEARCH_PAIR_VOLUME:
+                raise ValueError("research max_pair_volume is outside bounded range")
+            auto_values["max_pair_volume"] = volume
+
+        risk_values = {}
+        if "risk_budget_ratio" in parameters:
+            ratio = float(parameters["risk_budget_ratio"])
+            if ratio <= 0 or ratio > self.MAX_RESEARCH_RISK_BUDGET:
+                raise ValueError("research risk_budget_ratio is outside bounded range")
+            risk_values["risk_budget_ratio"] = ratio
+
+        return replace(
+            self.base,
+            auto=replace(self.base.auto, **auto_values),
+            risk=replace(self.base.risk, **risk_values),
+        )
 
     @staticmethod
     def _parameter_row(auto) -> dict:
@@ -380,11 +404,10 @@ class AutoPortfolioRunner:
             grouped[(item.product.lower(), item.exchange.upper())].append(item)
         far_symbols: set[str] = set()
         for rows in grouped.values():
-            ordered = sorted(rows, key=lambda item: (item.expiry, item.symbol))
-            far_symbols.update(item.symbol for item in ordered[1:])
-        delta = timedelta(seconds=max(0.0, float(seconds)))
+            rows.sort(key=lambda item: item.expiry)
+            far_symbols.update(item.symbol for item in rows[1:])
         return [
-            replace(row, timestamp=row.timestamp + delta)
+            replace(row, timestamp=row.timestamp + timedelta(seconds=seconds))
             if row.symbol in far_symbols
             else row
             for row in ticks
@@ -392,17 +415,22 @@ class AutoPortfolioRunner:
 
     @staticmethod
     def _remove_activity(ticks: list[Tick], ratio: float) -> list[Tick]:
-        """确定性制造少量 volume/OI 缺失，验证 selector 会安全拒绝而不是猜测。"""
         if ratio <= 0:
             return list(ticks)
         every = max(2, int(round(1.0 / ratio)))
+        counters: dict[str, int] = defaultdict(int)
         result: list[Tick] = []
-        for index, row in enumerate(sorted(ticks, key=lambda item: (item.timestamp, item.symbol)), start=1):
-            if index % every == 0:
+        for row in sorted(ticks, key=lambda item: (item.timestamp, item.symbol)):
+            counters[row.symbol] += 1
+            if counters[row.symbol] % every == 0:
                 result.append(replace(row, volume=0.0, open_interest=0.0))
             else:
                 result.append(row)
         return result
+
+    @staticmethod
+    def _ratio_key(value: float) -> str:
+        return f"{float(value):.6g}"
 
     @staticmethod
     def _slice(ticks: list[Tick], days: list[str]) -> list[Tick]:
@@ -435,10 +463,6 @@ class AutoPortfolioRunner:
         }
 
     @staticmethod
-    def _ratio_key(value: float) -> str:
-        return f"{float(value):.4g}"
-
-    @staticmethod
     def _validate(config: AutoPortfolioResearchConfig) -> None:
         if any(value <= 0 for value in (config.train_days, config.validation_days, config.oos_days, config.step_days)):
             raise ValueError("auto walk-forward windows must be positive")
@@ -448,7 +472,7 @@ class AutoPortfolioRunner:
             raise ValueError("depth haircuts must be within (0, 1]")
         if any(value < 0 for value in config.extra_latency_ticks + config.extra_impact_ticks):
             raise ValueError("latency/impact stress cannot be negative")
-        if any(not 0 < value < 1 for value in config.data_gap_rates + config.activity_missing_rates):
-            raise ValueError("data gap/activity missing rates must be within (0, 1)")
+        if any(not 0 <= value < 1 for value in config.data_gap_rates + config.activity_missing_rates):
+            raise ValueError("data/activity stress ratios must be within [0, 1)")
         if any(value < 0 for value in config.quote_skew_seconds):
             raise ValueError("quote skew stress cannot be negative")
