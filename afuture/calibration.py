@@ -9,6 +9,14 @@ from __future__ import annotations
 class ParameterCalibrator:
     """按邻域风险调整分选择稳定参数。"""
 
+    _EXTENDED_RESEARCH_KEYS = (
+        "min_net_edge",
+        "min_stationarity_score",
+        "max_half_life",
+        "risk_budget_ratio",
+        "max_pair_volume",
+    )
+
     def __init__(
         self, neighbor_radius: float = 0.20, min_neighbors: int = 2
     ) -> None:
@@ -28,16 +36,28 @@ class ParameterCalibrator:
     ) -> dict | None:
         """返回稳定区域中心；多个候选均孤立时拒绝选出历史尖峰。
 
-        默认保持原有相对距离邻域语义。研究参数网格可显式启用 ``grid_adjacency``：
-        只有在一个参数轴上相邻的点才属于同一局部区域，并要求中心与周围点同时表现
-        足够好。这样不同量纲的 Net Edge、半衰期和风险预算不会被错误忽略。
+        默认保留原有相对距离邻域语义。显式启用 ``grid_adjacency`` 时，只有在一个
+        参数轴上相邻的点才属于同一局部区域。对于 Auto Portfolio 的 Quality/Risk
+        阶段，只要扩展研究维度实际发生变化，也自动使用网格邻接并要求至少两个
+        周围参数点，避免这些维度被旧的四参数邻域规则静默忽略。
         """
         if not results:
             return None
         if len(results) == 1:
             return results[0]
-        if grid_adjacency:
-            return self._select_best_grid(results, parameter_keys)
+
+        auto_grid = self._extended_grid_varies(results)
+        if grid_adjacency or auto_grid:
+            required_neighbors = (
+                self.min_neighbors
+                if grid_adjacency
+                else max(self.min_neighbors, 3)
+            )
+            return self._select_best_grid(
+                results,
+                parameter_keys,
+                required_neighbors=required_neighbors,
+            )
 
         stable_candidates: list[tuple[float, float, dict]] = []
         for row in results:
@@ -62,10 +82,12 @@ class ParameterCalibrator:
         self,
         results: list[dict],
         parameter_keys: tuple[str, ...] | None,
+        *,
+        required_neighbors: int,
     ) -> dict | None:
         keys = self._grid_keys(results, parameter_keys)
         if not keys:
-            return self.select_best(results)
+            return None
         axes = {
             key: sorted({float(row[key]) for row in results})
             for key in keys
@@ -77,7 +99,7 @@ class ParameterCalibrator:
                 for other in results
                 if self._grid_neighbor(row, other, keys, axes)
             ]
-            if len(neighbors) < self.min_neighbors:
+            if len(neighbors) < required_neighbors:
                 continue
             support = [other for other in neighbors if other is not row]
             if not support:
@@ -86,7 +108,7 @@ class ParameterCalibrator:
             support_score = sum(
                 self._risk_adjusted(item) for item in support
             ) / len(support)
-            # 中心点本身和周围点必须同时成立；单点尖峰不能靠自身高分抬高稳定分。
+            # 中心和邻域必须同时成立；单点尖峰不能用自身高分抬高稳定分。
             stability_score = min(own_score, support_score)
             stable_candidates.append(
                 (stability_score, len(support), support_score, row)
@@ -97,6 +119,15 @@ class ParameterCalibrator:
             stable_candidates,
             key=lambda item: (item[0], item[1], item[2]),
         )[3]
+
+    @classmethod
+    def _extended_grid_varies(cls, results: list[dict]) -> bool:
+        for key in cls._EXTENDED_RESEARCH_KEYS:
+            if not all(key in row for row in results):
+                continue
+            if len({float(row[key]) for row in results}) > 1:
+                return True
+        return False
 
     @staticmethod
     def _grid_keys(
