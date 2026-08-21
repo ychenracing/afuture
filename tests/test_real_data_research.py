@@ -69,6 +69,33 @@ def test_daily_bar_conversion_uses_open_and_lagged_activity_without_lookahead():
     assert current.open_interest == pytest.approx(200000)
 
 
+def test_auto_selector_excludes_contract_before_historical_listing_date():
+    from afuture.auto import AutoConfig, AutoPairSelector
+    from afuture.models import ContractInfo
+
+    selector = AutoPairSelector(
+        AutoConfig(
+            enabled=True,
+            products=("m",),
+            exchanges=("DCE",),
+            max_contracts_per_product=3,
+            min_days_to_expiry=0,
+        )
+    )
+    catalog = [
+        ContractInfo("M2505", "DCE", "m", "2025-05-20", listing="2024-01-01"),
+        ContractInfo("M2509", "DCE", "m", "2025-09-20", listing="2024-06-01"),
+        ContractInfo("M2601", "DCE", "m", "2026-01-20", listing="2025-03-01"),
+    ]
+    before = selector.build_pairs(catalog, date(2025, 2, 1))
+    assert [(row.near_symbol, row.far_symbol) for row in before] == [("M2505", "M2509")]
+    after = selector.build_pairs(catalog, date(2025, 4, 1))
+    assert [(row.near_symbol, row.far_symbol) for row in after] == [
+        ("M2505", "M2509"),
+        ("M2509", "M2601"),
+    ]
+
+
 def _research_runner():
     from dataclasses import replace
     from afuture.auto import AutoConfig
