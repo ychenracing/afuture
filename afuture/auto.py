@@ -111,7 +111,12 @@ class AutoPairSelector:
                 continue
             try:
                 expiry = date.fromisoformat(item.expiry)
+                listing = date.fromisoformat(item.listing) if item.listing else None
             except ValueError:
+                continue
+            # 实盘 CTP catalog 天然只有已挂牌合约；历史研究额外提供 listing，
+            # 防止未来才挂牌的远月提前进入当时的前 3 个候选月份。
+            if listing is not None and listing > today:
                 continue
             if (expiry - today).days < self.config.min_days_to_expiry:
                 continue
