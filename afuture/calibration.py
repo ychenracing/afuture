@@ -13,6 +13,11 @@ class ParameterCalibrator:
         "min_net_edge",
         "min_stationarity_score",
         "max_half_life",
+        "min_persistence_score",
+        "max_volatility_percentile",
+        "max_trend_shift_z",
+        "min_carry_reversal_z",
+        "carry_reversal_weight",
         "risk_budget_ratio",
         "max_pair_volume",
     )
@@ -37,9 +42,9 @@ class ParameterCalibrator:
         """返回稳定区域中心；多个候选均孤立时拒绝选出历史尖峰。
 
         默认保留原有相对距离邻域语义。显式启用 ``grid_adjacency`` 时，只有在一个
-        参数轴上相邻的点才属于同一局部区域。对于 Auto Portfolio 的 Quality/Risk
-        阶段，只要扩展研究维度实际发生变化，也自动使用网格邻接并要求至少两个
-        周围参数点，避免这些维度被旧的四参数邻域规则静默忽略。
+        参数轴上相邻的点才属于同一局部区域。对于 Auto Portfolio 的 Quality、
+        Regime/Carry、Risk 阶段，只要扩展研究维度实际发生变化，也自动使用网格邻接
+        并要求至少两个周围参数点，避免这些维度被旧的四参数邻域规则静默忽略。
         """
         if not results:
             return None
@@ -129,8 +134,9 @@ class ParameterCalibrator:
                 return True
         return False
 
-    @staticmethod
+    @classmethod
     def _grid_keys(
+        cls,
         results: list[dict],
         parameter_keys: tuple[str, ...] | None,
     ) -> tuple[str, ...]:
@@ -139,11 +145,7 @@ class ParameterCalibrator:
             "entry_z",
             "exit_z",
             "stop_z",
-            "min_net_edge",
-            "min_stationarity_score",
-            "max_half_life",
-            "risk_budget_ratio",
-            "max_pair_volume",
+            *cls._EXTENDED_RESEARCH_KEYS,
         )
         return tuple(
             key
