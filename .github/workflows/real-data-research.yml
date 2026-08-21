@@ -61,6 +61,13 @@ jobs:
               "locked_diagnostic": report["locked_diagnostic"],
           }, ensure_ascii=False, indent=2))
           PY
+      - name: 上传期限结构快速筛选证据
+        uses: actions/upload-artifact@v4
+        with:
+          name: curve-family-screening
+          path: runtime/curve_family_screening.json
+          if-no-files-found: error
+          retention-days: 14
       - name: 运行两年真实数据生产链研究
         run: >-
           python tools/run_real_two_year_research.py
@@ -94,8 +101,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: real-two-year-research
-          path: |
-            runtime/curve_family_screening.json
-            runtime/real_2y_research.json
+          path: runtime/real_2y_research.json
           if-no-files-found: error
           retention-days: 14
