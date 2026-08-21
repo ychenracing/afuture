@@ -5,7 +5,7 @@ from afuture.curve_research import (
     CurveFamilyResearch,
     CurveObservation,
 )
-from afuture.models import ContractSpec
+from afuture.models import ContractSpec, FeeSpec
 
 
 def _rows(near, far):
@@ -196,3 +196,19 @@ def test_terminal_position_is_closed_with_cost():
     gross = (105 - 104) * 10 / (104 * 10 + 100 * 10)
     assert returns["20260106"] == pytest.approx(gross - close_cost)
     assert trades >= 2
+
+
+def test_curve_fee_cost_uses_cash_fee_over_combined_notional():
+    research = _research()
+    research.specs = {
+        "N": ContractSpec(
+            "N", "DCE", 10, 1, 0.1, 0.1,
+            FeeSpec(open_fixed=5.0, close_fixed=5.0),
+        ),
+        "F": ContractSpec("F", "DCE", 10, 1, 0.1, 0.1),
+    }
+    row = CurveObservation("20260101", "N", "F", 100, 50)
+    cost = research._transaction_cost(row, 1, 0)
+    # A single turnover is one side of a round trip: half of the near leg's
+    # 10-yuan open+close schedule, normalized by both legs' gross notional.
+    assert cost == pytest.approx(5.0 / (100 * 10 + 50 * 10))
