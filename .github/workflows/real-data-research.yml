@@ -34,7 +34,7 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - name: 筛选质变型期限结构 Alpha 家族
         run: >-
-          python tools/screen_curve_families.py
+          python -m tools.screen_curve_families
           --start 2024-08-21
           --end 2026-08-20
           --cache runtime/real_2y_cache
