@@ -24,6 +24,7 @@ from .models import ContractInfo, ContractSpec, FeeSpec, Tick
 
 _CHINA_TZ = ZoneInfo("Asia/Shanghai")
 _EXECUTION_PROXY = "close +/- one price tick; historical L1 unavailable"
+_ALL_MONTHS = tuple(range(1, 13))
 
 
 @dataclass(frozen=True)
@@ -64,12 +65,29 @@ class DailyTickConversion:
 
 
 PRODUCT_DEFINITIONS: dict[str, ProductDefinition] = {
+    # 月份按交易所真实挂牌周期生成；是否进入候选由真实 volume/OI/流动性门决定，
+    # 不能在研究阶段只保留“历史上看起来最好”的主力月。
     # 手续费取公开交易所/行情页常见标准，研究另做 1.5x/2x 成本压力。
-    "m": ProductDefinition("m", "DCE", 10, 1, 0.15, 1.5, 1.5, 1.5, contract_months=(1, 5, 9)),
-    "rb": ProductDefinition("rb", "SHFE", 10, 1, 0.15, fee_rate=0.0001, contract_months=(1, 5, 10)),
-    "TA": ProductDefinition("TA", "CZCE", 5, 2, 0.15, 3.0, 3.0, 0.0, contract_months=(1, 5, 9)),
-    "c": ProductDefinition("c", "DCE", 10, 1, 0.15, 1.2, 1.2, 1.2, contract_months=(1, 3, 5, 7, 9, 11)),
-    "p": ProductDefinition("p", "DCE", 10, 2, 0.15, 2.5, 2.5, 2.5, contract_months=(1, 5, 9)),
+    "m": ProductDefinition(
+        "m", "DCE", 10, 1, 0.15, 1.5, 1.5, 1.5,
+        contract_months=(1, 3, 5, 7, 8, 9, 11, 12),
+    ),
+    "rb": ProductDefinition(
+        "rb", "SHFE", 10, 1, 0.15, fee_rate=0.0001,
+        contract_months=_ALL_MONTHS,
+    ),
+    "TA": ProductDefinition(
+        "TA", "CZCE", 5, 2, 0.15, 3.0, 3.0, 0.0,
+        contract_months=_ALL_MONTHS,
+    ),
+    "c": ProductDefinition(
+        "c", "DCE", 10, 1, 0.15, 1.2, 1.2, 1.2,
+        contract_months=(1, 3, 5, 7, 9, 11),
+    ),
+    "p": ProductDefinition(
+        "p", "DCE", 10, 2, 0.15, 2.5, 2.5, 2.5,
+        contract_months=_ALL_MONTHS,
+    ),
 }
 
 
@@ -79,7 +97,6 @@ def parse_sina_daily_jsonp(payload: str, symbol: str) -> list[DailyBar]:
     left = payload.find("(")
     right = payload.rfind(")")
     if left < 0 or right <= left:
-        # 某些镜像直接返回 JSON。
         raw_text = payload.strip().rstrip(";")
     else:
         raw_text = payload[left + 1 : right]
@@ -174,7 +191,7 @@ def contract_symbols(
     warmup_days: int = 365,
     far_month_buffer: int = 8,
 ) -> list[str]:
-    """生成研究窗口附近的主流交割月代码，不访问未来行情。"""
+    """生成研究窗口附近的真实挂牌月代码，不访问未来行情。"""
 
     first = start - timedelta(days=max(0, warmup_days))
     last = end + timedelta(days=max(0, far_month_buffer) * 31)
@@ -224,12 +241,10 @@ def daily_bars_to_ticks(
     for row in bars:
         if row.volume <= 0 or row.open_interest <= 0:
             continue
-        # 日线没有历史 L1；用 close 左右各一 tick，随后 SimBroker 仍会再加配置滑点。
         bid = row.close - definition.price_tick
         ask = row.close + definition.price_tick
         if bid <= 0:
             continue
-        # 深度不是历史真实盘口；只让日成交量约束明显冷门合约，避免把 volume 当无限流动性。
         depth = max(1.0, min(200.0, sqrt(max(row.volume, 1.0)) / 2.0))
         timestamp = datetime.combine(row.day, time(14, 59), tzinfo=_CHINA_TZ)
         tick = Tick(
@@ -254,7 +269,7 @@ def infer_contract_info(
     bars_by_symbol: dict[str, list[DailyBar]],
     definitions: dict[str, ProductDefinition] | None = None,
 ) -> list[ContractInfo]:
-    """用合约真实最后有行情日期作为研究 expiry，避免硬编码未来最后交易日。"""
+    """用合约真实最后有行情日期作为已到期合约研究 expiry。"""
 
     definitions = definitions or PRODUCT_DEFINITIONS
     result: list[ContractInfo] = []
