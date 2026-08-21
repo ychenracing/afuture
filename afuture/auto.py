@@ -157,7 +157,7 @@ class AutoPairSelector:
 
 
 class AutoPairManager:
-    """维护自动候选、有限 warm history 和非阻塞元数据缓存。"""
+    """维护自动候选、有限 warm history、候选证据和非阻塞元数据缓存。"""
 
     def __init__(
         self,
@@ -165,6 +165,7 @@ class AutoPairManager:
         *,
         sample_store: MarketSampleStore | None = None,
         metadata_prefetcher: MetadataPrefetcher | None = None,
+        evidence_recorder=None,
     ) -> None:
         config.validate()
         self.config = config
@@ -184,6 +185,7 @@ class AutoPairManager:
         self.last_eligible_ids: set[str] = set()
         self.sample_store = sample_store
         self.metadata = metadata_prefetcher or MetadataPrefetcher(config.metadata_timeout_seconds)
+        self.evidence = evidence_recorder
 
     @property
     def initialized(self) -> bool:
@@ -347,34 +349,45 @@ class AutoPairManager:
             near = near_history[-1]
             far = far_history[-1]
             if min(near.volume, far.volume) < self.config.min_volume:
+                self._record_candidate(pair, near, far, None, None, "volume below minimum")
                 continue
             if min(near.open_interest, far.open_interest) < self.config.min_open_interest:
+                self._record_candidate(pair, near, far, None, None, "open interest below minimum")
                 continue
 
             ticks = list(near_history) + list(far_history)
             statistics = self.scanner.statistics(pair, ticks)
             if statistics is None:
+                self._record_candidate(pair, near, far, None, None, "insufficient synchronized statistics")
                 continue
             if self.scanner.entry_signal(pair, near, far, statistics) is None:
+                self._record_candidate(pair, near, far, statistics, None, "executable entry threshold not reached")
                 continue
             if statistics.stationarity_score < self.config.min_stationarity_score:
+                self._record_candidate(pair, near, far, statistics, None, "stationarity below minimum")
                 continue
             if statistics.half_life > self.config.max_half_life:
+                self._record_candidate(pair, near, far, statistics, None, "half-life above maximum")
                 continue
 
             pair_specs = self._prefetched_specs(broker, pair)
             if pair_specs is None:
-                # 首次接近开仓只安排后台查询；当前 Tick 绝不等待 CTP 元数据。
+                reason = self.metadata.error((pair.near_symbol, pair.far_symbol)) or "metadata pending"
+                self._record_candidate(pair, near, far, statistics, None, reason)
                 continue
             candidate = self.scanner.scan_pair(pair, ticks, pair_specs)
             if candidate is None:
+                self._record_candidate(pair, near, far, statistics, None, "net-edge candidate unavailable")
                 continue
             if candidate.liquidity_score < self.config.min_liquidity_score:
+                self._record_candidate(pair, near, far, statistics, candidate, "liquidity below minimum")
                 continue
             if candidate.net_edge <= self.config.min_net_edge:
+                self._record_candidate(pair, near, far, statistics, candidate, "net edge below minimum")
                 continue
             self.last_eligible_ids.add(pair.pair_id)
             scored.append((pair, candidate.score))
+            self._record_candidate(pair, near, far, statistics, candidate, "")
 
         return self.rank_candidates(scored, protected_pair_ids=protected_pair_ids)
 
@@ -387,7 +400,6 @@ class AutoPairManager:
         selected: list[PairConfig] = []
         product_counts: dict[str, int] = defaultdict(int)
 
-        # 已持仓组合优先保留“管理权”；是否还能新开仓由 last_eligible_ids 单独决定。
         for pair_id in sorted(protected_pair_ids):
             pair = self._pairs.get(pair_id)
             if pair is None or len(selected) >= self.config.max_active_pairs:
@@ -432,6 +444,23 @@ class AutoPairManager:
             "entry_std": 0.0,
             "last_sample_ts": last_ts,
         }
+
+    def _record_candidate(self, pair, near, far, statistics, candidate, reason: str) -> None:
+        if self.evidence is None:
+            return
+        self.evidence.record_candidate(
+            pair_id=pair.pair_id,
+            timestamp=max(near.timestamp, far.timestamp).isoformat(),
+            zscore=(float(statistics.zscore) if statistics is not None else None),
+            stationarity=(float(statistics.stationarity_score) if statistics is not None else None),
+            half_life=(float(statistics.half_life) if statistics is not None else None),
+            volume=float(min(near.volume, far.volume)),
+            open_interest=float(min(near.open_interest, far.open_interest)),
+            depth=float(min(near.bid_volume, near.ask_volume, far.bid_volume, far.ask_volume)),
+            expected_net_edge=(float(candidate.net_edge) if candidate is not None else None),
+            candidate_score=(float(candidate.score) if candidate is not None else None),
+            reject_reason=str(reason),
+        )
 
     def _prefetched_specs(
         self, broker, pair: PairConfig
