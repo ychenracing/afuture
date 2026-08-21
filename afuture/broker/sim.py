@@ -10,6 +10,7 @@ from ..fees import calculate_commission
 from ..models import (
     AccountSnapshot,
     BrokerEvent,
+    ContractInfo,
     ContractPosition,
     ContractSpec,
     Offset,
@@ -36,6 +37,7 @@ class SimBroker(Broker):
         conservative: bool = False,
         latency_ticks: int = 0,
         market_impact_ticks: int = 0,
+        contract_catalog: list[ContractInfo] | None = None,
     ) -> None:
         if initial_capital <= 0:
             raise ValueError("initial_capital must be positive")
@@ -45,6 +47,7 @@ class SimBroker(Broker):
         self.conservative = conservative
         self.latency_ticks = max(0, latency_ticks)
         self.market_impact_ticks = max(0, market_impact_ticks)
+        self._contract_catalog = list(contract_catalog or [])
         self.position_book = PositionBook()
         self._orders: dict[str, Order] = {}
         self._trades: list[Trade] = []
@@ -79,6 +82,9 @@ class SimBroker(Broker):
     ) -> dict[str, ContractSpec]:
         """模拟柜台直接返回本地参数，便于测试元数据安全门。"""
         return {symbol: self.specs[symbol] for symbol in symbols}
+
+    def get_contract_catalog(self) -> list[ContractInfo]:
+        return list(self._contract_catalog)
 
     def publish_tick(self, tick: Tick) -> None:
         tick.validate()

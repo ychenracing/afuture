@@ -1,0 +1,98 @@
+# 自动选标历史回放示例：使用同一 AutoPairManager 验证“发现→激活→交易→退役”。
+[system]
+mode = "replay"
+initial_capital = 500000
+
+[auto]
+enabled = true
+products = ["m"]
+exchanges = ["DCE"]
+max_active_pairs = 1
+max_pairs_per_product = 1
+max_contracts_per_product = 2
+min_days_to_expiry = 10
+scan_interval_seconds = 0
+max_sync_seconds = 2
+lookback = 3
+entry_z = 0.8
+exit_z = 0.5
+stop_z = 5.0
+max_pair_volume = 1
+sample_seconds = 0
+max_holding_samples = 20
+structural_mean_shift_z = 6.0
+structural_vol_ratio = 8.0
+legging_buffer = 0
+min_volume = 1000
+min_open_interest = 1000
+min_liquidity_score = 0.2
+min_stationarity_score = 0.0
+max_half_life = 1000
+min_net_edge = 0
+slippage_ticks = 0
+session_windows = ["09:00-11:30"]
+
+[risk]
+max_margin_ratio = 0.35
+max_daily_loss_ratio = 0.01
+max_total_drawdown_ratio = 0.08
+max_open_pairs = 1
+max_contract_volume = 3
+max_quote_age_seconds = 10
+expiry_blackout_days = 5
+min_available_ratio = 0.50
+margin_estimate_buffer = 1.20
+max_orders_per_minute = 20
+min_depth_multiple = 2
+max_bid_ask_ticks = 4
+limit_distance_ticks = 3
+risk_budget_ratio = 0.002
+risk_sigma_multiplier = 2.0
+open_cooldown_minutes = 0
+close_blackout_minutes = 0
+
+[execution]
+slippage_ticks = 0
+aggressive_ticks = 0
+auto_flatten_imbalance = true
+legging_timeout_seconds = 2
+conservative_simulation = false
+latency_ticks = 0
+market_impact_ticks = 0
+require_live_metadata = false
+metadata_timeout_seconds = 10
+
+[paths]
+state = "runtime/auto_replay_state.json"
+log = "runtime/afuture.log"
+report = "runtime/auto_replay_report.json"
+journal = "runtime/auto_replay_audit.jsonl"
+alert = "runtime/alerts.jsonl"
+
+[[contracts]]
+symbol = "m2609"
+exchange = "DCE"
+product = "m"
+expiry = "2026-09-15"
+multiplier = 10
+price_tick = 1
+margin_rate_long = 0.12
+margin_rate_short = 0.12
+[contracts.fee]
+open_fixed = 0
+close_fixed = 0
+close_today_fixed = 0
+
+[[contracts]]
+symbol = "m2701"
+exchange = "DCE"
+product = "m"
+expiry = "2027-01-15"
+multiplier = 10
+price_tick = 1
+margin_rate_long = 0.12
+margin_rate_short = 0.12
+[contracts.fee]
+open_fixed = 0
+close_fixed = 0
+close_today_fixed = 0

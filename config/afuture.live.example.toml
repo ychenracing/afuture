@@ -1,4 +1,4 @@
-# CTP 测试柜台示例。生产前必须替换合约、到期日、保证金、手续费和前置地址。
+# CTP 自动套利示例。默认只扫描少量高流动性商品品种，避免个人程序无意义订阅全市场。
 [system]
 mode = "live"
 initial_capital = 500000
@@ -7,6 +7,44 @@ initial_capital = 500000
 environment = "test"
 td_address = "tcp://YOUR_TRADE_FRONT"
 md_address = "tcp://YOUR_MARKET_FRONT"
+
+# 自动发现只负责“选哪个跨期组合”；策略、风控、下单仍走同一套正式链路。
+[auto]
+enabled = true
+# 品种白名单可以自行增删。默认保持较小，控制 CTP 订阅和元数据查询规模。
+products = ["m", "rb", "TA", "c", "p"]
+exchanges = ["DCE", "SHFE", "CZCE"]
+max_active_pairs = 2
+max_pairs_per_product = 1
+max_contracts_per_product = 3
+min_days_to_expiry = 20
+scan_interval_seconds = 30
+max_sync_seconds = 2.0
+
+# 动态组合统一使用的策略模板。
+lookback = 60
+entry_z = 2.0
+exit_z = 0.5
+stop_z = 4.0
+max_pair_volume = 3
+sample_seconds = 60
+max_holding_samples = 120
+structural_mean_shift_z = 3.0
+structural_vol_ratio = 2.5
+legging_buffer = 50
+
+# 自动候选硬门。必须同时满足活动度、流动性、均值回归和 Net Edge。
+min_volume = 5000
+min_open_interest = 10000
+min_liquidity_score = 0.5
+min_stationarity_score = 0.02
+max_half_life = 120
+min_net_edge = 100
+slippage_ticks = 1
+metadata_timeout_seconds = 15
+
+# 为保持个人系统简单，示例默认只做日盘。只有确认白名单内全部品种都匹配时再增加夜盘窗口。
+session_windows = ["09:00-10:15", "10:30-11:30", "13:30-15:00"]
 
 [risk]
 max_margin_ratio = 0.30
@@ -32,11 +70,11 @@ slippage_ticks = 1
 aggressive_ticks = 1
 auto_flatten_imbalance = true
 legging_timeout_seconds = 2.0
-# 实盘模式不使用模拟撮合参数，但保留显式值避免复制配置时遗漏。
+# 实盘不使用以下模拟撮合参数；保留显式值便于同一份配置复制到研究环境。
 conservative_simulation = true
 latency_ticks = 1
 market_impact_ticks = 1
-# 实盘应保持 true：本地参数可以更保守，但不能低估 CTP 查询到的真实风险参数。
+# 静态 pair 模式使用本地参数和 CTP 比较；auto 模式的动态合约参数直接来自 CTP。
 require_live_metadata = true
 metadata_timeout_seconds = 15
 
@@ -50,50 +88,3 @@ alert = "runtime/alerts.jsonl"
 [alert]
 # 可选通用 Webhook；留空时仍会写本地 alerts.jsonl。
 webhook = ""
-
-[[contracts]]
-symbol = "m2609"
-exchange = "DCE"
-multiplier = 10
-price_tick = 1
-# 必须使用期货公司账户真实值；可比实时查询值更高，不能更低。
-margin_rate_long = 0.15
-margin_rate_short = 0.15
-[contracts.fee]
-open_fixed = 2
-close_fixed = 2
-close_today_fixed = 2
-
-[[contracts]]
-symbol = "m2701"
-exchange = "DCE"
-multiplier = 10
-price_tick = 1
-margin_rate_long = 0.15
-margin_rate_short = 0.15
-[contracts.fee]
-open_fixed = 2
-close_fixed = 2
-close_today_fixed = 2
-
-[[pairs]]
-pair_id = "m_calendar"
-near_symbol = "m2609"
-far_symbol = "m2701"
-exchange = "DCE"
-volume = 3
-lookback = 60
-entry_z = 2.0
-exit_z = 0.5
-stop_z = 4.0
-sample_seconds = 60
-max_holding_samples = 120
-structural_mean_shift_z = 3.0
-structural_vol_ratio = 2.5
-min_net_edge = 100
-legging_buffer = 50
-risk_group = "oilseed"
-# 示例日期不是交易所权威数据；实盘前必须改成目标合约真实最后交易日。
-expiry_near = "2026-09-30"
-expiry_far = "2027-01-31"
-session_windows = ["09:00-11:30", "13:30-15:00", "21:00-23:00"]

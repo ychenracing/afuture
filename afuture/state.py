@@ -23,6 +23,7 @@ class RuntimeState:
     equity_high_watermark: float = 0.0
     positions: list[dict] = field(default_factory=list)
     strategy_states: dict[str, dict] = field(default_factory=dict)
+    auto_pairs: dict[str, dict] = field(default_factory=dict)
     runtime_mode: str = RuntimeMode.RUNNING.value
     reduce_reason: str = ""
     metadata_verified: bool = False

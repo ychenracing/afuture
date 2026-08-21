@@ -56,7 +56,27 @@ limit_up,limit_down,volume,open_interest
 - 当前方向的 Net Edge；
 - 综合候选分数。
 
-Scanner **不会自动开仓**。它属于研究层，避免把候选发现和生产交易权限绑在一起。
+命令行 `scan` 本身不会开仓；实盘 `auto` 模式会复用同一评分逻辑，但候选仍必须再进入 `TradingEngine → RiskManager → PairExecutor` 的正式权限链，Scanner 自己没有下单权限。
+
+
+## Auto 回放
+
+`replay` 也可以使用 `auto.enabled = true`，从而验证“自动选哪个组合”而不只验证单一固定 pair。历史配置中的 `[[contracts]]` 需要额外提供：
+
+```toml
+product = "m"
+expiry = "2026-09-15"
+```
+
+模拟柜台会把这些字段作为历史合约目录暴露给 `AutoPairManager`，随后使用与实盘相同的：
+
+- 到期过滤；
+- 相邻月份生成；
+- 成交量/Open Interest/盘口过滤；
+- Z-score、半衰期、平稳性和 Net Edge 排名；
+- 激活/保护已有仓位/平仓后退役。
+
+这样自动选择策略可以先在多品种历史数据上做 OOS 回放，再进入 CTP 测试柜台。实盘的合约目录仍只信任 CTP，不读取研究配置中的 expiry。
 
 ## Walk-forward
 

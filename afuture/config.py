@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 import os
 from pathlib import Path
@@ -13,7 +13,8 @@ try:
 except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib
 
-from .models import ContractSpec, FeeSpec, PairConfig
+from .auto import AutoConfig
+from .models import ContractInfo, ContractSpec, FeeSpec, PairConfig
 from .risk import RiskConfig
 
 
@@ -42,6 +43,8 @@ class AppConfig:
     journal_path: str = "runtime/audit.jsonl"
     alert_path: str = "runtime/alerts.jsonl"
     alert_webhook: str = ""
+    auto: AutoConfig = field(default_factory=AutoConfig)
+    contract_catalog: list[ContractInfo] = field(default_factory=list)
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -65,9 +68,18 @@ def load_config(path: str | Path) -> AppConfig:
         }
     )
 
-    contracts = _load_contracts(data.get("contracts", []))
+    contract_rows = data.get("contracts", [])
+    contracts = _load_contracts(contract_rows)
+    contract_catalog = _load_contract_catalog(contract_rows)
     pairs = _load_pairs(data.get("pairs", []), contracts, mode)
+    auto = _load_auto(data.get("auto", {}), mode)
+    if mode == "replay" and auto.enabled and not contract_catalog:
+        raise ValueError(
+            "replay auto mode requires contract product/expiry metadata"
+        )
     ctp = _load_ctp(data.get("ctp", {}), mode)
+    if mode == "live" and not pairs and not auto.enabled:
+        raise ValueError("live mode requires static pairs or auto.enabled=true")
 
     execution = data.get("execution", {})
     slippage_ticks = int(execution.get("slippage_ticks", 1))
@@ -124,6 +136,8 @@ def load_config(path: str | Path) -> AppConfig:
         journal_path=str(paths.get("journal", "runtime/audit.jsonl")),
         alert_path=str(paths.get("alert", "runtime/alerts.jsonl")),
         alert_webhook=str(alert.get("webhook", "")),
+        auto=auto,
+        contract_catalog=contract_catalog,
     )
 
 
@@ -158,6 +172,33 @@ def _load_contracts(rows: list[dict]) -> dict[str, ContractSpec]:
             raise ValueError(f"fee cannot be negative: {spec.symbol}")
         contracts[spec.symbol] = spec
     return contracts
+
+
+def _load_contract_catalog(rows: list[dict]) -> list[ContractInfo]:
+    """从研究配置提取自动回放所需的品种和到期日。
+
+    实盘不依赖这些字段，真实目录始终来自 CTP。
+    """
+    result: list[ContractInfo] = []
+    for raw in rows:
+        expiry = str(raw.get("expiry", "")).strip()
+        if not expiry:
+            continue
+        # 复用 ISO 日期解析，防止回放用错误到期日绕过自动过滤。
+        date.fromisoformat(expiry)
+        symbol = str(raw["symbol"])
+        product = str(raw.get("product", "")).strip()
+        if not product:
+            product = _contract_root(symbol)
+        result.append(
+            ContractInfo(
+                symbol=symbol,
+                exchange=str(raw["exchange"]).upper(),
+                product=product,
+                expiry=expiry,
+            )
+        )
+    return result
 
 
 def _load_pairs(
@@ -252,6 +293,28 @@ def _validate_session_window(pair_id: str, raw: str) -> None:
             ) from exc
     if match.group(1) == match.group(2):
         raise ValueError(f"pair {pair_id} session window cannot be zero length")
+
+
+def _load_auto(raw: dict, mode: str) -> AutoConfig:
+    """读取自动发现配置；实盘启用时必须显式给出交易时段。"""
+    values = dict(raw)
+    for name in ("products", "exchanges", "session_windows"):
+        if name in values:
+            values[name] = tuple(str(item) for item in values[name])
+    auto = AutoConfig(
+        **{
+            key: value
+            for key, value in values.items()
+            if key in AutoConfig.__dataclass_fields__
+        }
+    )
+    auto.validate()
+    if auto.enabled:
+        for window in auto.session_windows:
+            _validate_session_window("auto", window)
+        if mode == "live" and not auto.session_windows:
+            raise ValueError("auto session_windows are required in live mode")
+    return auto
 
 
 def _load_ctp(raw: dict, mode: str):

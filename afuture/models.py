@@ -82,6 +82,18 @@ class ContractSpec:
 
 
 @dataclass(frozen=True)
+class ContractInfo:
+    """用于自动发现的期货合约目录信息。
+
+    这里只保留构建跨期组合真正需要的字段，避免把 CTP SDK 对象泄漏到策略层。
+    """
+    symbol: str
+    exchange: str
+    product: str
+    expiry: str
+
+
+@dataclass(frozen=True)
 class PairConfig:
     """同品种跨期套利组合配置。
 

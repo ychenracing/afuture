@@ -216,16 +216,44 @@ def _wait_until_ready(broker, timeout_seconds: float) -> None:
         raise RuntimeError("CTP did not become ready before timeout")
 
 
-def _validate_live_metadata(config, broker) -> None:
-    """人工状态恢复同样拒绝使用低估风险的本地合约参数。"""
+def _validate_live_metadata(config, broker, extra_pairs=None) -> None:
+    """人工状态恢复同样要求柜台元数据存在；静态参数继续执行保守一致性校验。"""
     if not config.require_live_metadata:
         return
-    live_specs = broker.get_live_contract_specs(
-        list(config.contracts), config.metadata_timeout_seconds
-    )
-    decision = validate_contract_metadata(config.contracts, live_specs)
-    if not decision.allowed:
-        raise RuntimeError(decision.reason)
+    if config.contracts:
+        live_specs = broker.get_live_contract_specs(
+            list(config.contracts), config.metadata_timeout_seconds
+        )
+        decision = validate_contract_metadata(config.contracts, live_specs)
+        if not decision.allowed:
+            raise RuntimeError(decision.reason)
+
+    extra_symbols = {
+        symbol
+        for pair in (extra_pairs or [])
+        for symbol in (pair.near_symbol, pair.far_symbol)
+        if symbol not in config.contracts
+    }
+    if extra_symbols:
+        rows = broker.get_live_contract_specs(
+            sorted(extra_symbols), config.metadata_timeout_seconds
+        )
+        missing = extra_symbols - set(rows)
+        if missing:
+            raise RuntimeError(
+                f"live metadata missing for recovered auto contracts: {sorted(missing)}"
+            )
+
+
+def _auto_pairs_from_state(state) -> list[PairConfig]:
+    """把持久化动态组合恢复成 PairConfig，供人工恢复安全门复核。"""
+    result = []
+    for raw in state.auto_pairs.values():
+        row = dict(raw)
+        if "session_windows" in row:
+            row["session_windows"] = tuple(row["session_windows"])
+        result.append(PairConfig(**row))
+    return result
 
 
 def _recover_state(config, args, logger) -> int:
@@ -258,7 +286,8 @@ def _recover_state(config, args, logger) -> int:
     try:
         _wait_until_ready(broker, args.startup_timeout)
         wait_for_fresh_snapshot(broker, args.snapshot_wait)
-        _validate_live_metadata(config, broker)
+        recovery_pairs = config.pairs + _auto_pairs_from_state(state)
+        _validate_live_metadata(config, broker, recovery_pairs)
         active_orders = broker.get_active_orders()
         if active_orders:
             for order in active_orders:
@@ -277,7 +306,7 @@ def _recover_state(config, args, logger) -> int:
 
         account = broker.get_account()
         positions = broker.get_positions()
-        validate_recovery_positions(config.pairs, positions)
+        validate_recovery_positions(recovery_pairs, positions)
         adopt_recovery_state(store, state, account, positions)
         AuditJournal(config.journal_path).record(
             "manual_state_adoption",
@@ -305,6 +334,7 @@ def _build_alert_manager(config) -> AlertManager:
 
 def _run_live(config, args, logger) -> int:
     """完成柜台、快照、元数据、活动订单和持仓安全门后才进入实时循环。"""
+    from .auto import AutoPairManager
     from .broker.ctp import CtpBroker
     from .engine import TradingEngine
     from .journal import AuditJournal
@@ -324,6 +354,9 @@ def _run_live(config, args, logger) -> int:
         legging_timeout_seconds=config.legging_timeout_seconds,
         journal=AuditJournal(config.journal_path),
         alert_manager=_build_alert_manager(config),
+        auto_manager=(
+            AutoPairManager(config.auto) if config.auto.enabled else None
+        ),
         require_live_metadata=config.require_live_metadata,
         metadata_timeout_seconds=config.metadata_timeout_seconds,
     )
@@ -357,6 +390,12 @@ def _run_live(config, args, logger) -> int:
         elif not engine.reconcile_startup():
             raise RuntimeError("startup reconciliation failed")
 
+        if config.auto.enabled:
+            logger.info(
+                "CTP 已就绪，自动发现已启用：品种=%s，最多激活组合=%d",
+                ",".join(config.auto.products),
+                config.auto.max_active_pairs,
+            )
         logger.info("CTP 已就绪，元数据与持仓对账通过，交易循环启动")
         while True:
             engine.run_once()
@@ -386,6 +425,22 @@ def _run_live(config, args, logger) -> int:
     return 0
 
 
+def _research_pairs(config, ticks) -> list[PairConfig]:
+    """研究命令在 auto 模式下使用与实盘相同的相邻月份生成规则。"""
+    if not config.auto.enabled:
+        return list(config.pairs)
+    from datetime import datetime
+    from .auto import AutoPairSelector
+
+    trading_days = [str(tick.trading_day) for tick in ticks if tick.trading_day]
+    if not trading_days:
+        raise ValueError("auto research requires trading_day in tick data")
+    today = datetime.strptime(max(trading_days), "%Y%m%d").date()
+    return AutoPairSelector(config.auto).build_pairs(
+        config.contract_catalog, today
+    )
+
+
 def _parse_stress_multipliers(raw: str) -> tuple[float, ...]:
     values = tuple(float(item.strip()) for item in raw.split(",") if item.strip())
     if not values or any(value <= 0 for value in values):
@@ -413,9 +468,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "scan":
         ticks = read_ticks(args.data)
-        scanner = SpreadScanner()
+        scanner = SpreadScanner(
+            slippage_ticks=config.auto.slippage_ticks if config.auto.enabled else config.slippage_ticks,
+            max_sync_seconds=config.auto.max_sync_seconds if config.auto.enabled else 2.0,
+        )
         rows = []
-        for pair in config.pairs:
+        for pair in _research_pairs(config, ticks):
             candidate = scanner.scan_pair(pair, ticks, config.contracts)
             if candidate is not None:
                 rows.append(asdict(candidate))
@@ -425,7 +483,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "accept":
         ticks = read_ticks(args.data)
         pair = next(
-            (item for item in config.pairs if item.pair_id == args.pair), None
+            (item for item in _research_pairs(config, ticks) if item.pair_id == args.pair),
+            None,
         )
         if pair is None:
             raise ValueError(f"unknown pair: {args.pair}")

@@ -5,6 +5,7 @@ from __future__ import annotations
 from itertools import groupby
 from pathlib import Path
 
+from .auto import AutoPairManager
 from .broker.sim import SimBroker
 from .data import read_ticks
 from .engine import TradingEngine
@@ -32,6 +33,7 @@ def run_replay(config, data_path: str | Path):
         conservative=config.conservative_simulation,
         latency_ticks=config.latency_ticks,
         market_impact_ticks=config.market_impact_ticks,
+        contract_catalog=config.contract_catalog,
     )
     engine = TradingEngine(
         broker,
@@ -44,6 +46,9 @@ def run_replay(config, data_path: str | Path):
         slippage_ticks=config.slippage_ticks,
         legging_timeout_seconds=config.legging_timeout_seconds,
         journal=AuditJournal(config.journal_path),
+        auto_manager=(
+            AutoPairManager(config.auto) if config.auto.enabled else None
+        ),
         require_live_metadata=False,
         historical_mode=True,
     )

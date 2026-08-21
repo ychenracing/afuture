@@ -11,6 +11,7 @@ from datetime import datetime
 from queue import Empty, Queue
 from threading import Event
 from time import monotonic, sleep
+import re
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -18,6 +19,7 @@ from .base import Broker
 from ..models import (
     AccountSnapshot,
     BrokerEvent,
+    ContractInfo,
     ContractPosition,
     ContractSpec,
     FeeSpec,
@@ -82,6 +84,7 @@ class CtpBroker(Broker):
         self._position_snapshot_generation = 0
         self._last_account_monotonic = 0.0
         self._last_position_snapshot_monotonic = 0.0
+        self._contract_catalog: dict[str, ContractInfo] = {}
 
     def _load_runtime(self) -> dict[str, Any]:
         """延迟加载实盘依赖，并扩展完整持仓快照和费率查询回调。"""
@@ -122,6 +125,17 @@ class CtpBroker(Broker):
                 if callable(callback):
                     callback(snapshot)
 
+            def onRspQryInstrument(self, data, error, reqid, last):
+                # 先交给官方实现维护 ContractData/contract_inited，再把原始到期日暴露给 afuture。
+                super().onRspQryInstrument(data, error, reqid, last)
+                if int((error or {}).get("ErrorID", 0)) or not data:
+                    return
+                callback = getattr(
+                    self.gateway, "_afuture_contract_metadata_callback", None
+                )
+                if callable(callback):
+                    callback(dict(data))
+
             def _capture_rate(self, kind: str, data, error, reqid: int, last: bool) -> None:
                 waiter = self._afuture_rate_waiters.get(reqid)
                 if waiter is None or waiter.get("kind") != kind:
@@ -144,6 +158,7 @@ class CtpBroker(Broker):
             def __init__(self, event_engine, gateway_name):
                 super().__init__(event_engine, gateway_name)
                 self._afuture_position_snapshot_callback = None
+                self._afuture_contract_metadata_callback = None
                 # super 创建的交易 API 还未连接，直接替换不会遗留会话。
                 self.td_api = TrackedCtpTdApi(self)
 
@@ -174,6 +189,7 @@ class CtpBroker(Broker):
         if gateway is None:
             raise RuntimeError("CTP gateway could not be created")
         gateway._afuture_position_snapshot_callback = self._handle_position_snapshot
+        gateway._afuture_contract_metadata_callback = self._handle_contract_metadata
         self._event_engine.register(runtime["EVENT_TICK"], self._on_tick)
         self._event_engine.register(runtime["EVENT_ORDER"], self._on_order)
         self._event_engine.register(runtime["EVENT_TRADE"], self._on_trade)
@@ -297,6 +313,35 @@ class CtpBroker(Broker):
                 if value:
                     self._trading_day = str(value)
         return self._trading_day or datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d")
+
+    def get_contract_catalog(self) -> list[ContractInfo]:
+        """返回 CTP 合约查询得到的期货目录，供自动构建相邻月份。"""
+        return sorted(
+            self._contract_catalog.values(),
+            key=lambda item: (item.product.lower(), item.expiry, item.symbol),
+        )
+
+    def _handle_contract_metadata(self, data: dict) -> None:
+        """提取自动发现真正需要的少量字段，并过滤期权/组合合约。"""
+        symbol = str(data.get("InstrumentID", "")).strip()
+        exchange = str(data.get("ExchangeID", "")).strip().upper()
+        product = str(data.get("ProductID", "")).strip()
+        expiry_raw = str(data.get("ExpireDate", "")).strip()
+        if not symbol or not exchange or not re.fullmatch(r"[A-Za-z]{1,4}\d{3,4}", symbol):
+            return
+        if not product:
+            match = re.match(r"[A-Za-z]+", symbol)
+            product = match.group(0) if match else ""
+        try:
+            expiry = datetime.strptime(expiry_raw, "%Y%m%d").date().isoformat()
+        except ValueError:
+            return
+        self._contract_catalog[symbol] = ContractInfo(
+            symbol=symbol,
+            exchange=exchange,
+            product=product,
+            expiry=expiry,
+        )
 
     def get_live_contract_specs(self, symbols: list[str], timeout_seconds: float = 10.0) -> dict[str, ContractSpec]:
         """从 CTP/VeighNa 获取乘数、tick、保证金和手续费用于启动安全门。

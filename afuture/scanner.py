@@ -24,6 +24,16 @@ class SpreadCandidate:
     score: float
 
 
+@dataclass(frozen=True)
+class SpreadStatistics:
+    """不依赖手续费/保证金的纯行情统计预筛结果。"""
+
+    zscore: float
+    reference_mean: float
+    half_life: float
+    stationarity_score: float
+
+
 class SpreadScanner:
     """从 Tick 计算统计偏离、流动性、持仓活跃度和净边际。"""
 
@@ -31,9 +41,13 @@ class SpreadScanner:
         self,
         min_liquidity_score: float = 0.5,
         slippage_ticks: int = 1,
+        max_sync_seconds: float = 2.0,
     ) -> None:
+        if max_sync_seconds <= 0:
+            raise ValueError("max_sync_seconds must be positive")
         self.min_liquidity_score = min_liquidity_score
         self.slippage_ticks = slippage_ticks
+        self.max_sync_seconds = max_sync_seconds
 
     def filter(
         self, candidates: list[SpreadCandidate]
@@ -53,39 +67,14 @@ class SpreadScanner:
         specs: dict[str, ContractSpec],
     ) -> SpreadCandidate | None:
         """对一个同品种跨期组合生成最新研究候选。"""
-        near_by_time = {
-            tick.timestamp: tick
-            for tick in ticks
-            if tick.symbol == pair.near_symbol
-        }
-        far_by_time = {
-            tick.timestamp: tick
-            for tick in ticks
-            if tick.symbol == pair.far_symbol
-        }
-        common_times = sorted(set(near_by_time) & set(far_by_time))
-        if len(common_times) < max(3, pair.lookback):
+        synchronized = self.synchronized_ticks(pair, ticks)
+        statistics = self.statistics(pair, ticks, synchronized=synchronized)
+        if statistics is None:
             return None
-
-        spreads = [
-            near_by_time[timestamp].mid_price
-            - far_by_time[timestamp].mid_price
-            for timestamp in common_times
-        ]
-        if len(spreads) > pair.lookback:
-            history = spreads[-pair.lookback - 1 : -1]
-        else:
-            history = spreads[:-1]
-        if len(history) < 2:
-            return None
-
-        mean = sum(history) / len(history)
-        variance = sum((value - mean) ** 2 for value in history) / len(history)
-        std = sqrt(variance)
-        zscore = 0.0 if std <= 1e-12 else (spreads[-1] - mean) / std
-
-        near = near_by_time[common_times[-1]]
-        far = far_by_time[common_times[-1]]
+        spreads = [near.mid_price - far.mid_price for near, far in synchronized]
+        zscore = statistics.zscore
+        mean = statistics.reference_mean
+        near, far = synchronized[-1]
         action = (
             SignalAction.SHORT_SPREAD
             if zscore > 0
@@ -119,7 +108,8 @@ class SpreadScanner:
             -max(min(near.open_interest, far.open_interest), 0.0)
             / 10000.0
         )
-        half_life, stationarity_score = self._mean_reversion_stats(spreads)
+        half_life = statistics.half_life
+        stationarity_score = statistics.stationarity_score
 
         activity_score = (
             0.25
@@ -144,6 +134,89 @@ class SpreadScanner:
             net_edge=edge.net_edge,
             score=score,
         )
+
+    def statistics(
+        self,
+        pair: PairConfig,
+        ticks: list[Tick],
+        *,
+        synchronized: list[tuple[Tick, Tick]] | None = None,
+    ) -> SpreadStatistics | None:
+        """只用行情计算统计预筛，避免对明显无机会组合查询 CTP 费率。"""
+        synchronized = (
+            synchronized
+            if synchronized is not None
+            else self.synchronized_ticks(pair, ticks)
+        )
+        if len(synchronized) < max(3, pair.lookback):
+            return None
+        spreads = [near.mid_price - far.mid_price for near, far in synchronized]
+        history = (
+            spreads[-pair.lookback - 1 : -1]
+            if len(spreads) > pair.lookback
+            else spreads[:-1]
+        )
+        if len(history) < 2:
+            return None
+        mean = sum(history) / len(history)
+        variance = sum((value - mean) ** 2 for value in history) / len(history)
+        std = sqrt(variance)
+        zscore = 0.0 if std <= 1e-12 else (spreads[-1] - mean) / std
+        half_life, stationarity_score = self._mean_reversion_stats(spreads)
+        return SpreadStatistics(
+            zscore=zscore,
+            reference_mean=mean,
+            half_life=half_life,
+            stationarity_score=stationarity_score,
+        )
+
+    def synchronized_ticks(
+        self, pair: PairConfig, ticks: list[Tick]
+    ) -> list[tuple[Tick, Tick]]:
+        """按最近时间配对两腿行情，允许 CTP 异步推送存在小幅时间差。
+
+        同一腿不会要求时间戳完全相同；超过 ``max_sync_seconds`` 的组合仍被拒绝。
+        ``sample_seconds`` 同时用于降采样，避免高频 Tick 让统计窗口失去实际时间含义。
+        """
+        near_ticks = sorted(
+            (tick for tick in ticks if tick.symbol == pair.near_symbol),
+            key=lambda item: item.timestamp,
+        )
+        far_ticks = sorted(
+            (tick for tick in ticks if tick.symbol == pair.far_symbol),
+            key=lambda item: item.timestamp,
+        )
+        if not near_ticks or not far_ticks:
+            return []
+
+        result: list[tuple[Tick, Tick]] = []
+        far_index = 0
+        last_sample = None
+        for near in near_ticks:
+            while (
+                far_index + 1 < len(far_ticks)
+                and abs(
+                    (far_ticks[far_index + 1].timestamp - near.timestamp).total_seconds()
+                )
+                <= abs(
+                    (far_ticks[far_index].timestamp - near.timestamp).total_seconds()
+                )
+            ):
+                far_index += 1
+            far = far_ticks[far_index]
+            skew = abs((far.timestamp - near.timestamp).total_seconds())
+            if skew > self.max_sync_seconds:
+                continue
+            timestamp = max(near.timestamp, far.timestamp)
+            if (
+                last_sample is not None
+                and pair.sample_seconds > 0
+                and (timestamp - last_sample).total_seconds() < pair.sample_seconds
+            ):
+                continue
+            result.append((near, far))
+            last_sample = timestamp
+        return result
 
     @staticmethod
     def _mean_reversion_stats(values: list[float]) -> tuple[float, float]:

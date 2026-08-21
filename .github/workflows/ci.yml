@@ -30,6 +30,17 @@ jobs:
           assert report["positions"] == []
           assert report["account"]["margin"] == 0
           PY
+      - run: afuture validate --config config/afuture.auto-replay.example.toml
+      - run: afuture replay --config config/afuture.auto-replay.example.toml --data examples/auto_sample_ticks.csv
+      - name: 验证自动发现回放闭环
+        run: |
+          python - <<'PY'
+          import json
+          report = json.load(open("runtime/auto_replay_report.json", encoding="utf-8"))
+          assert report["performance"]["trade_count"] == 4
+          assert report["positions"] == []
+          assert report["account"]["margin"] == 0
+          PY
       - run: afuture scan --config config/afuture.example.toml --data examples/research_ticks.csv
       - run: >-
           afuture accept

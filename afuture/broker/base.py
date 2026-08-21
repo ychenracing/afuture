@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 
-from ..models import AccountSnapshot, BrokerEvent, ContractPosition, ContractSpec, Order, OrderRequest, Tick
+from ..models import AccountSnapshot, BrokerEvent, ContractInfo, ContractPosition, ContractSpec, Order, OrderRequest, Tick
 
 
 class Broker(ABC):
@@ -40,3 +40,7 @@ class Broker(ABC):
     def get_live_contract_specs(self, symbols: list[str], timeout_seconds: float = 10.0) -> dict[str, ContractSpec]:
         """实盘适配器应覆盖；模拟柜台直接返回本地参数。"""
         return {}
+
+    def get_contract_catalog(self) -> list[ContractInfo]:
+        """返回可用于自动发现的期货合约目录。"""
+        return []

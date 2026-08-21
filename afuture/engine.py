@@ -9,6 +9,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from .alerts import AlertManager
+from .auto import AutoPairManager
 from .execution import PairExecutor
 from .health.monitor import HealthMonitor
 from .metadata import validate_contract_metadata
@@ -53,6 +54,7 @@ class TradingEngine:
         health_monitor: HealthMonitor | None = None,
         portfolio_risk: PortfolioRiskAnalyzer | None = None,
         alert_manager: AlertManager | None = None,
+        auto_manager: AutoPairManager | None = None,
         require_live_metadata: bool = False,
         metadata_timeout_seconds: float = 10.0,
         historical_mode: bool = False,
@@ -60,7 +62,11 @@ class TradingEngine:
     ) -> None:
         self.broker = broker
         self.pairs = {pair.pair_id: pair for pair in pairs}
-        self.specs = specs
+        self.specs = dict(specs)
+        self._static_pair_ids = set(self.pairs)
+        self._static_spec_symbols = set(self.specs)
+        self._auto_pair_ids: set[str] = set()
+        self._retiring_auto_pairs: set[str] = set()
         self.risk_manager = risk_manager
         self.state_store = state_store
         self.strategies = {
@@ -69,7 +75,7 @@ class TradingEngine:
         self.executor = PairExecutor(
             broker,
             risk_manager,
-            specs,
+            self.specs,
             aggressive_ticks=aggressive_ticks,
             slippage_ticks=slippage_ticks,
         )
@@ -82,6 +88,7 @@ class TradingEngine:
         self._imbalance_since: dict[str, float] = {}
         self._initialized = False
         self._metadata_verified_session = False
+        self._metadata_trading_day = ""
         self._health_ready_since = 0.0
 
         self.journal = journal
@@ -90,6 +97,7 @@ class TradingEngine:
         )
         self.portfolio_risk = portfolio_risk or PortfolioRiskAnalyzer()
         self.alerts = alert_manager or AlertManager()
+        self.auto_manager = auto_manager
         self.require_live_metadata = require_live_metadata
         self.metadata_timeout_seconds = metadata_timeout_seconds
         self.historical_mode = historical_mode
@@ -123,6 +131,14 @@ class TradingEngine:
         if not self.broker.is_ready():
             raise RuntimeError("broker is not ready")
 
+        if self.auto_manager is not None and not self.auto_manager.initialized:
+            try:
+                self._initialize_auto_universe()
+            except Exception as exc:
+                self._initialized = True
+                self.emergency_stop(f"auto discovery initialization failed: {exc}")
+                return
+
         account = self.broker.get_account()
         self._advance_trading_day(account)
         self._health_ready_since = monotonic()
@@ -148,6 +164,7 @@ class TradingEngine:
             self.state.metadata_verified = True
             self._metadata_verified_session = True
 
+        self._metadata_trading_day = str(account.trading_day or "")
         decision = self.risk_manager.check_account(account)
         self.state.equity_high_watermark = self.risk_manager.high_watermark
         self._initialized = True
@@ -159,10 +176,17 @@ class TradingEngine:
     def _validate_live_metadata(self) -> RiskDecision:
         """从柜台刷新合约参数；任何查询异常都按失败关闭处理。"""
         try:
+            if not self._static_spec_symbols:
+                return RiskDecision(True)
+            configured = {
+                symbol: self.specs[symbol]
+                for symbol in self._static_spec_symbols
+            }
             live_specs = self.broker.get_live_contract_specs(
-                list(self.specs), self.metadata_timeout_seconds
+                sorted(self._static_spec_symbols),
+                self.metadata_timeout_seconds,
             )
-            return validate_contract_metadata(self.specs, live_specs)
+            return validate_contract_metadata(configured, live_specs)
         except Exception as exc:
             return RiskDecision(
                 False, f"live metadata query failed: {exc}"
@@ -223,6 +247,8 @@ class TradingEngine:
         try:
             tick.validate()
             self.quotes[tick.symbol] = tick
+            if self.auto_manager is not None:
+                self.auto_manager.observe(tick)
             if self.halted or self.state.runtime_mode != RuntimeMode.RUNNING.value:
                 return
 
@@ -233,7 +259,8 @@ class TradingEngine:
                 self.emergency_stop(decision.reason)
                 return
 
-            for pair_id, pair in self.pairs.items():
+            self._refresh_auto_pairs(tick.timestamp)
+            for pair_id, pair in list(self.pairs.items()):
                 if tick.symbol not in {pair.near_symbol, pair.far_symbol}:
                     continue
                 if self._pair_has_active_orders(pair_id):
@@ -261,6 +288,9 @@ class TradingEngine:
                     SignalAction.LONG_SPREAD,
                     SignalAction.SHORT_SPREAD,
                 }
+                if opening and pair_id in self._retiring_auto_pairs:
+                    self.strategies[pair_id].set_position(0)
+                    continue
                 if opening:
                     portfolio_decision = self.portfolio_risk.allow_open(
                         pair_id,
@@ -346,6 +376,7 @@ class TradingEngine:
         self._audit_pair_balance()
         if self.state.runtime_mode == RuntimeMode.REDUCE_ONLY.value:
             self._reduce_only_cycle()
+        self._cleanup_retired_auto_pairs()
 
     def _handle_trade_event(self, trade) -> None:
         self._record("trade", trade)
@@ -365,6 +396,7 @@ class TradingEngine:
             )
             return
         self._audit_pair_balance()
+        self._cleanup_retired_auto_pairs()
 
     def _handle_order_event(self, order) -> None:
         self._record("order", order)
@@ -380,7 +412,26 @@ class TradingEngine:
         self._audit_pair_balance()
 
     def _handle_account_event(self, account) -> None:
+        previous_day = self._metadata_trading_day
         self._advance_trading_day(account)
+        current_day = str(account.trading_day or "")
+        if (
+            self.require_live_metadata
+            and current_day
+            and previous_day
+            and current_day != previous_day
+        ):
+            metadata_decision = self._validate_live_metadata()
+            if not metadata_decision.allowed:
+                self.state.metadata_verified = False
+                self._metadata_verified_session = False
+                self.emergency_stop(metadata_decision.reason)
+                return
+            self.state.metadata_verified = True
+            self._metadata_verified_session = True
+        if current_day:
+            self._metadata_trading_day = current_day
+
         decision = self.risk_manager.check_account(account)
         self.state.equity_high_watermark = self.risk_manager.high_watermark
         self._persist()
@@ -672,6 +723,131 @@ class TradingEngine:
         if new_day:
             self.state.trading_day = new_day
 
+    def _initialize_auto_universe(self) -> None:
+        """在 CTP 合约查询完成后初始化自动候选，并恢复持久化动态组合。"""
+        assert self.auto_manager is not None
+        today = self._trading_date()
+        restored = self.auto_manager.bootstrap(
+            self.broker, today, self.state.auto_pairs
+        )
+        for pair, pair_specs in restored:
+            self._register_auto_pair(
+                pair, pair_specs, seed_state=None, persist=False
+            )
+
+    def _trading_date(self):
+        from datetime import date
+
+        raw = str(self.broker.get_trading_day() or "")
+        try:
+            return datetime.strptime(raw, "%Y%m%d").date()
+        except ValueError:
+            return date.today()
+
+    def _refresh_auto_pairs(self, now: datetime) -> None:
+        if self.auto_manager is None or not self.auto_manager.initialized:
+            return
+        protected = self._open_auto_pair_ids()
+        try:
+            self.auto_manager.refresh_if_needed(
+                self.broker,
+                self._trading_date(),
+                retained_pairs=[
+                    self.pairs[pair_id]
+                    for pair_id in self._auto_pair_ids
+                    if pair_id in self.pairs
+                ],
+            )
+            selected = self.auto_manager.select(
+                self.broker, now=now, protected_pair_ids=protected
+            )
+        except Exception as exc:
+            self._record("auto_scan_error", {"reason": str(exc)})
+            return
+        if selected is None:
+            return
+
+        selected_ids = {pair.pair_id for pair in selected}
+        eligible_ids = set(self.auto_manager.last_eligible_ids)
+        for pair_id in protected:
+            if pair_id not in eligible_ids:
+                self._retiring_auto_pairs.add(pair_id)
+        for pair in selected:
+            self._retiring_auto_pairs.discard(pair.pair_id)
+            if pair.pair_id in self.pairs:
+                self.specs.update(self.auto_manager.pair_specs(pair))
+                continue
+            self._register_auto_pair(
+                pair,
+                self.auto_manager.pair_specs(pair),
+                seed_state=self.auto_manager.strategy_seed(pair),
+            )
+
+        for pair_id in list(self._auto_pair_ids):
+            if pair_id in selected_ids or pair_id in protected:
+                continue
+            self._unregister_auto_pair(pair_id)
+
+    def _register_auto_pair(
+        self,
+        pair: PairConfig,
+        pair_specs: dict[str, ContractSpec],
+        *,
+        seed_state: dict | None,
+        persist: bool = True,
+    ) -> None:
+        self.specs.update(pair_specs)
+        self.pairs[pair.pair_id] = pair
+        strategy = CalendarSpreadStrategy(pair)
+        saved = self.state.strategy_states.get(pair.pair_id)
+        if saved:
+            strategy.restore_state(saved)
+        elif seed_state:
+            strategy.restore_state(seed_state)
+        self.strategies[pair.pair_id] = strategy
+        self._auto_pair_ids.add(pair.pair_id)
+        self.broker.subscribe(pair.near_symbol, pair.exchange)
+        self.broker.subscribe(pair.far_symbol, pair.exchange)
+        if persist:
+            self._persist()
+
+    def _unregister_auto_pair(self, pair_id: str) -> None:
+        pair = self.pairs.get(pair_id)
+        if pair is None or self._pair_has_position(pair):
+            return
+        if self._pair_has_active_orders(pair_id):
+            return
+        self.pairs.pop(pair_id, None)
+        self.strategies.pop(pair_id, None)
+        self._auto_pair_ids.discard(pair_id)
+        self._retiring_auto_pairs.discard(pair_id)
+        self.state.strategy_states.pop(pair_id, None)
+        self.state.auto_pairs.pop(pair_id, None)
+        self._persist()
+
+    def _pair_has_position(self, pair: PairConfig) -> bool:
+        positions = {
+            position.symbol: position
+            for position in self.broker.get_positions()
+        }
+        near = positions.get(pair.near_symbol)
+        far = positions.get(pair.far_symbol)
+        return bool(
+            (near is not None and not near.empty)
+            or (far is not None and not far.empty)
+        )
+
+    def _open_auto_pair_ids(self) -> set[str]:
+        return {
+            pair_id
+            for pair_id in self._auto_pair_ids
+            if pair_id in self.pairs and self._pair_has_position(self.pairs[pair_id])
+        }
+
+    def _cleanup_retired_auto_pairs(self) -> None:
+        for pair_id in list(self._retiring_auto_pairs):
+            self._unregister_auto_pair(pair_id)
+
     def _record(self, event_type: str, payload: object) -> None:
         if self.journal is not None:
             self.journal.record(event_type, payload)
@@ -681,6 +857,12 @@ class TradingEngine:
             pair_id: strategy.snapshot_state()
             for pair_id, strategy in self.strategies.items()
         }
+        if self.auto_manager is not None:
+            self.state.auto_pairs = {
+                pair_id: asdict(self.pairs[pair_id])
+                for pair_id in sorted(self._auto_pair_ids)
+                if pair_id in self.pairs
+            }
         try:
             account = self.broker.get_account()
             self._advance_trading_day(account)

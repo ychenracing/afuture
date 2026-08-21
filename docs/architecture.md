@@ -7,10 +7,10 @@
 ## 模块边界
 
 ```text
-Market Data / Replay CSV
-          │
-          ▼
-     TradingEngine
+CTP Contract Catalog      Market Data / Replay CSV
+        │                         │
+        ▼                         ▼
+   AutoPairManager ─────────→ TradingEngine
           │
    ┌──────┼──────────┐
    ▼      ▼          ▼
@@ -28,12 +28,30 @@ Strategy  Health   PortfolioRisk
  SimBroker    CtpBroker
 ```
 
+- `AutoPairManager`：只负责合约发现、实时候选排名和动态组合生命周期；不产生第二套交易逻辑。
 - `CalendarSpreadStrategy`：只产生交易意图，不访问账户。
 - `RiskManager`：决定是否允许开仓以及最大动态手数。
 - `PortfolioRiskAnalyzer`：从价差变化序列计算相关性，并约束风险组集中度。
 - `PairExecutor`：把意图转成双腿订单，负责 Net Edge、盘口、保证金预检、回滚和减仓修复。
 - `TradingEngine`：负责事件顺序、状态机、对账、健康门和持久化。 实盘健康门以墙钟检测行情整体冻结；回放健康门以历史事件时间计算跨腿陈旧度。
 - `Broker`：隔离模拟撮合与 CTP SDK。
+
+
+## 自动组合生命周期
+
+自动模式从 CTP 合约目录中按品种/交易所白名单筛选，只保留未进入到期黑名单的前几个交割月份，并仅生成**相邻月份**。这样个人程序无需维护庞大的组合图。
+
+候选必须同时通过：
+
+- 当前成交量和 Open Interest；
+- 一档盘口深度；
+- 异步两腿行情的时间同步容忍；
+- Z-score、半衰期和平稳性代理；
+- 扣除手续费、滑点和裸腿缓冲后的 Net Edge。
+
+引擎只激活少量最高分组合。自动层如果认为某个已有持仓组合不再优秀，会把它视为“等待退役”，但**不会为了轮换强平**；组合仍由原策略正常退出，平仓后再从引擎移除。动态组合配置写入状态文件，重启时先恢复，保证已有仓位不会因为自动发现重新排序而失去管理者。
+
+交易日变化后重新应用到期过滤并订阅新进入前排的合约。CTP 合约目录本身来自登录后的合约查询，不使用网页或静态代码表。
 
 ## 可成交价差
 
