@@ -1,0 +1,66 @@
+from datetime import date
+
+import pytest
+
+
+def test_sina_daily_parser_preserves_real_fields():
+    from afuture.real_data import parse_sina_daily_jsonp
+
+    payload = 'var x=([["2026-08-20","3000","3020","2990","3010","12345","67890","3008"]]);'
+    rows = parse_sina_daily_jsonp(payload, "M2609")
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.symbol == "M2609"
+    assert row.day == date(2026, 8, 20)
+    assert row.close == pytest.approx(3010)
+    assert row.volume == pytest.approx(12345)
+    assert row.open_interest == pytest.approx(67890)
+    assert row.settle == pytest.approx(3008)
+
+
+def test_daily_bar_conversion_marks_execution_proxy():
+    from afuture.real_data import DailyBar, ProductDefinition, daily_bars_to_ticks
+
+    definition = ProductDefinition(
+        product="m",
+        exchange="DCE",
+        multiplier=10,
+        price_tick=1,
+        margin_rate=0.15,
+        open_fee=2.0,
+        close_fee=2.0,
+        contract_months=(1, 5, 9),
+    )
+    row = DailyBar("M2609", date(2026, 8, 20), 3000, 3020, 2990, 3010, 100000, 200000, 3008)
+    result = daily_bars_to_ticks([row], definition)
+    assert result.execution_proxy == "close +/- one price tick; historical L1 unavailable"
+    assert result.ticks[0].volume == pytest.approx(100000)
+    assert result.ticks[0].open_interest == pytest.approx(200000)
+    assert result.ticks[0].bid_price == pytest.approx(3009)
+    assert result.ticks[0].ask_price == pytest.approx(3011)
+
+
+def test_research_parameter_application_supports_bounded_risk_scaling():
+    from dataclasses import replace
+    from afuture.auto import AutoConfig
+    from afuture.auto_research import AutoPortfolioRunner
+    from afuture.config import AppConfig
+    from afuture.risk import RiskConfig
+
+    base = AppConfig(
+        mode="replay",
+        initial_capital=500000,
+        contracts={},
+        pairs=[],
+        risk=RiskConfig(risk_budget_ratio=0.002, max_total_drawdown_ratio=0.08),
+        ctp=None,
+        auto=replace(AutoConfig(), enabled=True, products=("m",)),
+        contract_catalog=[],
+    )
+    runner = AutoPortfolioRunner(base)
+    tuned = runner._config_with_parameters({"risk_budget_ratio": 0.01, "max_pair_volume": 8})
+    assert tuned.risk.risk_budget_ratio == pytest.approx(0.01)
+    assert tuned.risk.max_total_drawdown_ratio == pytest.approx(0.08)
+    assert tuned.auto.max_pair_volume == 8
+    with pytest.raises(ValueError):
+        runner._config_with_parameters({"risk_budget_ratio": 0.09})
