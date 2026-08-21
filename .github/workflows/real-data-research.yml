@@ -7,7 +7,9 @@ on:
       # 两年研究复用完整生产链；任一 afuture 交易/研究模块变化都可能改变结果。
       - "afuture/**"
       - "tools/run_real_two_year_research.py"
+      - "tools/screen_curve_families.py"
       - "tests/test_real_data_research.py"
+      - "tests/test_curve_family_research.py"
       - "tests/test_research_calibration_grid.py"
       - "tests/test_research_terminal_boundaries.py"
       - "tests/test_auto_refresh_retention.py"
@@ -30,7 +32,36 @@ jobs:
           python-version: "3.13"
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[dev]"
-      - name: 运行两年真实数据研究
+      - name: 筛选质变型期限结构 Alpha 家族
+        run: >-
+          python tools/screen_curve_families.py
+          --start 2024-08-21
+          --end 2026-08-20
+          --cache runtime/real_2y_cache
+          --output runtime/curve_family_screening.json
+      - name: 校验期限结构筛选边界
+        run: |
+          python - <<'PY'
+          import json
+          report = json.load(open("runtime/curve_family_screening.json", encoding="utf-8"))
+          assert report["window"]["trading_days"] >= 360
+          assert report["window"]["train_days"] >= 180
+          assert report["window"]["validation_days"] >= 80
+          assert report["window"]["locked_diagnostic_days"] >= 80
+          assert report["method"]["candidate_count"] == 11
+          assert report["method"]["minimum_family_support"] == 2
+          assert report["method"]["locked_interval_used_for_selection"] is False
+          assert report["method"]["locked_interval_is_pristine"] is False
+          assert report["data"]["historical_l1_available"] is False
+          assert set(report["data"]["products"]) >= {"m", "rb", "ta", "c", "p"}
+          print(json.dumps({
+              "stable_family_found": report["stable_family_found"],
+              "family_support": report["family_support"],
+              "selected": report["selected"],
+              "locked_diagnostic": report["locked_diagnostic"],
+          }, ensure_ascii=False, indent=2))
+          PY
+      - name: 运行两年真实数据生产链研究
         run: >-
           python tools/run_real_two_year_research.py
           --start 2024-08-21
@@ -63,6 +94,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: real-two-year-research
-          path: runtime/real_2y_research.json
+          path: |
+            runtime/curve_family_screening.json
+            runtime/real_2y_research.json
           if-no-files-found: error
           retention-days: 14
