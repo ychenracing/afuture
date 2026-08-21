@@ -116,6 +116,7 @@ class CalendarSpreadStrategy:
         raw_ts = str(state.get("last_sample_ts", ""))
         if raw_ts:
             from datetime import datetime
+
             self._last_sample_ts = datetime.fromisoformat(raw_ts)
         else:
             self._last_sample_ts = None
@@ -126,6 +127,42 @@ class CalendarSpreadStrategy:
         if self._armed_direction not in {-1, 0, 1}:
             raise ValueError("invalid persisted confirmation direction")
         self._armed_extreme = float(state.get("armed_extreme", 0.0))
+
+    def restore_after_rejected_signal(self, previous_state: dict) -> None:
+        """执行未接受信号时恢复真实持仓语义，同时保留本次市场观测。
+
+        ``on_quotes`` 会先更新内部目标仓位再交给风控/执行。若随后被拒绝，必须恢复
+        信号前的真实仓位和入场锚点，但不能丢掉已经消费的本次样本、日频采样标记或
+        确认状态，否则同一交易日可能重复产生同一信号。
+        """
+        observed = self.snapshot_state()
+        previous_position = int(previous_state.get("position", 0))
+        previous_holding = int(previous_state.get("holding_samples", 0))
+
+        self.restore_state(previous_state)
+        self._history.clear()
+        for value in observed.get("history", [])[-self.pair.lookback:]:
+            self._history.append(float(value))
+        self._raw_history.clear()
+        for value in observed.get("raw_history", [])[-self.pair.lookback:]:
+            self._raw_history.append(float(value))
+        self._z_history.clear()
+        for value in observed.get("z_history", [])[-self._z_history.maxlen:]:
+            self._z_history.append(float(value))
+        raw_ts = str(observed.get("last_sample_ts", ""))
+        if raw_ts:
+            from datetime import datetime
+
+            self._last_sample_ts = datetime.fromisoformat(raw_ts)
+        else:
+            self._last_sample_ts = None
+        self._last_sample_trading_day = str(
+            observed.get("last_sample_trading_day", "")
+        )
+        self._armed_direction = int(observed.get("armed_direction", 0))
+        self._armed_extreme = float(observed.get("armed_extreme", 0.0))
+        if previous_position != 0:
+            self._holding_samples = previous_holding + 1
 
     def on_quotes(self, near: Tick, far: Tick) -> SpreadSignal:
         """按配置采样，在统一统计空间生成跨期交易信号。"""
@@ -410,7 +447,10 @@ class CalendarSpreadStrategy:
         if len(values) < 4:
             return 999.0, 0.0
         levels = values[:-1]
-        changes = [values[index + 1] - values[index] for index in range(len(values) - 1)]
+        changes = [
+            values[index + 1] - values[index]
+            for index in range(len(values) - 1)
+        ]
         level_mean = sum(levels) / len(levels)
         change_mean = sum(changes) / len(changes)
         denominator = sum((value - level_mean) ** 2 for value in levels)
@@ -422,7 +462,9 @@ class CalendarSpreadStrategy:
         ) / denominator
         if beta >= 0:
             return 999.0, 0.0
-        return max(0.1, -log(2.0) / beta), min(1.0, max(0.0, -beta))
+        return max(0.1, -log(2.0) / beta), min(
+            1.0, max(0.0, -beta)
+        )
 
     @staticmethod
     def _parse_window(raw: str) -> tuple[time, time]:
@@ -433,7 +475,9 @@ class CalendarSpreadStrategy:
         except ValueError as exc:
             raise ValueError(f"invalid daily sample window: {raw}") from exc
         if start >= end:
-            raise ValueError("daily sample window must be an intraday increasing window")
+            raise ValueError(
+                "daily sample window must be an intraday increasing window"
+            )
         return start, end
 
     @staticmethod
@@ -448,19 +492,31 @@ class CalendarSpreadStrategy:
         return delta / std
 
     def _mean(self) -> float:
-        return sum(self._history) / len(self._history) if self._history else 0.0
+        return (
+            sum(self._history) / len(self._history)
+            if self._history
+            else 0.0
+        )
 
     def _std(self, mean: float) -> float:
         if not self._history:
             return 0.0
-        variance = sum((value - mean) ** 2 for value in self._history) / len(self._history)
+        variance = sum(
+            (value - mean) ** 2 for value in self._history
+        ) / len(self._history)
         return sqrt(variance)
 
     def _raw_mean(self) -> float:
-        return sum(self._raw_history) / len(self._raw_history) if self._raw_history else 0.0
+        return (
+            sum(self._raw_history) / len(self._raw_history)
+            if self._raw_history
+            else 0.0
+        )
 
     def _raw_std(self, mean: float) -> float:
         if not self._raw_history:
             return 0.0
-        variance = sum((value - mean) ** 2 for value in self._raw_history) / len(self._raw_history)
+        variance = sum(
+            (value - mean) ** 2 for value in self._raw_history
+        ) / len(self._raw_history)
         return sqrt(variance)
