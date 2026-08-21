@@ -1,7 +1,7 @@
 """基于 VeighNa ``vnpy_ctp`` 的 CTP 柜台适配器。
 
-个人期货账户通常通过期货公司 CTP 前置接入交易所，而不是直接连接交易所。
-本模块只在运行实盘命令时导入 VeighNa，因此研究和测试环境无需安装 CTP 二进制依赖。
+个人期货账户通常通过期货公司的 CTP 交易/行情前置接入交易所。
+模块在运行实盘命令时才导入二进制依赖，研究和测试环境不需要安装 CTP。
 """
 
 from __future__ import annotations
@@ -9,7 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime
 from queue import Empty, Queue
-from time import monotonic
+from threading import Event
+from time import monotonic, sleep
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -18,6 +19,8 @@ from ..models import (
     AccountSnapshot,
     BrokerEvent,
     ContractPosition,
+    ContractSpec,
+    FeeSpec,
     Offset,
     Order,
     OrderRequest,
@@ -32,8 +35,7 @@ from ..position import PositionBook
 
 @dataclass(frozen=True)
 class CtpCredentials:
-    """CTP 连接参数。敏感字段应从环境变量注入。"""
-
+    """CTP 连接参数。敏感字段从环境变量注入。"""
     user_id: str
     password: str
     broker_id: str
@@ -45,8 +47,7 @@ class CtpCredentials:
 
 
 def build_ctp_setting(credentials: CtpCredentials) -> dict[str, str]:
-    """构造 vnpy_ctp 当前 ``CtpGateway`` 所需配置。"""
-    env = "测试" if credentials.environment.lower() == "test" else "实盘"
+    """构造当前 ``CtpGateway`` 使用的中文配置键。"""
     return {
         "用户名": credentials.user_id,
         "密码": credentials.password,
@@ -55,18 +56,16 @@ def build_ctp_setting(credentials: CtpCredentials) -> dict[str, str]:
         "行情服务器": credentials.md_address,
         "产品名称": credentials.app_id,
         "授权编码": credentials.auth_code,
-        "柜台环境": env,
+        "柜台环境": "测试" if credentials.environment.lower() == "test" else "实盘",
     }
 
 
 class CtpBroker(Broker):
-    """把 VeighNa CTP 事件和对象转换为 afuture 的内部模型。"""
+    """把 VeighNa CTP 对象转换为 afuture 内部模型。"""
 
     gateway_name = "CTP"
 
-    def __init__(
-        self, credentials: CtpCredentials, *, snapshot_stale_seconds: float = 20.0
-    ) -> None:
+    def __init__(self, credentials: CtpCredentials, *, snapshot_stale_seconds: float = 20.0) -> None:
         if snapshot_stale_seconds <= 0:
             raise ValueError("snapshot_stale_seconds must be positive")
         self.credentials = credentials
@@ -85,29 +84,25 @@ class CtpBroker(Broker):
         self._last_position_snapshot_monotonic = 0.0
 
     def _load_runtime(self) -> dict[str, Any]:
-        """延迟加载实盘依赖，并为 CTP 持仓查询增加完整快照完成事件。"""
+        """延迟加载实盘依赖，并扩展完整持仓快照和费率查询回调。"""
         if self._runtime is not None:
             return self._runtime
         try:
             from vnpy.event import EventEngine
-            from vnpy.trader.constant import (
-                Direction,
-                Exchange,
-                Offset as VnOffset,
-                OrderType as VnOrderType,
-                Status,
-            )
+            from vnpy.trader.constant import Direction, Exchange, Offset as VnOffset, OrderType as VnOrderType, Status
             from vnpy.trader.engine import MainEngine
             from vnpy.trader.event import EVENT_ACCOUNT, EVENT_ORDER, EVENT_TICK, EVENT_TRADE
             from vnpy.trader.object import OrderRequest as VnOrderRequest, SubscribeRequest
             from vnpy_ctp.gateway.ctp_gateway import CtpGateway, CtpTdApi
         except ImportError as exc:
-            raise RuntimeError(
-                "CTP live dependencies are missing; install with: pip install -e '.[live]'"
-            ) from exc
+            raise RuntimeError("CTP live dependencies are missing; install with: pip install -e '.[live]'") from exc
 
         class TrackedCtpTdApi(CtpTdApi):
-            """在官方 CTP 回调之上暴露一次完整持仓查询的边界。"""
+            """在官方交易 API 上增加查询完成边界，不改动官方下单逻辑。"""
+
+            def __init__(self, gateway):
+                super().__init__(gateway)
+                self._afuture_rate_waiters: dict[int, dict[str, Any]] = {}
 
             def onRspQryInvestorPosition(self, data, error, reqid, last):
                 error_id = int((error or {}).get("ErrorID", 0))
@@ -117,30 +112,39 @@ class CtpBroker(Broker):
                 if not last:
                     super().onRspQryInvestorPosition(data, error, reqid, False)
                     return
-
-                # 最后一条仍需先进入官方聚合逻辑，但不能让官方逻辑先清空缓存。
                 if data:
                     super().onRspQryInvestorPosition(data, error, reqid, False)
                 snapshot = list(self.positions.values())
                 for position in snapshot:
                     self.gateway.on_position(position)
                 self.positions.clear()
-
-                callback = getattr(
-                    self.gateway, "_afuture_position_snapshot_callback", None
-                )
+                callback = getattr(self.gateway, "_afuture_position_snapshot_callback", None)
                 if callable(callback):
                     callback(snapshot)
 
+            def _capture_rate(self, kind: str, data, error, reqid: int, last: bool) -> None:
+                waiter = self._afuture_rate_waiters.get(reqid)
+                if waiter is None or waiter.get("kind") != kind:
+                    return
+                if int((error or {}).get("ErrorID", 0)):
+                    waiter["error"] = str((error or {}).get("ErrorMsg", "CTP metadata query failed"))
+                elif data:
+                    waiter["rows"].append(dict(data))
+                if last:
+                    waiter["event"].set()
+
+            def onRspQryInstrumentMarginRate(self, data, error, reqid, last):
+                self._capture_rate("margin", data, error, reqid, last)
+
+            def onRspQryInstrumentCommissionRate(self, data, error, reqid, last):
+                self._capture_rate("commission", data, error, reqid, last)
+
         class TrackedCtpGateway(CtpGateway):
-            """使用带完整快照边界的交易 API，其他行为保持官方实现。"""
-
             default_name = "CTP"
-
             def __init__(self, event_engine, gateway_name):
                 super().__init__(event_engine, gateway_name)
                 self._afuture_position_snapshot_callback = None
-                # ``super`` 创建的交易 API 尚未连接，直接替换不会留下活动会话。
+                # super 创建的交易 API 还未连接，直接替换不会遗留会话。
                 self.td_api = TrackedCtpTdApi(self)
 
         self._runtime = {
@@ -170,7 +174,6 @@ class CtpBroker(Broker):
         if gateway is None:
             raise RuntimeError("CTP gateway could not be created")
         gateway._afuture_position_snapshot_callback = self._handle_position_snapshot
-
         self._event_engine.register(runtime["EVENT_TICK"], self._on_tick)
         self._event_engine.register(runtime["EVENT_ORDER"], self._on_order)
         self._event_engine.register(runtime["EVENT_TRADE"], self._on_trade)
@@ -200,7 +203,6 @@ class CtpBroker(Broker):
         )
 
     def health_error(self, *, now_monotonic: float | None = None) -> str | None:
-        """检测账户和持仓周期快照是否停止刷新。"""
         if not self.is_ready():
             return None
         now = monotonic() if now_monotonic is None else now_monotonic
@@ -213,11 +215,9 @@ class CtpBroker(Broker):
         return None
 
     def snapshot_marker(self) -> tuple[int, int]:
-        """记录当前账户事件和完整持仓快照代次，供启动安全门等待新快照。"""
         return self._account_event_generation, self._position_snapshot_generation
 
     def snapshot_ready(self, marker: tuple[int, int]) -> bool:
-        """只有账户和持仓都在 marker 之后完整刷新才算启动快照有效。"""
         account_generation, position_generation = marker
         return bool(
             self._last_account is not None
@@ -229,32 +229,30 @@ class CtpBroker(Broker):
         if self._main_engine is None:
             raise RuntimeError("CTP broker is not started")
         runtime = self._load_runtime()
-        req = runtime["SubscribeRequest"](
-            symbol=symbol, exchange=self._exchange(exchange)
+        request = runtime["SubscribeRequest"](
+            symbol=symbol,
+            exchange=self._exchange(exchange),
         )
-        self._main_engine.subscribe(req, self.gateway_name)
+        self._main_engine.subscribe(request, self.gateway_name)
 
     def send_order(self, request: OrderRequest) -> str:
         if not self.is_ready() or self._main_engine is None:
             raise RuntimeError("CTP market/trading session is not ready")
-        vn_request = self._to_vnpy_order(request)
-        order_id = self._main_engine.send_order(vn_request, self.gateway_name)
+        order_id = self._main_engine.send_order(self._to_vnpy_order(request), self.gateway_name)
         if not order_id:
             raise RuntimeError("CTP order request was not accepted by gateway")
         self._order_references[order_id] = request.reference
         return order_id
 
     def owns_order(self, order_id: str) -> bool:
-        """只承认当前进程实际提交并记录过的委托。"""
         return order_id in self._order_references
 
     def cancel_order(self, order_id: str) -> None:
         if self._main_engine is None:
             return
         order = self._main_engine.get_order(order_id)
-        if order is None:
-            return
-        self._main_engine.cancel_order(order.create_cancel_request(), self.gateway_name)
+        if order is not None:
+            self._main_engine.cancel_order(order.create_cancel_request(), self.gateway_name)
 
     def get_order(self, order_id: str) -> Order | None:
         if self._main_engine is None:
@@ -265,10 +263,7 @@ class CtpBroker(Broker):
     def get_active_orders(self) -> list[Order]:
         if self._main_engine is None:
             return []
-        return [
-            self._convert_order(order)
-            for order in self._main_engine.get_all_active_orders()
-        ]
+        return [self._convert_order(order) for order in self._main_engine.get_all_active_orders()]
 
     def get_account(self) -> AccountSnapshot:
         if self._main_engine is not None:
@@ -280,11 +275,10 @@ class CtpBroker(Broker):
         return self._last_account
 
     def get_positions(self) -> list[ContractPosition]:
-        """返回最近一次完整快照叠加本进程成交后的镜像，不读取 OMS 残留仓位。"""
         return [replace(position) for position in self._positions.values() if not position.empty]
 
     def poll_events(self) -> list[BrokerEvent]:
-        result: list[BrokerEvent] = []
+        result = []
         while True:
             try:
                 result.append(self._events.get_nowait())
@@ -302,17 +296,81 @@ class CtpBroker(Broker):
                     value = value.decode("ascii", errors="ignore")
                 if value:
                     self._trading_day = str(value)
-        return self._trading_day or datetime.now(ZoneInfo("Asia/Shanghai")).strftime(
-            "%Y%m%d"
-        )
+        return self._trading_day or datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d")
+
+    def get_live_contract_specs(self, symbols: list[str], timeout_seconds: float = 10.0) -> dict[str, ContractSpec]:
+        """从 CTP/VeighNa 获取乘数、tick、保证金和手续费用于启动安全门。
+
+        查询失败、固定金额保证金等无法可靠映射的情况一律报错，由上层 fail-closed。
+        """
+        if not self.is_ready() or self._main_engine is None:
+            raise RuntimeError("CTP is not ready for metadata query")
+        gateway = self._main_engine.get_gateway(self.gateway_name)
+        td_api = getattr(gateway, "td_api", None) if gateway else None
+        if td_api is None:
+            raise RuntimeError("CTP trading API is unavailable")
+        contract_map = {c.symbol: c for c in self._main_engine.get_all_contracts()}
+        deadline = monotonic() + max(timeout_seconds, 0.1)
+        result: dict[str, ContractSpec] = {}
+        for symbol in symbols:
+            contract = contract_map.get(symbol)
+            if contract is None:
+                raise RuntimeError(f"CTP contract metadata missing: {symbol}")
+            margin = self._query_rate(td_api, "margin", symbol, deadline)
+            commission = self._query_rate(td_api, "commission", symbol, deadline)
+            long_by_volume = float(margin.get("LongMarginRatioByVolume", 0.0) or 0.0)
+            short_by_volume = float(margin.get("ShortMarginRatioByVolume", 0.0) or 0.0)
+            if long_by_volume > 0 or short_by_volume > 0:
+                raise RuntimeError(f"fixed-per-lot margin is unsupported for validation: {symbol}")
+            fee = FeeSpec(
+                open_fixed=float(commission.get("OpenRatioByVolume", 0.0) or 0.0),
+                open_rate=float(commission.get("OpenRatioByMoney", 0.0) or 0.0),
+                close_fixed=float(commission.get("CloseRatioByVolume", 0.0) or 0.0),
+                close_rate=float(commission.get("CloseRatioByMoney", 0.0) or 0.0),
+                close_today_fixed=float(commission.get("CloseTodayRatioByVolume", 0.0) or 0.0),
+                close_today_rate=float(commission.get("CloseTodayRatioByMoney", 0.0) or 0.0),
+            )
+            result[symbol] = ContractSpec(
+                symbol=symbol,
+                exchange=contract.exchange.value,
+                multiplier=float(contract.size),
+                price_tick=float(contract.pricetick),
+                margin_rate_long=float(margin.get("LongMarginRatioByMoney", 0.0) or 0.0),
+                margin_rate_short=float(margin.get("ShortMarginRatioByMoney", 0.0) or 0.0),
+                fee=fee,
+            )
+        return result
+
+    def _query_rate(self, td_api, kind: str, symbol: str, deadline: float) -> dict:
+        reqid = int(getattr(td_api, "reqid", 0)) + 1
+        td_api.reqid = reqid
+        waiter = {"kind": kind, "event": Event(), "rows": [], "error": ""}
+        td_api._afuture_rate_waiters[reqid] = waiter
+        try:
+            while True:
+                if monotonic() >= deadline:
+                    raise RuntimeError(f"CTP {kind} query timeout: {symbol}")
+                if kind == "margin":
+                    status = td_api.reqQryInstrumentMarginRate({"InstrumentID": symbol, "HedgeFlag": "1"}, reqid)
+                else:
+                    status = td_api.reqQryInstrumentCommissionRate({"InstrumentID": symbol}, reqid)
+                if not status:
+                    break
+                sleep(0.2)
+            remaining = max(0.0, deadline - monotonic())
+            if not waiter["event"].wait(remaining):
+                raise RuntimeError(f"CTP {kind} query timeout: {symbol}")
+            if waiter["error"]:
+                raise RuntimeError(f"CTP {kind} query failed for {symbol}: {waiter['error']}")
+            if not waiter["rows"]:
+                raise RuntimeError(f"CTP {kind} query returned no data: {symbol}")
+            return waiter["rows"][-1]
+        finally:
+            td_api._afuture_rate_waiters.pop(reqid, None)
 
     def _to_vnpy_order(self, request: OrderRequest):
         runtime = self._load_runtime()
-        direction = (
-            runtime["Direction"].LONG
-            if request.side is OrderSide.BUY
-            else runtime["Direction"].SHORT
-        )
+        direction = runtime["Direction"].LONG if request.side is OrderSide.BUY else runtime["Direction"].SHORT
         offset_map = {
             Offset.OPEN: runtime["Offset"].OPEN,
             Offset.CLOSE: runtime["Offset"].CLOSE,
@@ -356,6 +414,8 @@ class CtpBroker(Broker):
             trading_day=self.get_trading_day(),
             limit_up=float(getattr(raw, "limit_up", 0.0) or 0.0),
             limit_down=float(getattr(raw, "limit_down", 0.0) or 0.0),
+            volume=float(getattr(raw, "volume", 0.0) or 0.0),
+            open_interest=float(getattr(raw, "open_interest", 0.0) or 0.0),
         )
         try:
             tick.validate()
@@ -368,11 +428,7 @@ class CtpBroker(Broker):
 
     def _on_trade(self, event) -> None:
         raw = event.data
-        side = (
-            OrderSide.BUY
-            if getattr(raw.direction, "name", "").upper() == "LONG"
-            else OrderSide.SELL
-        )
+        side = OrderSide.BUY if getattr(raw.direction, "name", "").upper() == "LONG" else OrderSide.SELL
         offset_name = getattr(raw.offset, "name", "CLOSE").upper()
         offset = {
             "OPEN": Offset.OPEN,
@@ -381,24 +437,22 @@ class CtpBroker(Broker):
             "CLOSEYESTERDAY": Offset.CLOSE_YESTERDAY,
         }.get(offset_name, Offset.CLOSE)
         trade = Trade(
-            trade_id=raw.vt_tradeid,
-            order_id=raw.vt_orderid,
-            symbol=raw.symbol,
-            exchange=raw.exchange.value,
-            side=side,
-            offset=offset,
-            volume=int(raw.volume),
-            price=float(raw.price),
-            timestamp=raw.datetime or datetime.now(ZoneInfo("Asia/Shanghai")),
+            raw.vt_tradeid,
+            raw.vt_orderid,
+            raw.symbol,
+            raw.exchange.value,
+            side,
+            offset,
+            int(raw.volume),
+            float(raw.price),
+            raw.datetime or datetime.now(ZoneInfo("Asia/Shanghai")),
         )
         try:
             book = PositionBook(self.get_positions())
             book.apply_trade(trade)
             self._positions = {position.symbol: position for position in book.all()}
         except Exception as exc:
-            self._events.put(
-                BrokerEvent("broker_error", f"CTP trade mirror update failed: {exc}")
-            )
+            self._events.put(BrokerEvent("broker_error", f"CTP trade mirror update failed: {exc}"))
         self._events.put(BrokerEvent("trade", trade))
 
     def _on_account(self, event) -> None:
@@ -408,7 +462,6 @@ class CtpBroker(Broker):
         self._events.put(BrokerEvent("account", self._last_account))
 
     def _handle_position_snapshot(self, raw_positions: list[object]) -> None:
-        """用一次 CTP 查询的完整结果原子替换仓位镜像；空列表同样有效。"""
         combined: dict[str, ContractPosition] = {}
         try:
             for raw in raw_positions:
@@ -417,13 +470,8 @@ class CtpBroker(Broker):
                 if volume < 0 or yesterday < 0 or yesterday > volume:
                     raise ValueError(f"invalid CTP position volume for {raw.symbol}")
                 today = volume - yesterday
-                position = combined.setdefault(
-                    raw.symbol,
-                    ContractPosition(raw.symbol, raw.exchange.value),
-                )
-                direction_value = getattr(
-                    raw.direction, "name", str(raw.direction)
-                ).upper()
+                position = combined.setdefault(raw.symbol, ContractPosition(raw.symbol, raw.exchange.value))
+                direction_value = getattr(raw.direction, "name", str(raw.direction)).upper()
                 if "LONG" in direction_value:
                     position.long_today += today
                     position.long_yesterday += yesterday
@@ -437,10 +485,7 @@ class CtpBroker(Broker):
         except Exception as exc:
             self._events.put(BrokerEvent("broker_error", str(exc)))
             return
-
-        self._positions = {
-            symbol: position for symbol, position in combined.items() if not position.empty
-        }
+        self._positions = {symbol: position for symbol, position in combined.items() if not position.empty}
         self._position_snapshot_generation += 1
         self._last_position_snapshot_monotonic = monotonic()
         self._events.put(BrokerEvent("position_snapshot", self.get_positions()))
@@ -448,17 +493,9 @@ class CtpBroker(Broker):
     def _convert_account(self, raw) -> AccountSnapshot:
         balance = float(raw.balance)
         available = float(raw.available)
-        # VeighNa AccountData 不暴露 CTP CurrMargin，以权益与可用资金差额作为保守占用代理。
+        # VeighNa AccountData 不暴露 CurrMargin，用权益与可用资金差额作为保守代理。
         margin = max(0.0, balance - available)
-        return AccountSnapshot(
-            balance=balance,
-            equity=balance,
-            available=available,
-            margin=margin,
-            realized_pnl=0.0,
-            unrealized_pnl=0.0,
-            trading_day=self.get_trading_day(),
-        )
+        return AccountSnapshot(balance, balance, available, margin, 0.0, 0.0, self.get_trading_day())
 
     def _convert_order(self, raw) -> Order:
         runtime = self._load_runtime()
@@ -470,11 +507,7 @@ class CtpBroker(Broker):
             runtime["Status"].CANCELLED: OrderStatus.CANCELLED,
             runtime["Status"].REJECTED: OrderStatus.REJECTED,
         }
-        side = (
-            OrderSide.BUY
-            if getattr(raw.direction, "name", "").upper() == "LONG"
-            else OrderSide.SELL
-        )
+        side = OrderSide.BUY if getattr(raw.direction, "name", "").upper() == "LONG" else OrderSide.SELL
         offset_name = getattr(raw.offset, "name", "CLOSE").upper()
         offset = {
             "OPEN": Offset.OPEN,
@@ -483,27 +516,22 @@ class CtpBroker(Broker):
             "CLOSEYESTERDAY": Offset.CLOSE_YESTERDAY,
         }.get(offset_name, Offset.CLOSE)
         type_name = getattr(raw.type, "name", "LIMIT").upper()
-        order_type = {
-            "FAK": OrderType.FAK,
-            "FOK": OrderType.FOK,
-        }.get(type_name, OrderType.LIMIT)
-        reference = getattr(raw, "reference", "") or self._order_references.get(
-            raw.vt_orderid, ""
-        )
+        order_type = {"FAK": OrderType.FAK, "FOK": OrderType.FOK}.get(type_name, OrderType.LIMIT)
+        reference = getattr(raw, "reference", "") or self._order_references.get(raw.vt_orderid, "")
         request = OrderRequest(
-            symbol=raw.symbol,
-            exchange=raw.exchange.value,
-            side=side,
-            offset=offset,
-            volume=int(raw.volume),
-            price=float(raw.price),
-            order_type=order_type,
-            reference=reference,
+            raw.symbol,
+            raw.exchange.value,
+            side,
+            offset,
+            int(raw.volume),
+            float(raw.price),
+            order_type,
+            reference,
         )
         return Order(
-            order_id=raw.vt_orderid,
-            request=request,
-            status=status_map.get(raw.status, OrderStatus.REJECTED),
-            traded=int(raw.traded),
-            average_price=float(raw.price),
+            raw.vt_orderid,
+            request,
+            status_map.get(raw.status, OrderStatus.REJECTED),
+            int(raw.traded),
+            float(raw.price),
         )

@@ -1,3 +1,4 @@
+# 研究/回放示例。合约参数只用于示例，实盘必须按期货公司真实参数更新。
 [system]
 mode = "replay"
 initial_capital = 500000
@@ -6,62 +7,79 @@ initial_capital = 500000
 max_margin_ratio = 0.35
 max_daily_loss_ratio = 0.01
 max_total_drawdown_ratio = 0.08
-max_open_pairs = 2
-max_contract_volume = 4
-max_quote_age_seconds = 5
+max_open_pairs = 3
+max_contract_volume = 10
+max_quote_age_seconds = 10
 expiry_blackout_days = 5
 min_available_ratio = 0.50
 margin_estimate_buffer = 1.20
 max_orders_per_minute = 20
+min_depth_multiple = 2.0
+max_bid_ask_ticks = 4
+limit_distance_ticks = 3
+risk_budget_ratio = 0.002
+risk_sigma_multiplier = 2.0
+open_cooldown_minutes = 0
+close_blackout_minutes = 0
 
 [execution]
-slippage_ticks = 0
+slippage_ticks = 1
 aggressive_ticks = 1
 auto_flatten_imbalance = true
 legging_timeout_seconds = 2.0
+conservative_simulation = true
+latency_ticks = 0
+market_impact_ticks = 1
+require_live_metadata = false
+metadata_timeout_seconds = 10
 
 [paths]
 state = "runtime/replay_state.json"
 log = "runtime/afuture.log"
 report = "runtime/replay_report.json"
 journal = "runtime/audit.jsonl"
+alert = "runtime/alerts.jsonl"
 
-# 以下参数仅用于示例回放，不代表当前交易所或期货公司的实时保证金和手续费。
-# 实盘前必须用开户期货公司的最新参数逐项替换。
 [[contracts]]
 symbol = "m2609"
 exchange = "DCE"
 multiplier = 10
 price_tick = 1
-margin_rate_long = 0.15
-margin_rate_short = 0.15
-
+margin_rate_long = 0.12
+margin_rate_short = 0.12
 [contracts.fee]
-open_fixed = 2.0
-close_fixed = 2.0
-close_today_fixed = 2.0
+open_fixed = 0
+close_fixed = 0
+close_today_fixed = 0
 
 [[contracts]]
 symbol = "m2701"
 exchange = "DCE"
 multiplier = 10
 price_tick = 1
-margin_rate_long = 0.15
-margin_rate_short = 0.15
-
+margin_rate_long = 0.12
+margin_rate_short = 0.12
 [contracts.fee]
-open_fixed = 2.0
-close_fixed = 2.0
-close_today_fixed = 2.0
+open_fixed = 0
+close_fixed = 0
+close_today_fixed = 0
 
 [[pairs]]
 pair_id = "m_calendar"
 near_symbol = "m2609"
 far_symbol = "m2701"
 exchange = "DCE"
+# 最大允许手数，实际开仓手数由风险预算、波动和盘口深度动态决定。
 volume = 1
 lookback = 3
-entry_z = 2.0
-exit_z = 1.0
+entry_z = 0.8
+exit_z = 0.5
 stop_z = 5.0
-sample_seconds = 30
+sample_seconds = 0
+max_holding_samples = 20
+structural_mean_shift_z = 6.0
+structural_vol_ratio = 8.0
+min_net_edge = 0
+legging_buffer = 0
+risk_group = "oilseed"
+session_windows = ["09:00-11:30", "13:30-15:00", "21:00-23:00"]

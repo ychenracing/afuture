@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from collections import deque
-from math import sqrt
+from math import inf, sqrt
 
+from .economics import executable_spreads
 from .models import PairConfig, SignalAction, SpreadSignal, Tick
 
 
 class CalendarSpreadStrategy:
-    """只产生价差信号，不直接访问交易柜台。"""
+    """只产生统计交易意图，不直接访问柜台或决定最终能否开仓。"""
 
     def __init__(self, pair: PairConfig) -> None:
         if pair.lookback < 2:
@@ -21,6 +22,7 @@ class CalendarSpreadStrategy:
         self._position = 0
         self._entry_mean = 0.0
         self._entry_std = 0.0
+        self._holding_samples = 0
         self._last_sample_ts = None
 
     @property
@@ -28,29 +30,43 @@ class CalendarSpreadStrategy:
         """1 表示多价差，-1 表示空价差，0 表示无仓。"""
         return self._position
 
+    @property
+    def spread_std(self) -> float:
+        mean = self._mean()
+        return self._std(mean)
+
     def set_position(self, position: int) -> None:
         if position not in {-1, 0, 1}:
             raise ValueError("spread position must be -1, 0 or 1")
+        if self._position == 0 and position != 0 and self._history:
+            self._entry_mean = self._mean()
+            self._entry_std = max(self._std(self._entry_mean), 1e-9)
+            self._holding_samples = 0
+        if position == 0:
+            self._holding_samples = 0
         self._position = position
 
     def snapshot_state(self) -> dict:
-        """导出策略状态，保证重启后不丢失滚动窗口和入场基准。"""
+        """导出策略状态，保证重启后不丢失滚动窗口和入场锚点。"""
         return {
             "history": list(self._history),
             "position": self._position,
             "entry_mean": self._entry_mean,
             "entry_std": self._entry_std,
+            "holding_samples": self._holding_samples,
             "last_sample_ts": self._last_sample_ts.isoformat() if self._last_sample_ts else "",
         }
 
     def restore_state(self, state: dict) -> None:
-        """恢复由 snapshot_state 生成的状态；超长历史自动截断到当前 lookback。"""
         self._history.clear()
         for value in state.get("history", [])[-self.pair.lookback:]:
             self._history.append(float(value))
-        self.set_position(int(state.get("position", 0)))
+        self._position = int(state.get("position", 0))
+        if self._position not in {-1, 0, 1}:
+            raise ValueError("invalid persisted spread position")
         self._entry_mean = float(state.get("entry_mean", 0.0))
         self._entry_std = float(state.get("entry_std", 0.0))
+        self._holding_samples = int(state.get("holding_samples", 0))
         raw_ts = str(state.get("last_sample_ts", ""))
         if raw_ts:
             from datetime import datetime
@@ -59,50 +75,119 @@ class CalendarSpreadStrategy:
             self._last_sample_ts = None
 
     def on_quotes(self, near: Tick, far: Tick) -> SpreadSignal:
-        """用可成交盘口中间价构造价差并生成状态化信号。"""
+        """历史中心用中间价维护，开仓阈值使用方向性可成交价差判断。"""
         near.validate()
         far.validate()
         timestamp = max(near.timestamp, far.timestamp)
-        spread = near.mid_price - far.mid_price
+        mid_spread = near.mid_price - far.mid_price
 
         if self._last_sample_ts is not None and self.pair.sample_seconds > 0:
-            elapsed = (timestamp - self._last_sample_ts).total_seconds()
-            if elapsed < self.pair.sample_seconds:
-                return SpreadSignal(self.pair.pair_id, SignalAction.HOLD, 0.0, timestamp, spread, 0.0)
+            if (timestamp - self._last_sample_ts).total_seconds() < self.pair.sample_seconds:
+                return SpreadSignal(
+                    self.pair.pair_id,
+                    SignalAction.HOLD,
+                    0.0,
+                    timestamp,
+                    mid_spread,
+                    self._mean(),
+                    self.spread_std,
+                )
 
         if len(self._history) < self.pair.lookback:
-            self._history.append(spread)
+            self._history.append(mid_spread)
             self._last_sample_ts = timestamp
-            return SpreadSignal(self.pair.pair_id, SignalAction.HOLD, 0.0, timestamp, spread, self._mean())
+            return SpreadSignal(
+                self.pair.pair_id,
+                SignalAction.HOLD,
+                0.0,
+                timestamp,
+                mid_spread,
+                self._mean(),
+                self.spread_std,
+            )
 
         mean = self._mean()
         std = self._std(mean)
-        zscore = 0.0 if std == 0 else (spread - mean) / std
+        long_exec, short_exec = executable_spreads(near, far)
+        long_z = self._z(long_exec, mean, std)
+        short_z = self._z(short_exec, mean, std)
+        mid_z = self._z(mid_spread, mean, std)
         action = SignalAction.HOLD
+        chosen_spread = mid_spread
+        chosen_z = mid_z
+        reason = ""
 
         if self._position == 0:
-            if zscore >= self.pair.entry_z:
+            if short_z >= self.pair.entry_z:
                 action = SignalAction.SHORT_SPREAD
+                chosen_spread, chosen_z = short_exec, short_z
                 self._position = -1
-                self._entry_mean = mean
-                self._entry_std = max(std, 1e-12)
-            elif zscore <= -self.pair.entry_z:
+            elif long_z <= -self.pair.entry_z:
                 action = SignalAction.LONG_SPREAD
+                chosen_spread, chosen_z = long_exec, long_z
                 self._position = 1
+            if action is not SignalAction.HOLD:
                 self._entry_mean = mean
-                self._entry_std = max(std, 1e-12)
+                self._entry_std = max(std, 1e-9)
+                self._holding_samples = 0
         else:
-            entry_z = (spread - self._entry_mean) / max(self._entry_std, 1e-12)
-            if abs(zscore) >= self.pair.stop_z:
-                action = SignalAction.EMERGENCY_EXIT
-                self._position = 0
-            elif abs(entry_z) <= self.pair.exit_z:
+            self._holding_samples += 1
+            anchored_z = (mid_spread - self._entry_mean) / max(
+                self._entry_std, 1e-9
+            )
+            current_std = max(std, 1e-9)
+            mean_shift_z = max(
+                abs(mean - self._entry_mean),
+                abs(mid_spread - self._entry_mean),
+            ) / max(self._entry_std, 1e-9)
+            vol_ratio = current_std / max(self._entry_std, 1e-9)
+            # 已经回到入场锚点时直接正常退出；此时即便滚动波动率因入场异常点暂时放大，
+            # 也不应把“成功回归”误判成结构失效。
+            if abs(anchored_z) <= self.pair.exit_z:
                 action = SignalAction.EXIT
+                reason = "spread reverted to entry anchor"
+            elif (
+                mean_shift_z >= self.pair.structural_mean_shift_z
+                or vol_ratio >= self.pair.structural_vol_ratio
+            ):
+                action = SignalAction.EMERGENCY_EXIT
+                reason = "structural break detected"
+            elif abs(anchored_z) >= self.pair.stop_z:
+                action = SignalAction.EMERGENCY_EXIT
+                reason = "entry anchored stop reached"
+            elif (
+                self.pair.max_holding_samples > 0
+                and self._holding_samples >= self.pair.max_holding_samples
+            ):
+                action = SignalAction.EMERGENCY_EXIT
+                reason = "maximum holding period reached"
+            if action in {SignalAction.EXIT, SignalAction.EMERGENCY_EXIT}:
                 self._position = 0
+                self._holding_samples = 0
 
-        self._history.append(spread)
+        self._history.append(mid_spread)
         self._last_sample_ts = timestamp
-        return SpreadSignal(self.pair.pair_id, action, zscore, timestamp, spread, mean)
+        return SpreadSignal(
+            self.pair.pair_id,
+            action,
+            chosen_z,
+            timestamp,
+            chosen_spread,
+            mean,
+            std,
+            reason,
+        )
+
+    @staticmethod
+    def _z(value: float, mean: float, std: float) -> float:
+        delta = value - mean
+        if std <= 1e-12:
+            if delta > 0:
+                return inf
+            if delta < 0:
+                return -inf
+            return 0.0
+        return delta / std
 
     def _mean(self) -> float:
         return sum(self._history) / len(self._history) if self._history else 0.0
@@ -110,5 +195,7 @@ class CalendarSpreadStrategy:
     def _std(self, mean: float) -> float:
         if not self._history:
             return 0.0
-        variance = sum((value - mean) ** 2 for value in self._history) / len(self._history)
+        variance = sum(
+            (value - mean) ** 2 for value in self._history
+        ) / len(self._history)
         return sqrt(variance)

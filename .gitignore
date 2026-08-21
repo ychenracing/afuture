@@ -1,10 +1,8 @@
+.venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.venv/
-venv/
-.env
-runtime/
 *.egg-info/
-dist/
-build/
+runtime/
+.env
+config/live.toml

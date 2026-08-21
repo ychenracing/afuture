@@ -1,4 +1,4 @@
-"""确定性模拟柜台，用于回放、测试和实盘前演练。"""
+"""确定性模拟柜台，支持普通和保守撮合模式。"""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from ..position import PositionBook
 
 
 class SimBroker(Broker):
-    """按一档盘口撮合，支持可成交限价单、FAK 和简单部分成交。"""
+    """按一档盘口撮合，并可启用深度消耗、延迟和市场冲击的保守模式。"""
 
     def __init__(
         self,
@@ -33,10 +33,18 @@ class SimBroker(Broker):
         specs: dict[str, ContractSpec],
         *,
         slippage_ticks: int = 0,
+        conservative: bool = False,
+        latency_ticks: int = 0,
+        market_impact_ticks: int = 0,
     ) -> None:
+        if initial_capital <= 0:
+            raise ValueError("initial_capital must be positive")
         self.initial_capital = initial_capital
         self.specs = specs
         self.slippage_ticks = max(0, slippage_ticks)
+        self.conservative = conservative
+        self.latency_ticks = max(0, latency_ticks)
+        self.market_impact_ticks = max(0, market_impact_ticks)
         self.position_book = PositionBook()
         self._orders: dict[str, Order] = {}
         self._trades: list[Trade] = []
@@ -49,6 +57,9 @@ class SimBroker(Broker):
         self._realized_pnl = 0.0
         self._commission = 0.0
         self._trading_day = ""
+        self._tick_seq = 0
+        self._eligible_seq: dict[str, int] = {}
+        self._depth: dict[str, list[int]] = {}
 
     def start(self) -> None:
         self._started = True
@@ -63,12 +74,24 @@ class SimBroker(Broker):
         if symbol not in self.specs:
             raise KeyError(f"unknown contract: {symbol}")
 
+    def get_live_contract_specs(
+        self, symbols: list[str], timeout_seconds: float = 10.0
+    ) -> dict[str, ContractSpec]:
+        """模拟柜台直接返回本地参数，便于测试元数据安全门。"""
+        return {symbol: self.specs[symbol] for symbol in symbols}
+
     def publish_tick(self, tick: Tick) -> None:
         tick.validate()
+        self._tick_seq += 1
         if self._trading_day and tick.trading_day != self._trading_day:
             self.position_book.roll_trading_day()
         self._trading_day = tick.trading_day
         self._ticks[tick.symbol] = tick
+        # 每个新 Tick 只有一份一档深度；同一 Tick 内的多个订单共享并消耗这份深度。
+        self._depth[tick.symbol] = [
+            int(tick.bid_volume),
+            int(tick.ask_volume),
+        ]
         self._events.append(BrokerEvent("tick", tick))
         self._match_symbol(tick.symbol)
 
@@ -79,14 +102,20 @@ class SimBroker(Broker):
             raise KeyError(f"unknown contract: {request.symbol}")
         if request.volume <= 0 or request.price <= 0:
             raise ValueError("invalid order request")
+
         order_id = f"SIM-{next(self._order_seq)}"
-        order = Order(order_id=order_id, request=request, status=OrderStatus.NOT_TRADED)
+        order = Order(
+            order_id=order_id,
+            request=request,
+            status=OrderStatus.NOT_TRADED,
+        )
         self._orders[order_id] = order
         self._events.append(BrokerEvent("order", order))
-        self._match_order(order)
-        if request.order_type in {OrderType.FAK, OrderType.FOK} and order.active:
-            order.status = OrderStatus.CANCELLED
-            self._events.append(BrokerEvent("order", order))
+        self._eligible_seq[order_id] = self._tick_seq + self.latency_ticks
+
+        if not self.conservative or self.latency_ticks == 0:
+            self._match_order(order)
+            self._cancel_ioc_remainder(order)
         return order_id
 
     def cancel_order(self, order_id: str) -> None:
@@ -102,11 +131,9 @@ class SimBroker(Broker):
         return [order for order in self._orders.values() if order.active]
 
     def get_trades(self) -> list[Trade]:
-        """返回成交历史副本，供回放统计使用。"""
         return list(self._trades)
 
     def get_orders(self) -> list[Order]:
-        """返回订单历史副本。"""
         return list(self._orders.values())
 
     def get_positions(self) -> list[ContractPosition]:
@@ -115,14 +142,27 @@ class SimBroker(Broker):
     def get_account(self) -> AccountSnapshot:
         unrealized = 0.0
         margin = 0.0
-        for p in self.position_book.all():
-            spec = self.specs[p.symbol]
-            tick = self._ticks.get(p.symbol)
-            mark = tick.last_price if tick else max(p.long_price, p.short_price, 0.0)
-            unrealized += (mark - p.long_price) * p.long_total * spec.multiplier
-            unrealized += (p.short_price - mark) * p.short_total * spec.multiplier
+        for position in self.position_book.all():
+            spec = self.specs[position.symbol]
+            tick = self._ticks.get(position.symbol)
+            mark = (
+                tick.last_price
+                if tick is not None
+                else max(position.long_price, position.short_price, 0.0)
+            )
+            unrealized += (
+                (mark - position.long_price)
+                * position.long_total
+                * spec.multiplier
+            )
+            unrealized += (
+                (position.short_price - mark)
+                * position.short_total
+                * spec.multiplier
+            )
             margin += mark * spec.multiplier * (
-                p.long_total * spec.margin_rate_long + p.short_total * spec.margin_rate_short
+                position.long_total * spec.margin_rate_long
+                + position.short_total * spec.margin_rate_short
             )
         equity = self._balance + unrealized
         return AccountSnapshot(
@@ -132,7 +172,10 @@ class SimBroker(Broker):
             margin=margin,
             realized_pnl=self._realized_pnl - self._commission,
             unrealized_pnl=unrealized,
-            trading_day=self._trading_day or datetime.now(timezone.utc).strftime("%Y%m%d"),
+            trading_day=(
+                self._trading_day
+                or datetime.now(timezone.utc).strftime("%Y%m%d")
+            ),
         )
 
     def poll_events(self) -> list[BrokerEvent]:
@@ -142,24 +185,37 @@ class SimBroker(Broker):
 
     def _match_symbol(self, symbol: str) -> None:
         for order in list(self._orders.values()):
-            if order.active and order.request.symbol == symbol:
-                self._match_order(order)
+            if not order.active or order.request.symbol != symbol:
+                continue
+            self._match_order(order)
+            if self._tick_seq >= self._eligible_seq.get(order.order_id, 0):
+                self._cancel_ioc_remainder(order)
 
     def _match_order(self, order: Order) -> None:
         tick = self._ticks.get(order.request.symbol)
         if tick is None or not order.active:
             return
+        eligible = self._eligible_seq.get(order.order_id, 0)
+        if self.conservative and self._tick_seq < eligible:
+            return
+
         request = order.request
+        depth = self._depth.setdefault(
+            request.symbol,
+            [int(tick.bid_volume), int(tick.ask_volume)],
+        )
         if request.side is OrderSide.BUY:
             marketable = request.price >= tick.ask_price
-            available = int(tick.ask_volume)
+            available = depth[1]
             raw_price = tick.ask_price
-            signed_slip = 1
+            sign = 1
+            depth_index = 1
         else:
             marketable = request.price <= tick.bid_price
-            available = int(tick.bid_volume)
+            available = depth[0]
             raw_price = tick.bid_price
-            signed_slip = -1
+            sign = -1
+            depth_index = 0
         if not marketable or available <= 0:
             return
 
@@ -168,17 +224,39 @@ class SimBroker(Broker):
             return
         fill_volume = min(remaining, available)
         spec = self.specs[request.symbol]
-        fill_price = raw_price + signed_slip * self.slippage_ticks * spec.price_tick
+        impact_ticks = self.market_impact_ticks if self.conservative else 0
+        fill_price = raw_price + sign * (
+            self.slippage_ticks + impact_ticks
+        ) * spec.price_tick
+        if request.side is OrderSide.BUY and tick.limit_up > 0:
+            fill_price = min(fill_price, tick.limit_up)
+        if request.side is OrderSide.SELL and tick.limit_down > 0:
+            fill_price = max(fill_price, tick.limit_down)
+
+        depth[depth_index] -= fill_volume
         self._fill(order, fill_volume, fill_price)
+
+    def _cancel_ioc_remainder(self, order: Order) -> None:
+        if (
+            order.request.order_type in {OrderType.FAK, OrderType.FOK}
+            and order.active
+        ):
+            order.status = OrderStatus.CANCELLED
+            self._events.append(BrokerEvent("order", order))
 
     def _fill(self, order: Order, volume: int, price: float) -> None:
         previous_traded = order.traded
         order.traded += volume
         order.average_price = (
-            (order.average_price * previous_traded + price * volume) / order.traded
+            order.average_price * previous_traded + price * volume
+        ) / order.traded
+        order.status = (
+            OrderStatus.FILLED
+            if order.traded == order.request.volume
+            else OrderStatus.PART_TRADED
         )
-        order.status = OrderStatus.FILLED if order.traded == order.request.volume else OrderStatus.PART_TRADED
 
+        tick = self._ticks[order.request.symbol]
         trade = Trade(
             trade_id=f"SIM-T-{next(self._trade_seq)}",
             order_id=order.order_id,
@@ -188,16 +266,20 @@ class SimBroker(Broker):
             offset=order.request.offset,
             volume=volume,
             price=price,
-            timestamp=self._ticks[order.request.symbol].timestamp,
+            timestamp=tick.timestamp,
         )
-        points = self.position_book.apply_trade(trade)
+        realized_points = self.position_book.apply_trade(trade)
         spec = self.specs[trade.symbol]
-        realized = points * spec.multiplier
-        commission = calculate_commission(spec, trade.offset, trade.price, trade.volume)
+        realized = realized_points * spec.multiplier
+        commission = calculate_commission(
+            spec, trade.offset, trade.price, trade.volume
+        )
         self._realized_pnl += realized
         self._commission += commission
         self._balance += realized - commission
+
         trade = Trade(**{**trade.__dict__, "commission": commission})
         self._trades.append(trade)
-        self._events.append(BrokerEvent("trade", trade))
-        self._events.append(BrokerEvent("order", order))
+        self._events.extend(
+            [BrokerEvent("trade", trade), BrokerEvent("order", order)]
+        )

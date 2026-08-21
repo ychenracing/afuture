@@ -19,3 +19,25 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - run: python -m pytest -q
       - run: python -m compileall -q afuture
+      - run: afuture validate --config config/afuture.example.toml
+      - run: afuture replay --config config/afuture.example.toml --data examples/sample_ticks.csv
+      - name: 验证样例回放闭环
+        run: |
+          python - <<'PY'
+          import json
+          report = json.load(open("runtime/replay_report.json", encoding="utf-8"))
+          assert report["performance"]["trade_count"] == 4
+          assert report["positions"] == []
+          assert report["account"]["margin"] == 0
+          PY
+      - run: afuture scan --config config/afuture.example.toml --data examples/research_ticks.csv
+      - run: >-
+          afuture accept
+          --config config/afuture.example.toml
+          --data examples/research_ticks.csv
+          --pair m_calendar
+          --train-days 4
+          --validation-days 2
+          --oos-days 2
+          --step-days 2
+          --stress-multipliers 1.0,1.5,2.0

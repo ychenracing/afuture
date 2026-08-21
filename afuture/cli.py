@@ -1,20 +1,25 @@
-"""命令行入口。"""
+"""命令行入口。
+
+实盘相关命令默认采用 fail-closed：柜台、完整账户/持仓快照、元数据和持仓对账
+任一安全门未通过，都不会进入正常交易循环。
+"""
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
+import json
 import os
 import time
 
-from .broker.ctp import CtpBroker
+from .alerts import AlertManager, FileAlertSink, WebhookAlertSink
 from .config import load_config
-from .engine import TradingEngine
-from .journal import AuditJournal
+from .data import read_ticks
 from .logging_utils import configure_logging
-from .models import AccountSnapshot, ContractPosition, PairConfig
-from .replay import run_replay
-from .report import write_account_report
-from .risk import RiskManager
+from .metadata import validate_contract_metadata
+from .models import AccountSnapshot, ContractPosition, PairConfig, RuntimeMode
+from .research import AcceptanceGate, ResearchConfig, WalkForwardRunner
+from .scanner import SpreadScanner
 from .state import StateStore
 
 
@@ -23,7 +28,10 @@ _RECOVERY_ACK = "I_VERIFIED_CTP_POSITIONS"
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="afuture", description="国内期货跨期套利交易系统")
+    """创建 CLI，并把研究与实盘入口明确分离。"""
+    parser = argparse.ArgumentParser(
+        prog="afuture", description="国内期货跨期套利交易系统"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     validate = sub.add_parser("validate", help="校验配置，不连接柜台")
@@ -32,6 +40,24 @@ def build_parser() -> argparse.ArgumentParser:
     replay = sub.add_parser("replay", help="历史 Tick 回放")
     replay.add_argument("--config", required=True)
     replay.add_argument("--data", required=True)
+
+    scan = sub.add_parser("scan", help="扫描跨期套利研究候选")
+    scan.add_argument("--config", required=True)
+    scan.add_argument("--data", required=True)
+
+    accept = sub.add_parser("accept", help="执行 Walk-forward/OOS/Stress 晋级验收")
+    accept.add_argument("--config", required=True)
+    accept.add_argument("--data", required=True)
+    accept.add_argument("--pair", required=True)
+    accept.add_argument("--train-days", type=int, default=60)
+    accept.add_argument("--validation-days", type=int, default=20)
+    accept.add_argument("--oos-days", type=int, default=20)
+    accept.add_argument("--step-days", type=int, default=20)
+    accept.add_argument(
+        "--stress-multipliers",
+        default="1.0,1.5,2.0",
+        help="用逗号分隔的交易成本压力倍数",
+    )
 
     live = sub.add_parser("live", help="连接 CTP 柜台")
     live.add_argument("--config", required=True)
@@ -50,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def wait_for_fresh_snapshot(
-    broker: CtpBroker,
+    broker,
     timeout_seconds: float,
     *,
     poll_interval: float = 0.1,
@@ -61,18 +87,19 @@ def wait_for_fresh_snapshot(
     while not broker.snapshot_ready(marker) and time.monotonic() < deadline:
         time.sleep(max(poll_interval, 0.0001))
     if not broker.snapshot_ready(marker):
-        raise RuntimeError("fresh CTP account/position snapshot did not arrive before timeout")
-
+        raise RuntimeError(
+            "fresh CTP account/position snapshot did not arrive before timeout"
+        )
 
 
 def drain_after_halt(
-    engine: TradingEngine,
+    engine,
     broker,
     timeout_seconds: float,
     *,
     poll_interval: float = 0.1,
 ) -> bool:
-    """停机后持续处理撤单/成交回报，尽量在断开前清空活动委托。"""
+    """停机后继续处理撤单/成交回报，尽量在断开前清空活动委托。"""
     deadline = time.monotonic() + max(timeout_seconds, 0.0)
     while True:
         active_orders = broker.get_active_orders()
@@ -89,14 +116,16 @@ def drain_after_halt(
 def validate_recovery_positions(
     pairs: list[PairConfig], positions: list[ContractPosition]
 ) -> None:
-    """恢复时只接受配置内、数量精确且双腿方向相反的完整套利持仓。"""
+    """恢复只接受配置内、双腿等量反向且不超过风险上限的套利持仓。"""
     allowed_symbols = {
         symbol
         for pair in pairs
         for symbol in (pair.near_symbol, pair.far_symbol)
     }
     unknown = sorted(
-        position.symbol for position in positions if position.symbol not in allowed_symbols
+        position.symbol
+        for position in positions
+        if not position.empty and position.symbol not in allowed_symbols
     )
     if unknown:
         raise RuntimeError(
@@ -117,19 +146,27 @@ def validate_recovery_positions(
             raise RuntimeError(
                 f"pair {pair.pair_id} exchange does not match configured exchange"
             )
+
+        long_volume = near.long_total if near.short_total == 0 else 0
         long_spread = (
-            near.long_total == far.short_total == pair.volume
-            and near.short_total == 0
+            long_volume > 0
+            and long_volume == far.short_total
             and far.long_total == 0
         )
+        short_volume = near.short_total if near.long_total == 0 else 0
         short_spread = (
-            near.short_total == far.long_total == pair.volume
-            and near.long_total == 0
+            short_volume > 0
+            and short_volume == far.long_total
             and far.short_total == 0
         )
         if not (long_spread or short_spread):
             raise RuntimeError(
                 f"pair {pair.pair_id} is not a configured balanced spread"
+            )
+        volume = long_volume if long_spread else short_volume
+        if volume > pair.volume:
+            raise RuntimeError(
+                f"pair {pair.pair_id} position exceeds configured risk cap"
             )
 
 
@@ -139,7 +176,7 @@ def adopt_recovery_state(
     account: AccountSnapshot,
     positions: list[ContractPosition],
 ) -> None:
-    """人工恢复只重建期望持仓，不解除停机；下一次启动仍需独立再次对账。"""
+    """人工恢复只重建期望仓位，仍保持停机并要求下一会话重新验元数据和对账。"""
     old_day = str(state.trading_day or "")
     new_day = str(account.trading_day or "")
     if new_day and new_day != old_day:
@@ -155,7 +192,9 @@ def adopt_recovery_state(
     state.kill_reason = (
         "operator adopted verified CTP positions; restart live for independent reconciliation"
     )
+    state.runtime_mode = RuntimeMode.HALTED.value
     state.reconciled = False
+    state.metadata_verified = False
     store.save_positions(state, positions)
 
 
@@ -169,7 +208,7 @@ def _require_production_confirmation(config, args) -> None:
         )
 
 
-def _wait_until_ready(broker: CtpBroker, timeout_seconds: float) -> None:
+def _wait_until_ready(broker, timeout_seconds: float) -> None:
     deadline = time.monotonic() + max(timeout_seconds, 0.0)
     while not broker.is_ready() and time.monotonic() < deadline:
         time.sleep(0.2)
@@ -177,8 +216,24 @@ def _wait_until_ready(broker: CtpBroker, timeout_seconds: float) -> None:
         raise RuntimeError("CTP did not become ready before timeout")
 
 
+def _validate_live_metadata(config, broker) -> None:
+    """人工状态恢复同样拒绝使用低估风险的本地合约参数。"""
+    if not config.require_live_metadata:
+        return
+    live_specs = broker.get_live_contract_specs(
+        list(config.contracts), config.metadata_timeout_seconds
+    )
+    decision = validate_contract_metadata(config.contracts, live_specs)
+    if not decision.allowed:
+        raise RuntimeError(decision.reason)
+
+
 def _recover_state(config, args, logger) -> int:
-    """在持久化停机状态下，经过强确认后把人工核验的柜台持仓重新锚定为期望状态。"""
+    """强确认后把人工核验的柜台持仓重新锚定为期望状态，但不解除停机。"""
+    from .broker.ctp import CtpBroker
+    from .journal import AuditJournal
+    from .report import write_account_report
+
     if config.mode != "live" or config.ctp is None:
         raise ValueError("recover-state requires system.mode=live")
     _require_production_confirmation(config, args)
@@ -194,21 +249,26 @@ def _recover_state(config, args, logger) -> int:
     store = StateStore(config.state_path)
     state = store.load()
     if not state.kill_switch:
-        raise RuntimeError("state recovery is allowed only while the kill switch is active")
+        raise RuntimeError(
+            "state recovery is allowed only while the kill switch is active"
+        )
 
     broker = CtpBroker(config.ctp)
     broker.start()
     try:
         _wait_until_ready(broker, args.startup_timeout)
         wait_for_fresh_snapshot(broker, args.snapshot_wait)
+        _validate_live_metadata(config, broker)
         active_orders = broker.get_active_orders()
         if active_orders:
             for order in active_orders:
                 broker.cancel_order(order.order_id)
             state.kill_switch = True
             state.reconciled = False
+            state.metadata_verified = False
             state.kill_reason = (
-                "active orders found during state recovery; cancelled; rerun recovery after verification"
+                "active orders found during state recovery; cancelled; "
+                "rerun recovery after verification"
             )
             store.save(state)
             raise RuntimeError(
@@ -229,31 +289,27 @@ def _recover_state(config, args, logger) -> int:
         )
         write_account_report(config.report_path, account, positions)
         logger.warning(
-            "已重建本地期望持仓，但停机开关仍保持；必须重新执行 live 完成第二次独立对账"
+            "已重建本地期望持仓，但停机开关仍保持；必须重新执行 live 完成元数据校验和第二次独立对账"
         )
         return 0
     finally:
         broker.stop()
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    config = load_config(args.config)
-    logger = configure_logging(config.log_path)
 
-    if args.command == "validate":
-        logger.info("配置校验通过")
-        return 0
-    if args.command == "replay":
-        account = run_replay(config, args.data)
-        logger.info("回放完成：权益 %.2f，保证金 %.2f", account.equity, account.margin)
-        return 0
+def _build_alert_manager(config) -> AlertManager:
+    sinks = [FileAlertSink(config.alert_path)]
+    if config.alert_webhook:
+        sinks.append(WebhookAlertSink(config.alert_webhook))
+    return AlertManager(sinks)
 
-    if args.command == "recover-state":
-        return _recover_state(config, args, logger)
 
-    if config.mode != "live" or config.ctp is None:
-        raise ValueError("live command requires system.mode=live")
-    _require_production_confirmation(config, args)
+def _run_live(config, args, logger) -> int:
+    """完成柜台、快照、元数据、活动订单和持仓安全门后才进入实时循环。"""
+    from .broker.ctp import CtpBroker
+    from .engine import TradingEngine
+    from .journal import AuditJournal
+    from .report import write_account_report
+    from .risk import RiskManager
 
     broker = CtpBroker(config.ctp)
     engine = TradingEngine(
@@ -264,27 +320,28 @@ def main(argv: list[str] | None = None) -> int:
         StateStore(config.state_path),
         auto_flatten_imbalance=config.auto_flatten_imbalance,
         aggressive_ticks=config.aggressive_ticks,
+        slippage_ticks=config.slippage_ticks,
         legging_timeout_seconds=config.legging_timeout_seconds,
         journal=AuditJournal(config.journal_path),
+        alert_manager=_build_alert_manager(config),
+        require_live_metadata=config.require_live_metadata,
+        metadata_timeout_seconds=config.metadata_timeout_seconds,
     )
     engine.start()
     try:
         try:
             _wait_until_ready(broker, args.startup_timeout)
-        except RuntimeError:
-            engine.emergency_stop("CTP startup timeout")
-            raise
-
-        # 等待官方定时查询链路在“就绪之后”重新返回账户和完整持仓快照。
-        # 不并发手工触发查询，避免和 CTP 查询流控产生竞争。
-        try:
             wait_for_fresh_snapshot(broker, args.snapshot_wait)
-        except RuntimeError:
-            engine.emergency_stop("CTP fresh account/position snapshot timeout")
+        except RuntimeError as exc:
+            engine.emergency_stop(str(exc))
             raise
-        engine.initialize_after_ready()
 
-        # 首次启动或重启都先核对持仓；已有活动订单视为不安全启动。
+        engine.initialize_after_ready()
+        if not engine.state.metadata_verified:
+            raise RuntimeError(
+                f"live contract metadata verification failed: {engine.state.kill_reason}"
+            )
+
         active_orders = broker.get_active_orders()
         if active_orders:
             for order in active_orders:
@@ -294,11 +351,13 @@ def main(argv: list[str] | None = None) -> int:
 
         if engine.halted:
             if not engine.clear_kill_switch_after_reconcile():
-                raise RuntimeError("kill switch remains active because reconciliation did not pass")
+                raise RuntimeError(
+                    "kill switch remains active because reconciliation did not pass"
+                )
         elif not engine.reconcile_startup():
             raise RuntimeError("startup reconciliation failed")
 
-        logger.info("CTP 已就绪并完成持仓对账，交易循环启动")
+        logger.info("CTP 已就绪，元数据与持仓对账通过，交易循环启动")
         while True:
             engine.run_once()
             if engine.halted:
@@ -309,13 +368,99 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if engine.halted and broker.is_ready():
             try:
-                if not drain_after_halt(engine, broker, args.halt_drain):
-                    logger.error("停机后仍有活动委托；已保留停机开关，下一次启动会再次检查并撤单")
+                if not drain_after_halt(
+                    engine, broker, args.halt_drain
+                ):
+                    logger.error(
+                        "停机后仍有活动委托；已保留停机开关，下一次启动会再次检查"
+                    )
             except Exception as exc:
                 logger.error("停机撤单收尾失败：%s", exc)
         try:
-            write_account_report(config.report_path, broker.get_account(), broker.get_positions())
+            write_account_report(
+                config.report_path, broker.get_account(), broker.get_positions()
+            )
         except Exception as exc:
             logger.error("关闭前账户报告写入失败：%s", exc)
         engine.stop()
     return 0
+
+
+def _parse_stress_multipliers(raw: str) -> tuple[float, ...]:
+    values = tuple(float(item.strip()) for item in raw.split(",") if item.strip())
+    if not values or any(value <= 0 for value in values):
+        raise ValueError("stress multipliers must be positive")
+    return values
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    config = load_config(args.config)
+    logger = configure_logging(config.log_path)
+
+    if args.command == "validate":
+        logger.info("配置校验通过")
+        return 0
+
+    if args.command == "replay":
+        from .replay import run_replay
+
+        account = run_replay(config, args.data)
+        logger.info(
+            "回放完成：权益 %.2f，保证金 %.2f", account.equity, account.margin
+        )
+        return 0
+
+    if args.command == "scan":
+        ticks = read_ticks(args.data)
+        scanner = SpreadScanner()
+        rows = []
+        for pair in config.pairs:
+            candidate = scanner.scan_pair(pair, ticks, config.contracts)
+            if candidate is not None:
+                rows.append(asdict(candidate))
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "accept":
+        ticks = read_ticks(args.data)
+        pair = next(
+            (item for item in config.pairs if item.pair_id == args.pair), None
+        )
+        if pair is None:
+            raise ValueError(f"unknown pair: {args.pair}")
+        research_config = ResearchConfig(
+            train_days=args.train_days,
+            validation_days=args.validation_days,
+            oos_days=args.oos_days,
+            step_days=args.step_days,
+            cost_stress_multipliers=_parse_stress_multipliers(
+                args.stress_multipliers
+            ),
+        )
+        result = WalkForwardRunner(
+            config.contracts, config.initial_capital
+        ).run(pair, ticks, research_config)
+        decision = AcceptanceGate().evaluate(result)
+        print(
+            json.dumps(
+                {
+                    "accepted": decision.accepted,
+                    "reasons": decision.reasons,
+                    "selected_parameters": result.selected_parameters,
+                    "folds": [asdict(fold) for fold in result.folds],
+                    "stress_results": result.stress_results,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0 if decision.accepted else 2
+
+    if args.command == "recover-state":
+        return _recover_state(config, args, logger)
+
+    if config.mode != "live" or config.ctp is None:
+        raise ValueError("live command requires system.mode=live")
+    _require_production_confirmation(config, args)
+    return _run_live(config, args, logger)

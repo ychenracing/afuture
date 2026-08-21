@@ -4,7 +4,7 @@ from .models import ContractSpec, Offset
 
 
 def calculate_commission(spec: ContractSpec, offset: Offset, price: float, volume: int) -> float:
-    """按合约配置计算手续费，不在代码中假设交易所费率长期不变。"""
+    """按配置计算手续费，不假设交易所和期货公司费率长期不变。"""
     turnover = price * spec.multiplier * volume
     fee = spec.fee
     if offset is Offset.OPEN:

@@ -1,37 +1,40 @@
 # afuture
 
-`afuture` 是一套面向个人投资者的国内期货**跨期套利交易系统**。系统把研究回放、模拟撮合和 CTP 实盘接入放在同一套策略、风控与订单模型上，默认采用保守的失败关闭（fail-closed）原则。
+`afuture` 是一套面向个人投资者的国内商品期货**同品种跨期套利交易系统**。它把历史研究、保守模拟撮合和 CTP 实盘接入放在同一套策略、风控、执行和状态模型上，核心原则是：**先证明净交易边际，再允许开仓；任何状态不确定时优先减少风险。**
 
-> 期货账户并不是程序直接连到交易所撮合主机。个人投资者通常通过期货公司的 CTP 交易/行情前置接入；`afuture` 的实盘适配器基于 VeighNa 的 `vnpy_ctp`。
+> 个人期货账户通常通过期货公司的 CTP 交易/行情前置接入交易所，并不是程序直接连接交易所撮合主机。项目的实盘适配器基于 VeighNa `vnpy_ctp`。
 
-## 当前能力
+## 当前范围
 
-- 同品种不同月份的跨期价差均值回归策略。
-- 使用双腿最新可成交盘口构造价差，滚动 Z-score 产生开仓、回归退出和极端偏离退出信号。
-- 回放和模拟交易支持一档盘口、限价单、FAK、FOK、部分成交、滑点、保证金、今昨仓和手续费。
-- 上期所、能源中心平今/平昨拆单；其他交易所使用普通平仓。
-- 双腿组合保证金一次性预检，并对静态保证金率增加安全缓冲。
-- 最大保证金、最小可用资金、日亏损、总回撤、单合约手数、组合数量、临近到期禁开仓、行情陈旧和报单速率限制。
-- 双腿非原子成交监控；超时失衡时只减仓修复，并触发持久化停机。
-- CTP 行情、下单、撤单、账户、持仓和交易日适配。
-- 启动持仓对账、活动订单检查、断线停机、停机状态持久化、策略状态恢复。
-- JSONL 审计日志、滚动运行日志、JSON 账户/绩效报告。
-- CLI 支持配置校验、历史回放、CTP 实盘和停机后的人工状态恢复入口。
+正式策略只做同一品种不同交割月份的跨期套利，例如豆粕近月/远月。项目**不**把股指期现套利、跨品种套利、高频做市或方向性期货交易混入当前生产链路。
 
-## 策略边界
+核心能力：
 
-当前正式交易策略只实现**期货跨期套利**，这是有意收窄的范围。股指期货与 ETF 的期现/基差套利需要另一条证券交易通道，CTP 不能完成 ETF 那一腿，因此本项目不会把“只连接 CTP”包装成完整的股指期现套利。
-
-第一阶段建议研究流动性较好的同品种跨期组合，例如豆粕、螺纹钢、PTA 等；这只是研究方向，不是实时品种推荐。合约月份、保证金、手续费、最后交易日和流动性必须在每次实盘前依据开户期货公司的最新信息更新。
+- **可成交价差**：多价差使用 `near.ask - far.bid`，空价差使用 `near.bid - far.ask`，不再只看 mid-price。
+- **Net Edge**：开仓前扣除手续费、滑点和裸腿风险缓冲；Z-score 异常但净边际不足时不交易。
+- **状态化均值回归**：滚动 Z-score、Entry-anchored stop、最长持有、结构性均值漂移/波动率突变退出。
+- **动态手数**：`volume` 是最大允许手数，实际手数由账户风险预算、价差波动、盘口深度和硬上限共同决定。
+- **市场微观结构保护**：盘口宽度、一档深度、涨跌停距离、开盘冷静期、收盘禁开仓窗口、到期日黑名单。
+- **组合风险**：滚动价差变化相关性和 `risk_group` 集中度限制。
+- **双腿异常恢复**：`RUNNING → REDUCE_ONLY → HALTED`；裸腿时持续只减仓修复，风险消除后仍要求人工复核才能恢复正常交易。
+- **CTP 实盘**：行情、下单、撤单、账户、持仓、订单/成交回报、完整持仓快照、交易日处理。
+- **CTP 元数据安全门**：启动时查询合约乘数、price tick、保证金率和账户手续费；本地配置可以更保守，但不能低估柜台真实风险参数。
+- **启动与运行对账**：未知成交、未知活动订单、持仓漂移、CTP 断线或快照陈旧都会触发 fail-closed。
+- **状态完整性**：状态文件带 schema version、单调 sequence、SHA-256 checksum、最后订单/成交 ID，并兼容旧状态迁移。
+- **研究工具**：Scanner 计算成交量、Open Interest、深度、Z-score、半衰期、平稳性代理和 Net Edge；`accept` 执行 Train/Validation/OOS/成本压力 Walk-forward。
+- **保守模拟**：一档深度消耗、部分成交、FAK/FOK、滑点、延迟和 market impact。
+- **审计与告警**：JSONL 审计日志、本地关键告警文件和可选通用 Webhook。
 
 ## 安装
 
-研究、测试和回放：
+研究、回放和测试：
 
 ```bash
 python -m venv .venv
-# Windows: .venv\Scripts\activate
-# Linux/macOS: source .venv/bin/activate
+# Windows
+.venv\Scripts\activate
+# Linux/macOS
+# source .venv/bin/activate
 python -m pip install -e ".[dev]"
 ```
 
@@ -41,133 +44,210 @@ python -m pip install -e ".[dev]"
 python -m pip install -e ".[live,dev]"
 ```
 
-实盘适配器当前针对 `vnpy 4.4.x` 与 `vnpy_ctp 6.7.11.4` 的接口行为实现并测试；`pyproject.toml` 已限制版本范围，避免上游私有回调结构变化时被无意升级。
+实盘适配器针对 `vnpy 4.4.x` 与 `vnpy_ctp 6.7.11.4` 的当前接口行为实现。上游版本变化后必须重新跑测试柜台验收，不能直接升级生产环境依赖。
 
-## 快速验证
+## 快速开始
+
+校验研究配置：
 
 ```bash
 afuture validate --config config/afuture.example.toml
-afuture replay --config config/afuture.example.toml --data examples/sample_ticks.csv
 ```
 
-输出默认位于 `runtime/`：
+保守历史回放：
 
-- `replay_report.json`：账户快照和回测指标。
-- `audit.jsonl`：信号、订单、成交和停机事件。
-- `afuture.log`：运行日志。
-- `replay_state.json`：可恢复的状态快照。
+```bash
+afuture replay \
+  --config config/afuture.example.toml \
+  --data examples/sample_ticks.csv
+```
 
-回放会主动清理其状态文件后重新开始，避免上一次运行污染研究结果。
+扫描当前跨期候选：
+
+```bash
+afuture scan \
+  --config config/afuture.example.toml \
+  --data examples/research_ticks.csv
+```
+
+执行短窗口示例 Walk-forward；真实研究应使用更长窗口：
+
+```bash
+afuture accept \
+  --config config/afuture.example.toml \
+  --data examples/research_ticks.csv \
+  --pair m_calendar \
+  --train-days 4 \
+  --validation-days 2 \
+  --oos-days 2 \
+  --step-days 2 \
+  --stress-multipliers 1.0,1.5,2.0
+```
+
+## 为什么不直接用 Z-score 开仓
+
+传统简化模型常用：
+
+```text
+spread = near.mid - far.mid
+```
+
+但真实双腿成交面对的是：
+
+```text
+多价差开仓 = near.ask - far.bid
+空价差开仓 = near.bid - far.ask
+```
+
+`afuture` 会进一步估算：
+
+```text
+Net Edge
+= 预期均值回归收益
+- 往返手续费
+- 双腿滑点
+- 裸腿风险缓冲
+```
+
+只有统计信号和 Net Edge 同时通过，才进入风险预算与盘口检查。这样能避免“回测看起来有价差，实盘一成交优势就消失”的常见套利假象。
 
 ## 实盘配置
 
-先复制示例配置并修改：
+复制示例：
 
-1. `system.mode = "live"`。
-2. `[ctp]` 中填写期货公司提供的交易前置、行情前置和 `environment = "test"` 或 `"production"`。
-3. 将合约乘数、最小变动价位、保证金率、手续费改成账户真实值。
-4. 每个 `pairs` 必须填写 `expiry_near` 和 `expiry_far`，内容应来自合约真实最后交易日；系统在临近到期窗口禁止新开仓。
-5. 实盘组合不得复用同一个合约，避免持仓归属不清。
+```bash
+cp config/afuture.live.example.toml config/live.toml
+```
 
-敏感字段不写进 TOML：
+CTP 密钥只从环境变量读取：
 
 ```text
 AFUTURE_CTP_USER
 AFUTURE_CTP_PASSWORD
 AFUTURE_CTP_BROKER
-AFUTURE_CTP_APP_ID      # 期货公司要求认证时填写
-AFUTURE_CTP_AUTH_CODE   # 期货公司要求认证时填写
+AFUTURE_CTP_APP_ID
+AFUTURE_CTP_AUTH_CODE
 ```
 
-先使用期货公司测试环境：
+测试柜台：
 
 ```bash
 afuture live --config config/live.toml
 ```
 
-生产柜台额外设置：
+生产柜台额外要求双重确认：
 
 ```text
 AFUTURE_LIVE_ACK=I_UNDERSTAND_FUTURES_RISK
 ```
 
-并显式执行：
-
 ```bash
 afuture live --config config/live.toml --confirm-live
 ```
 
-两道确认不能防止亏损，它们只是降低误连生产账户的概率。
+### 实盘启动安全门
 
-## 实盘启动安全门
+程序不会在登录成功后立即发单。顺序是：
 
-启动后不会立即发单。流程为：
+1. CTP 行情和交易登录、合约初始化完成。
+2. 等待登录之后**新产生**的账户事件和一次完整持仓快照。
+3. 查询实时合约乘数、price tick、保证金和手续费并与本地配置比较。
+4. 若存在遗留活动订单，先撤单并停机。
+5. 本地期望持仓与柜台完整持仓逐合约对账。
+6. 已存在 Kill Switch 时，只有本次会话元数据校验和持仓对账都通过才允许解除。
+7. 进入 `RUNNING`。
 
-1. CTP 行情、交易登录成功并完成合约初始化。
-2. 等待 CTP 定时查询链路返回新的账户事件和一次完整持仓快照。
-3. 若发现遗留活动订单，先撤单并停机。
-4. 本地持久化持仓与柜台持仓逐项对账。
-5. 有历史停机标记时，只有重新连接且对账通过才能解除。
-6. 开始接收信号和发单。
+如果人工交易或其他程序改变了同一账户的仓位，系统会把未知成交/持仓漂移视为异常。因此建议为该系统使用独立期货账户，至少不要让多个程序同时交易同一批合约。
 
-建议使用**独立期货账户或至少保证该账户不被其他程序同时交易**。否则系统无法可靠判断某个持仓/订单是否属于自身套利组合。
+## 异常状态机
+
+```text
+RUNNING
+   │
+   ├─ 普通风险/数据异常 ───────────→ HALTED
+   │
+   └─ 双腿失衡/紧急退出失败 ─────→ REDUCE_ONLY
+                                      │
+                                      ├─ 持续撤单、FAK 只减仓
+                                      │
+                                      └─ 风险恢复 → HALTED → 人工复核
+```
+
+`HALTED` 只表示程序不再增加风险，并不等于仓位一定已经安全。对于裸腿场景，系统会先进入 `REDUCE_ONLY` 尝试降低风险，然后才进入需要人工复核的 `HALTED`。
 
 ## 默认风控
 
-默认值面向约 50 万元级别的谨慎起步，不代表适用于所有账户：
+示例默认值面向约 50 万元级别的谨慎研究起点，不构成资金或品种建议：
 
-| 规则 | 默认值 |
+| 规则 | 示例值 |
 |---|---:|
-| 最大保证金/权益 | 35% |
-| 最小可用资金/权益 | 50% |
+| 最大保证金 / 权益 | 35% |
+| 最小可用资金 / 权益 | 50% |
 | 单交易日最大亏损 | 1% |
-| 从权益高水位最大回撤 | 8% |
+| 权益高水位最大回撤 | 8% |
 | 最大同时套利组合 | 3 |
 | 单合约最大手数 | 10 |
-| 静态保证金估算缓冲 | 1.20 倍 |
-| 行情最大陈旧时间 | 10 秒 |
+| 风险预算 / 权益 / 组合 | 0.20% |
+| 最小一档深度倍数 | 2x |
+| 最大 bid/ask 宽度 | 4 ticks |
+| 涨跌停最小距离 | 3 ticks |
 | 临近到期禁开仓 | 5 天 |
-| 每分钟最大普通报单 | 20 |
-| 双腿失衡允许窗口 | 2 秒 |
+| 普通报单频率 | 20 次/分钟 |
 
-实盘前应按账户规模、品种波动、期货公司保证金和手续费重新设置，而不是直接照抄默认值。
+实盘必须按具体品种波动、账户手续费和期货公司保证金重新设置。
+
+## 研究晋级原则
+
+`accept` 不是“找最高收益参数”，而是：
+
+1. Train + Validation 选择参数。
+2. 参数必须位于相邻参数也表现稳定的区域；多个孤立峰值不自动选冠军。
+3. OOS 只用于验收，不参与前面的参数选择。
+4. 对最终候选执行 1x/1.5x/2x 等交易成本压力。
+5. OOS 正收益比例、最大回撤和成本压力同时达标才晋级。
+
+真实实盘前还应覆盖多年份、不同月份合约、不同波动状态、手续费/滑点扩大和删除单一优势区间等压力场景。
 
 ## 项目结构
 
 ```text
 afuture/
   broker/
-    base.py          # 柜台统一接口
-    sim.py           # 模拟撮合
-    ctp.py           # VeighNa CTP 实盘适配
-  models.py          # 统一领域模型
-  strategy.py        # 跨期均值回归策略
-  risk.py            # 账户和组合级风控
-  execution.py       # 双腿执行与裸腿修复
-  position.py        # 今昨仓和持仓簿
-  engine.py          # 实时/回放统一事件链路
-  state.py           # 状态持久化
-  reconcile.py       # 启动对账
-  data.py            # CSV Tick 数据
-  fees.py            # 手续费模型
-  report.py          # 绩效和账户报告
-  journal.py         # 结构化审计日志
-  cli.py             # 命令行入口
+    base.py             # 柜台统一接口
+    sim.py              # 模拟/保守撮合
+    ctp.py              # VeighNa CTP 实盘适配
+  models.py             # 统一领域模型
+  economics.py          # 可成交价差与 Net Edge
+  strategy.py           # 跨期均值回归与结构失效
+  risk.py               # 账户、市场和动态仓位风控
+  portfolio_risk.py     # 滚动相关性与风险组
+  execution.py          # 双腿执行、回滚和只减仓修复
+  engine.py             # 实时/回放统一事件链
+  health/monitor.py     # 健康门
+  metadata.py           # CTP 实时参数校验
+  state.py              # 可校验状态持久化
+  scanner.py            # 候选扫描
+  calibration.py        # 稳定参数区域选择
+  research.py           # Walk-forward/OOS/Stress
+  alerts.py             # 本地/Webhook 告警
+  journal.py            # 结构化审计日志
+  cli.py                # 命令行入口
 ```
 
-详细说明见：
+进一步说明：
 
-- `docs/architecture.md`
-- `docs/live-trading.md`
-- `docs/data-and-backtest.md`
+- [架构与数据流](docs/architecture.md)
+- [实盘与恢复](docs/live-trading.md)
+- [数据、回放与研究](docs/data-and-backtest.md)
+- [生产上线检查表](docs/production-checklist.md)
 
-## 仍需你在真实账户完成的验证
+## 仍然不能由代码仓库替代的验证
 
-仓库可以建立 CTP 连接并形成完整的软件交易闭环，但代码仓库本身无法替代以下账户侧验证：
+代码可以建立完整的软件闭环，但以下事项只有你的期货公司测试/真实环境才能最终确认：
 
-- 你的期货公司 CTP 前置地址、BrokerID、AppID/AuthCode 是否正确。
-- 账户是否已经开通目标交易所/品种权限。
-- 期货公司实际保证金率、手续费和平今费。
-- 测试柜台中的下单、撤单、断线重连、夜盘交易日和持仓对账。
+- CTP 前置地址、BrokerID、AppID/AuthCode 和账户权限。
+- 账户实际保证金、手续费和平今费查询结果。
+- 测试柜台下单、撤单、部分成交、断线重连、夜盘交易日。
+- 特定期货公司柜台对 CTP 查询频率、风控和报单限制的差异。
 
-因此正确上线顺序是：**历史回放 → CTP 测试环境 → 极小真实仓位 → 再扩大资金**。不要跳过测试柜台直接用 50 万元生产实盘。
+推荐上线顺序：**历史研究 → 保守回放 → CTP 测试柜台 → 极小真实仓位 → 多交易日验证 → 再扩大风险预算**。

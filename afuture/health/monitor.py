@@ -1,14 +1,9 @@
-"""交易系统健康监控。
-
-只负责发现异常，不负责产生交易信号。
-发现连接、行情、账户状态异常时，交由上层风控处理。
-"""
+"""交易系统健康监控。"""
 
 from dataclasses import dataclass
-from time import time
 
 
-@dataclass
+@dataclass(frozen=True)
 class HealthSnapshot:
     """系统健康快照。"""
 
@@ -16,19 +11,42 @@ class HealthSnapshot:
     market_delay_seconds: float
     account_ready: bool
     position_ready: bool
+    quotes_ready: bool = True
 
 
 class HealthMonitor:
-    """检查实时交易环境是否满足运行条件。"""
+    """把连接、账户、持仓和行情健康统一成 fail-closed 判断。"""
 
-    def __init__(self, max_market_delay_seconds: float = 10):
+    def __init__(self, max_market_delay_seconds: float = 10.0) -> None:
         self.max_market_delay_seconds = max_market_delay_seconds
 
+    def evaluate(
+        self,
+        *,
+        connected: bool,
+        account_ready: bool,
+        position_ready: bool,
+        quotes_ready: bool,
+        max_quote_age: float,
+    ) -> str:
+        """返回健康异常原因；空字符串表示通过。"""
+        if not connected:
+            return "broker connection is not healthy"
+        if not account_ready:
+            return "account snapshot is not ready"
+        if not position_ready:
+            return "position snapshot is not ready"
+        if not quotes_ready:
+            return "required market quotes are missing"
+        if max_quote_age > self.max_market_delay_seconds:
+            return "market quote is stale"
+        return ""
+
     def is_healthy(self, snapshot: HealthSnapshot) -> bool:
-        """判断当前环境是否允许继续运行。"""
-        return (
-            snapshot.connected
-            and snapshot.account_ready
-            and snapshot.position_ready
-            and snapshot.market_delay_seconds <= self.max_market_delay_seconds
+        return not self.evaluate(
+            connected=snapshot.connected,
+            account_ready=snapshot.account_ready,
+            position_ready=snapshot.position_ready,
+            quotes_ready=snapshot.quotes_ready,
+            max_quote_age=snapshot.market_delay_seconds,
         )

@@ -1,52 +1,68 @@
-# 安全失败的 CTP 测试柜台模板。复制为 config/live.toml 后再填写真实参数。
-# 本文件故意不填写 expiry_near/expiry_far；未补齐真实最后交易日前，validate 会拒绝通过。
-
+# CTP 测试柜台示例。生产前必须替换合约、到期日、保证金、手续费和前置地址。
 [system]
 mode = "live"
 initial_capital = 500000
 
 [ctp]
 environment = "test"
-td_address = "tcp://replace-with-broker-td-front"
-md_address = "tcp://replace-with-broker-md-front"
+td_address = "tcp://YOUR_TRADE_FRONT"
+md_address = "tcp://YOUR_MARKET_FRONT"
 
 [risk]
-max_margin_ratio = 0.35
+max_margin_ratio = 0.30
 max_daily_loss_ratio = 0.01
 max_total_drawdown_ratio = 0.08
 max_open_pairs = 2
-max_contract_volume = 4
-max_quote_age_seconds = 5
+max_contract_volume = 5
+max_quote_age_seconds = 10
 expiry_blackout_days = 5
-min_available_ratio = 0.50
-margin_estimate_buffer = 1.20
+min_available_ratio = 0.55
+margin_estimate_buffer = 1.25
 max_orders_per_minute = 20
+min_depth_multiple = 2.0
+max_bid_ask_ticks = 3
+limit_distance_ticks = 3
+risk_budget_ratio = 0.0015
+risk_sigma_multiplier = 2.5
+open_cooldown_minutes = 2
+close_blackout_minutes = 5
 
 [execution]
-slippage_ticks = 0
+slippage_ticks = 1
 aggressive_ticks = 1
 auto_flatten_imbalance = true
 legging_timeout_seconds = 2.0
+# 实盘模式不使用模拟撮合参数，但保留显式值避免复制配置时遗漏。
+conservative_simulation = true
+latency_ticks = 1
+market_impact_ticks = 1
+# 实盘应保持 true：本地参数可以更保守，但不能低估 CTP 查询到的真实风险参数。
+require_live_metadata = true
+metadata_timeout_seconds = 15
 
 [paths]
 state = "runtime/live_state.json"
-log = "runtime/afuture-live.log"
+log = "runtime/afuture.log"
 report = "runtime/live_report.json"
-journal = "runtime/live_audit.jsonl"
+journal = "runtime/audit.jsonl"
+alert = "runtime/alerts.jsonl"
 
-# 以下静态参数只是结构示例，实盘前必须按期货公司当前参数替换。
+[alert]
+# 可选通用 Webhook；留空时仍会写本地 alerts.jsonl。
+webhook = ""
+
 [[contracts]]
 symbol = "m2609"
 exchange = "DCE"
 multiplier = 10
 price_tick = 1
+# 必须使用期货公司账户真实值；可比实时查询值更高，不能更低。
 margin_rate_long = 0.15
 margin_rate_short = 0.15
-
 [contracts.fee]
-open_fixed = 2.0
-close_fixed = 2.0
-close_today_fixed = 2.0
+open_fixed = 2
+close_fixed = 2
+close_today_fixed = 2
 
 [[contracts]]
 symbol = "m2701"
@@ -55,22 +71,29 @@ multiplier = 10
 price_tick = 1
 margin_rate_long = 0.15
 margin_rate_short = 0.15
-
 [contracts.fee]
-open_fixed = 2.0
-close_fixed = 2.0
-close_today_fixed = 2.0
+open_fixed = 2
+close_fixed = 2
+close_today_fixed = 2
 
 [[pairs]]
 pair_id = "m_calendar"
 near_symbol = "m2609"
 far_symbol = "m2701"
 exchange = "DCE"
-volume = 1
+volume = 3
 lookback = 60
 entry_z = 2.0
 exit_z = 0.5
 stop_z = 4.0
-sample_seconds = 30
-# expiry_near = "请替换为真实最后交易日，格式 YYYY-MM-DD"
-# expiry_far = "请替换为真实最后交易日，格式 YYYY-MM-DD"
+sample_seconds = 60
+max_holding_samples = 120
+structural_mean_shift_z = 3.0
+structural_vol_ratio = 2.5
+min_net_edge = 100
+legging_buffer = 50
+risk_group = "oilseed"
+# 示例日期不是交易所权威数据；实盘前必须改成目标合约真实最后交易日。
+expiry_near = "2026-09-30"
+expiry_far = "2027-01-31"
+session_windows = ["09:00-11:30", "13:30-15:00", "21:00-23:00"]

@@ -1,6 +1,4 @@
-"""CSV 行情读取与回放数据校验。"""
-
-from __future__ import annotations
+"""CSV Tick 行情读取与回放数据校验。"""
 
 import csv
 from datetime import datetime
@@ -24,14 +22,15 @@ _REQUIRED_COLUMNS = {
 
 def read_ticks(path: str | Path) -> list[Tick]:
     """读取标准化 Tick CSV，并按时间排序。"""
-    path = Path(path)
-    with path.open("r", encoding="utf-8", newline="") as handle:
+    ticks: list[Tick] = []
+    with Path(path).open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         missing = _REQUIRED_COLUMNS - set(reader.fieldnames or [])
         if missing:
             raise ValueError(f"missing columns: {sorted(missing)}")
-        ticks = [
-            Tick(
+
+        for row in reader:
+            tick = Tick(
                 symbol=row["symbol"],
                 exchange=row["exchange"],
                 timestamp=datetime.fromisoformat(row["timestamp"]),
@@ -43,9 +42,9 @@ def read_ticks(path: str | Path) -> list[Tick]:
                 trading_day=row["trading_day"],
                 limit_up=float(row.get("limit_up") or 0.0),
                 limit_down=float(row.get("limit_down") or 0.0),
+                volume=float(row.get("volume") or 0.0),
+                open_interest=float(row.get("open_interest") or 0.0),
             )
-            for row in reader
-        ]
-    for tick in ticks:
-        tick.validate()
+            tick.validate()
+            ticks.append(tick)
     return sorted(ticks, key=lambda item: item.timestamp)
