@@ -65,6 +65,21 @@ class AutoPortfolioRunner:
     MAX_RESEARCH_RISK_BUDGET = 0.02
     MAX_RESEARCH_PAIR_VOLUME = 20
     _INVALID_SCORE = -1.0e12
+    _PARAMETER_KEYS = (
+        "lookback",
+        "entry_z",
+        "exit_z",
+        "min_net_edge",
+        "min_stationarity_score",
+        "max_half_life",
+        "min_persistence_score",
+        "max_volatility_percentile",
+        "max_trend_shift_z",
+        "min_carry_reversal_z",
+        "carry_reversal_weight",
+        "risk_budget_ratio",
+        "max_pair_volume",
+    )
 
     def __init__(self, base_config) -> None:
         if not base_config.auto.enabled:
@@ -77,8 +92,8 @@ class AutoPortfolioRunner:
     ) -> list[dict]:
         """返回预先限定的小型全局参数邻域，不做高维全空间搜索。
 
-        默认 CLI 不优化风险参数；两年真实数据研究可以显式传入受上限约束的
-        ``risk_budget_ratio``/``max_pair_volume``，并且仍只能用 Train+Validation 选择。
+        默认 CLI 不优化风险参数或 regime 参数；两年真实数据研究可以显式传入受上限
+        约束的全局网格，并且所有参数仍只能用 Train+Validation 选择。
         """
         if research.parameter_grid:
             return [dict(row) for row in research.parameter_grid]
@@ -170,16 +185,7 @@ class AutoPortfolioRunner:
                 continue
             parameters = {
                 key: selected[key]
-                for key in (
-                    "lookback",
-                    "entry_z",
-                    "exit_z",
-                    "min_net_edge",
-                    "min_stationarity_score",
-                    "max_half_life",
-                    "risk_budget_ratio",
-                    "max_pair_volume",
-                )
+                for key in self._PARAMETER_KEYS
                 if key in selected
             }
             oos_metrics = self._run_portfolio(self._config_with_parameters(parameters), oos_ticks)
@@ -446,6 +452,11 @@ class AutoPortfolioRunner:
             "min_net_edge": auto.min_net_edge,
             "min_stationarity_score": auto.min_stationarity_score,
             "max_half_life": auto.max_half_life,
+            "min_persistence_score": auto.min_persistence_score,
+            "max_volatility_percentile": auto.max_volatility_percentile,
+            "max_trend_shift_z": auto.max_trend_shift_z,
+            "min_carry_reversal_z": auto.min_carry_reversal_z,
+            "carry_reversal_weight": auto.carry_reversal_weight,
         }
 
     def _cost_stress(self, config, multiplier: float):
