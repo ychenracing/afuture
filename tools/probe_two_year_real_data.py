@@ -1,6 +1,6 @@
-"""Probe two years of real specific-contract futures history through AKShare.
+"""Fetch real specific-contract futures history through AKShare for two-year research.
 
-The exchange aggregate endpoint can reject cloud-runner requests, so this probe uses
+The exchange aggregate endpoint can reject cloud-runner requests, so this script uses
 AKShare's documented Sina specific-contract history interfaces. It is research-only and
 never enters the production trading path.
 """
@@ -16,31 +16,63 @@ import akshare as ak
 import pandas as pd
 
 START_DATE = pd.Timestamp("2024-08-21")
-END_DATE = pd.Timestamp("2026-08-20")
+END_DATE = pd.Timestamp("2026-08-20 23:59:59")
 
 
-def _symbols() -> list[str]:
-    symbols: list[str] = []
+def symbols() -> list[str]:
+    result: list[str] = []
     for product in ("M", "C", "P"):
         for contract in ("2501", "2505", "2509", "2601", "2605", "2609", "2701"):
-            symbols.append(f"{product}{contract}")
+            result.append(f"{product}{contract}")
     for contract in ("2410", "2501", "2505", "2510", "2601", "2605", "2610", "2701"):
-        symbols.append(f"RB{contract}")
-    # Sina uses four-digit year/month symbols for the historical CZCE endpoint.
+        result.append(f"RB{contract}")
     for contract in ("2409", "2501", "2505", "2509", "2601", "2605", "2609", "2701"):
-        symbols.append(f"TA{contract}")
-    return symbols
+        result.append(f"TA{contract}")
+    return result
 
 
-def _product(symbol: str) -> str:
+def product_of(symbol: str) -> str:
     match = re.match(r"[A-Za-z]+", symbol)
     return match.group(0).upper() if match else ""
 
 
-def _minute_probe() -> dict[str, object]:
-    """Check whether Sina minute history is deep enough for rolling multi-year research."""
+def fetch_daily(symbol: str) -> pd.DataFrame:
+    frame = ak.futures_zh_daily_sina(symbol=symbol).copy()
+    if frame.empty:
+        return frame
+    date_col = "date" if "date" in frame.columns else str(frame.columns[0])
+    frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
+    frame = frame.loc[
+        (frame[date_col] >= START_DATE.normalize())
+        & (frame[date_col] <= END_DATE.normalize())
+    ].copy()
+    if not frame.empty:
+        frame.rename(columns={date_col: "date"}, inplace=True)
+        frame["symbol"] = symbol
+        frame["product"] = product_of(symbol)
+    return frame
+
+
+def fetch_60m(symbol: str) -> pd.DataFrame:
+    frame = ak.futures_zh_minute_sina(symbol=symbol, period="60").copy()
+    if frame.empty:
+        return frame
+    time_col = "datetime" if "datetime" in frame.columns else str(frame.columns[0])
+    frame[time_col] = pd.to_datetime(frame[time_col], errors="coerce")
+    frame = frame.loc[
+        (frame[time_col] >= START_DATE) & (frame[time_col] <= END_DATE)
+    ].copy()
+    if not frame.empty:
+        frame.rename(columns={time_col: "datetime"}, inplace=True)
+        frame["symbol"] = symbol
+        frame["product"] = product_of(symbol)
+    return frame
+
+
+def minute_depth_probe() -> dict[str, object]:
+    """Document why 60m is the highest frequency with rolling two-year coverage."""
     result: dict[str, object] = {}
-    for symbol in ("M2501", "M2605", "M2609", "RB2505", "RB2605", "TA2505", "TA2605"):
+    for symbol in ("M2501", "M2605", "RB2505", "RB2605", "TA2505", "TA2605"):
         periods: dict[str, object] = {}
         for period in ("60", "15", "1"):
             try:
@@ -66,50 +98,51 @@ def _minute_probe() -> dict[str, object]:
 def main() -> None:
     output = Path("runtime")
     output.mkdir(parents=True, exist_ok=True)
-    rows: list[pd.DataFrame] = []
+    daily_rows: list[pd.DataFrame] = []
+    hourly_rows: list[pd.DataFrame] = []
     status: dict[str, object] = {}
 
-    for symbol in _symbols():
+    for symbol in symbols():
+        row: dict[str, object] = {}
         try:
-            frame = ak.futures_zh_daily_sina(symbol=symbol)
+            daily = fetch_daily(symbol)
+            if not daily.empty:
+                daily_rows.append(daily)
+                row["daily_rows"] = int(len(daily))
+                row["daily_first"] = daily["date"].min().date().isoformat()
+                row["daily_last"] = daily["date"].max().date().isoformat()
         except Exception as exc:
-            status[symbol] = {"error": f"{type(exc).__name__}: {exc}"}
-            continue
-        if frame is None or frame.empty:
-            status[symbol] = {"rows": 0}
-            continue
+            row["daily_error"] = f"{type(exc).__name__}: {exc}"
 
-        date_col = "date" if "date" in frame.columns else str(frame.columns[0])
-        frame = frame.copy()
-        frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
-        frame = frame.loc[
-            (frame[date_col] >= START_DATE) & (frame[date_col] <= END_DATE)
-        ].copy()
-        if frame.empty:
-            status[symbol] = {"rows": 0, "outside_window": True}
-            continue
-        frame["symbol"] = symbol
-        frame["product"] = _product(symbol)
-        rows.append(frame)
-        status[symbol] = {
-            "rows": int(len(frame)),
-            "first_date": frame[date_col].min().date().isoformat(),
-            "last_date": frame[date_col].max().date().isoformat(),
-        }
+        try:
+            hourly = fetch_60m(symbol)
+            if not hourly.empty:
+                hourly_rows.append(hourly)
+                row["hourly_rows"] = int(len(hourly))
+                row["hourly_first"] = hourly["datetime"].min().isoformat()
+                row["hourly_last"] = hourly["datetime"].max().isoformat()
+                row["hourly_days"] = int(hourly["datetime"].dt.date.nunique())
+        except Exception as exc:
+            row["hourly_error"] = f"{type(exc).__name__}: {exc}"
+        status[symbol] = row
 
-    combined = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
-    if combined.empty:
-        raise RuntimeError("Sina specific-contract endpoint returned no target history")
+    daily_all = pd.concat(daily_rows, ignore_index=True) if daily_rows else pd.DataFrame()
+    hourly_all = pd.concat(hourly_rows, ignore_index=True) if hourly_rows else pd.DataFrame()
+    if daily_all.empty or hourly_all.empty:
+        raise RuntimeError("specific-contract history did not provide both daily and 60m data")
 
-    product_summary: dict[str, object] = {}
-    for product, group in combined.groupby("product"):
-        dates = pd.to_datetime(group["date"], errors="coerce").dropna()
-        product_summary[str(product)] = {
-            "rows": int(len(group)),
-            "symbols": sorted(group["symbol"].astype(str).unique().tolist()),
-            "first_date": dates.min().date().isoformat(),
-            "last_date": dates.max().date().isoformat(),
-            "trading_days": int(dates.dt.date.nunique()),
+    products: dict[str, object] = {}
+    for product, daily_group in daily_all.groupby("product"):
+        hourly_group = hourly_all.loc[hourly_all["product"] == product]
+        products[str(product)] = {
+            "daily_trading_days": int(daily_group["date"].dt.date.nunique()),
+            "daily_first": daily_group["date"].min().date().isoformat(),
+            "daily_last": daily_group["date"].max().date().isoformat(),
+            "hourly_rows": int(len(hourly_group)),
+            "hourly_trading_days": int(hourly_group["datetime"].dt.date.nunique()),
+            "hourly_first": hourly_group["datetime"].min().isoformat() if not hourly_group.empty else None,
+            "hourly_last": hourly_group["datetime"].max().isoformat() if not hourly_group.empty else None,
+            "symbols": sorted(daily_group["symbol"].astype(str).unique().tolist()),
         }
 
     report = {
@@ -117,11 +150,12 @@ def main() -> None:
         "start_date": START_DATE.date().isoformat(),
         "end_date": END_DATE.date().isoformat(),
         "generated_on": date.today().isoformat(),
-        "products": product_summary,
+        "products": products,
         "symbol_status": status,
-        "minute_probe": _minute_probe(),
+        "minute_depth_probe": minute_depth_probe(),
     }
-    combined.to_csv(output / "two_year_specific_contract_daily.csv", index=False)
+    daily_all.to_csv(output / "two_year_specific_contract_daily.csv", index=False)
+    hourly_all.to_csv(output / "two_year_specific_contract_60m.csv", index=False)
     (output / "realdata_probe.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
