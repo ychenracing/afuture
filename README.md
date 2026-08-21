@@ -1,25 +1,94 @@
 # afuture
 
-`afuture` 是一套面向个人使用的国内商品期货**同品种跨期套利自动交易系统**。目标不是建设交易平台，而是保持一条小而完整的闭环：
+`afuture` 是一个面向个人使用的国内商品期货**同品种跨期套利自动交易程序**。目标不是建设庞大交易平台，而是保持一条小而完整、可审计、可停机恢复的生产闭环：
 
 ```text
-发现具体合约 → 筛选净机会 → 风险预算 → 双腿执行 → 异常减仓 → 证据复验
+真实数据资格门 → CTP 合约发现 → 自动选相邻月份 → 统计/流动性/Net Edge 筛选
+             → 风险预算 → 双腿执行 → 异常只减仓 → Shadow/实盘证据复验
 ```
 
-系统基于 VeighNa `vnpy_ctp` 接入期货公司 CTP。正式策略只做同一品种不同交割月份的跨期套利，不混入方向性期货、跨品种、期现、期权或高频做市。
+系统基于 VeighNa `vnpy_ctp` 接入期货公司 CTP。正式策略只做同一品种不同交割月份的跨期套利，不引入方向性期货、跨品种、期现、期权、高频做市、在线自动调参或机器学习选标。
 
-> **重要：** 软件闭环完整不等于已经证明高收益/低回撤。最终生产晋级以真实多年份数据的 `accept-auto`、CTP Shadow/测试柜台和极小真实仓位证据为准。
+> 历史回测不能保证未来高收益或低回撤。当前代码已经完成工程闭环和真实历史证据门，但生产晋级仍必须依赖 Shadow、测试柜台和极小真实仓位的实际手续费/滑点/稳定性证据。
 
-## 当前生产链
+## 当前生产策略
+
+截至 2026-08-21 的固定生产候选白名单：
+
+- `M`：豆粕；
+- `OI`：菜籽油。
+
+运行时不会写死具体交割合约，而是从 CTP 合约目录中自动选择上述品种当前可交易的相邻月份组合。中心信号参数：
+
+| 参数 | 值 |
+|---|---:|
+| `signal_transform` | `log_ratio` |
+| `lookback` | 25 个日样本 |
+| `entry_z` | 2.50 |
+| `confirmation_retrace_z` | 0.30 |
+| `min_confirmed_entry_z` | 1.75 |
+| `exit_z` | 0.75 |
+| `stop_z` | 4.00 |
+| `entry_trend_window` | 6 |
+| `max_entry_z_slope` | 0.75 |
+| `min_stationarity_score` | 0.01 |
+| `max_half_life` | 60 |
+| `max_holding_samples` | 20 天 |
+| `daily_sample_window` | 22:55-23:00 |
+
+入场不是看到 `±2.5σ` 就立即逆势交易，而是先武装极端偏离，再等待至少 `0.30σ` 的回归确认，同时仍保留至少 `1.75σ` 的有效偏离。随后还必须继续通过趋势斜率、平稳性、半衰期、成交量、Open Interest、盘口深度、双腿同步和 Net Edge 硬门。
+
+## 两年真实数据证据
+
+主验收来自 AKShare 新浪**具体交割合约** 60 分钟历史，不使用连续合约或随机合成数据。
+
+```text
+最近窗口：2024-08-21 ~ 2026-08-20，484 个交易日
+独立前置窗口：2022-08-22 ~ 2024-08-20，485 个交易日
+研究品种：A C EG FG I M MA OI P PP RB RM SA TA Y
+最近两年约 9.9 万根具体合约 60 分钟 K 线
+```
+
+最近两年严格切分：
+
+```text
+Train       2024-08-21 ~ 2025-08-20
+Validation  2025-08-21 ~ 2026-02-20
+Final OOS   2026-02-21 ~ 2026-08-20
+```
+
+品种和参数资格先由 Train + Validation 固定，Final OOS 只负责否决。在 **2x 保守往返成本** 下，中心方案证据：
+
+| 验收 | 合格品种 | 交易数 | 累计 R | 最大回撤 R | 胜率 |
+|---|---|---:|---:|---:|---:|
+| 2022-2024 资格 → 下一年 Forward | A | 4 | +0.193 | -0.062 | 50% |
+| Train + Validation → Final OOS | M、OI | 4 | +1.208 | -0.042 | 75% |
+| 最近两年 M、OI 全窗口（描述性） | M、OI | 15 | +7.588 | -0.182 | 86.7% |
+
+16 组单变量参数邻域中 9 组同时通过前置 Forward 与当前 Final OOS，邻域通过率 `56.25%`。这说明中心点不是单一历史尖峰，但样本数量仍然偏少，因此不继续为了抬高回测收益扩大参数自由度。
+
+风险比例历史代理（不是实盘收益预测）：
+
+| 每笔风险比例 | 两年复合收益代理 | 历史最大回撤代理 |
+|---:|---:|---:|
+| 1.0% | +7.8% | -0.18% |
+| 1.5% | +11.9% | -0.27% |
+| 2.0% | +16.1% | -0.36% |
+
+生产示例把 `2%` 作为候选风险预算上限，同时保留 `35%` 保证金上限、`1%` 日亏损熔断和 `8%` 权益高水位回撤熔断；真实手数还会被盘口深度、保证金、单合约上限和 CTP 实时参数进一步压缩。
+
+完整证据见 [`docs/two_year_real_data_validation.md`](docs/two_year_real_data_validation.md)。
+
+## 生产链路
 
 ```text
 CTP Contract Catalog / Historical Catalog
                   ↓
             AutoPairManager
-  相邻月份 + 到期过滤 + 少量白名单
+  M/OI 白名单 + 到期过滤 + 相邻月份
                   ↓
- volume / OI / depth / executable Z-score
- half-life / stationarity / Net Edge
+ daily log-ratio / confirmation / stationarity
+ volume / OI / depth / executable Net Edge
                   ↓
        少量 open-eligible pairs
                   ↓
@@ -32,18 +101,15 @@ CTP Contract Catalog / Historical Catalog
        CtpBroker / SimBroker
 ```
 
-关键原则：
+关键约束：
 
-- **可成交价差**：多价差用 `near.ask - far.bid`，空价差用 `near.bid - far.ask`；退出和止损同样使用可实际平仓的方向性价差。
-- **Net Edge**：开仓前扣除手续费、滑点和裸腿风险缓冲；统计偏离明显但净边际不足时不交易。
-- **自动发现**：CTP 合约目录 → 品种白名单 → 到期过滤 → 相邻月份 → 活动度/均值回归/Net Edge 排名。
-- **管理权与开仓权分离**：已有持仓即使失去 Auto 资格仍继续管理退出，但会立刻失去新开仓权限；平仓后立即退役。
-- **动态手数**：`PairConfig.volume` 是上限，真实开仓手数由账户权益、价差波动、盘口深度和硬上限共同决定。
-- **组合风险**：限制同风险组暴露和高相关价差组合。
-- **异常状态机**：`RUNNING → REDUCE_ONLY → HALTED`；裸腿优先只减仓，不把“程序停机”误当作“风险已消失”。
-- **真实元数据**：动态候选使用 CTP 合约乘数、price tick、保证金和手续费；慢速费率查询在后台预取，不阻塞 Tick 主循环。
-- **有限 warm history**：实盘只持久化 `lookback + buffer` 级别采样行情，盘中重启不必从零等待完整 lookback。
-- **状态真相**：本地期望持仓与柜台完整快照分离，未知成交/订单/持仓漂移 fail-closed。
+- **可成交价差**：开仓、退出和止损都按真实可成交 bid/ask 方向计算，不用 mid-price 冒充成交；
+- **管理权与开仓权分离**：已有持仓即使失去 Auto 资格仍继续管理退出，但不能重新开仓；
+- **非阻塞元数据**：保证金/手续费查询在后台预取，Tick 关键路径不等待慢速 CTP 查询；
+- **有限 warm history**：只持久化 `lookback + buffer` 级别采样行情，日常重启不从零重新预热；
+- **组合风险**：限制同风险组暴露和高相关价差组合；
+- **异常状态机**：`RUNNING → REDUCE_ONLY → HALTED`，裸腿先减风险，状态不确定时 fail-closed；
+- **状态真相**：本地期望持仓与柜台完整快照分离，未知成交/订单/持仓漂移都会阻止继续开仓。
 
 ## 安装
 
@@ -64,11 +130,11 @@ python -m pip install -e ".[dev]"
 python -m pip install -e ".[live,dev]"
 ```
 
-当前实盘适配器针对 `vnpy 4.4.x` 与 `vnpy_ctp 6.7.11.4` 接口行为实现。升级 CTP/VeighNa 后必须重新跑测试柜台验收。
+当前实盘适配器针对 `vnpy 4.4.x` 与 `vnpy_ctp 6.7.11.4` 接口行为实现。升级 CTP/VeighNa 后必须重新做测试柜台验收。
 
-## 研究流程
+## 研究与验收
 
-### 1. 先检查数据
+先检查数据：
 
 ```bash
 afuture data-check \
@@ -76,37 +142,7 @@ afuture data-check \
   --data path/to/multi_contract_ticks.csv
 ```
 
-`data-check` 保留源 CSV 原始顺序，检查：
-
-- 时间范围、交易日数、每日样本数；
-- 合约/品种覆盖；
-- 重复与乱序；
-- 无效盘口；
-- volume/OI 缺失比例；
-- 涨跌停字段缺失；
-- 日内长断档；
-- 每日 Auto 是否真的有双腿候选；
-- 单一品种样本是否过度集中。
-
-### 2. 普通回放
-
-```bash
-afuture replay \
-  --config config/afuture.example.toml \
-  --data examples/sample_ticks.csv
-```
-
-### 3. Auto 回放
-
-```bash
-afuture replay \
-  --config config/afuture.auto-replay.example.toml \
-  --data examples/auto_sample_ticks.csv
-```
-
-Auto 回放和实盘使用同一个 `AutoPairManager → TradingEngine → RiskManager → PairExecutor` 生命周期，不另写一套“研究版选标器”。
-
-### 4. 单 pair 诊断
+单 pair 诊断：
 
 ```bash
 afuture accept \
@@ -120,9 +156,7 @@ afuture accept \
   --stress-multipliers 1.0,1.5,2.0
 ```
 
-`accept` 保留用于单 pair 研究和定位 first divergence，但它**不是最终机器人的生产晋级门**。
-
-### 5. 最终 Auto Portfolio 晋级
+最终 Auto Portfolio 研究入口：
 
 ```bash
 afuture accept-auto \
@@ -135,31 +169,9 @@ afuture accept-auto \
   --stress-multipliers 1.0,1.5,2.0
 ```
 
-`accept-auto` 直接运行最终 Auto Portfolio，包含：
+`accept-auto` 复用最终生产链，覆盖 Train/Validation/OOS、全局小型参数邻域、成本压力、leave-one-product-out、single-product attribution、remove-best-period、深度 haircut、延迟、market impact、数据缺失、双腿异步和 activity 缺失。
 
-- Train → Validation → OOS 时间隔离；
-- 小型**全局**参数邻域，只调信号/候选参数，不为每个商品单独过拟合；
-- OOS 不参与参数选择；
-- 1x / 1.5x / 2x 成本压力；
-- leave-one-product-out；
-- single-product attribution；
-- remove-best-OOS-period；
-- top-depth haircut；
-- 延迟和 market impact；
-- 确定性 Tick 缺失；
-- 0.5 / 1 / 2 秒双腿异步；
-- 少量 volume/OI 缺失。
-
-默认预注册门要求：
-
-- 聚合 OOS 收益必须为正；
-- 正收益 OOS fold 比例至少 60%；
-- 最差 OOS 回撤不超过 6%；
-- OOS 必须有足够交易样本；
-- 成本压力不能严重崩塌；
-- 多品种时不能出现明显单一品种垄断或 leave-one-product-out 灾难性失效。
-
-这些阈值是研究门，不是收益保证，也不能为了看到最终 OOS 后再反向移动。
+两年真实数据重新抓取属于昂贵的 L4 证据门，`.github/workflows/research-2y.yml` 只保留手动触发；普通小改动不重复抓取和回测相同历史状态。
 
 ## Shadow：真实行情，不发真实单
 
@@ -167,17 +179,9 @@ afuture accept-auto \
 afuture shadow --config config/live.toml
 ```
 
-Shadow：
+Shadow 使用真实 CTP 行情、合约目录、保证金和手续费元数据，但订单只进入本地保守 `SimBroker`，不会调用真实 CTP `send_order()`。
 
-- 连接真实 CTP；
-- 使用真实合约目录；
-- 使用真实行情；
-- 查询真实保证金/手续费元数据；
-- 运行真实 Auto Selector / RiskManager / PairExecutor；
-- 所有订单只进入本地保守 `SimBroker`；
-- `ShadowBroker.send_order()` 从类型层面不调用真实 CTP `send_order()`。
-
-Shadow 每次启动使用新的虚拟账户，证据写入：
+证据输出：
 
 ```text
 runtime/shadow_execution_quality.jsonl
@@ -185,33 +189,13 @@ runtime/shadow_market_samples/
 runtime/shadow_audit.jsonl
 ```
 
-查看汇总：
+汇总：
 
 ```bash
 afuture quality-report --config config/live.toml --shadow
 ```
 
-## Execution Quality
-
-Live/Shadow 会记录三层证据：
-
-1. `candidate`：pair、Z-score、平稳性、半衰期、volume/OI、depth、候选分数、预期 Net Edge、拒绝原因；
-2. `decision`：交易动作、风险手数、是否允许、执行拒绝原因；
-3. `round_trip`：预期/实际价差、滑点、手续费、双腿成交时间差、部分成交、rollback、REDUCE_ONLY、realized Net Edge。
-
-Live 默认写：
-
-```text
-runtime/execution_quality.jsonl
-```
-
-汇总：
-
-```bash
-afuture quality-report --config config/live.toml
-```
-
-CTP 成交回报本身通常不携带结算后的单笔账户手续费，因此正式分析应把程序根据**实时查询费率 + 实际成交价**计算的手续费与期货公司结算单定期核对；不能把模型手续费冒充结算单真值。
+Execution Quality 会记录 candidate、decision、round-trip 三层证据，包括预期/实际价差、手续费、滑点、双腿成交时间差、部分成交、rollback、REDUCE_ONLY 和 realized Net Edge。
 
 ## CTP Doctor
 
@@ -219,19 +203,11 @@ CTP 成交回报本身通常不携带结算后的单笔账户手续费，因此�
 afuture doctor --config config/live.toml
 ```
 
-`doctor` 只检查：
-
-- 行情/交易登录；
-- fresh account + position snapshot；
-- 合约目录；
-- 少量合约元数据查询；
-- 当前账户/交易日。
-
-**Doctor 永远不下单。** 真正的 FAK、部分成交、拒单、断线、平今/平昨 smoke 必须在期货公司测试柜台按生产检查表执行，不能由仓库在没有你的测试账户时伪造“已通过”。
+`doctor` 只检查登录、fresh account/position snapshot、合约目录、少量元数据和交易日，**永远不下单**。FAK/FOK、部分成交、拒单、断线、平今/平昨仍必须在期货公司测试柜台验证。
 
 ## 实盘
 
-复制：
+复制配置：
 
 ```bash
 cp config/afuture.live.example.toml config/live.toml
@@ -253,71 +229,32 @@ AFUTURE_CTP_AUTH_CODE
 afuture live --config config/live.toml
 ```
 
-生产柜台额外要求：
+生产柜台还要求：
 
 ```text
 AFUTURE_LIVE_ACK=I_UNDERSTAND_FUTURES_RISK
 ```
 
-并显式：
+并显式执行：
 
 ```bash
 afuture live --config config/live.toml --confirm-live
 ```
 
-启动顺序：CTP 就绪 → Auto 合约目录/恢复 → fresh 账户/完整持仓快照 → 元数据门 → 遗留订单门 → 本地/柜台持仓对账 → `RUNNING`。
+启动顺序：CTP 就绪 → Auto 合约目录/历史恢复 → fresh 账户/完整持仓快照 → 元数据门 → 遗留订单门 → 本地/柜台持仓对账 → `RUNNING`。
 
-## 默认范围与明确不做
+## 现在不继续增加什么
 
-默认只使用一个小商品白名单并只开少量组合。代码支持扩大 Universe，但当前不建议：
+当前最大不确定性是 **Alpha 在真实执行后的持续性**，不是功能数量。除非后续 OOS/Shadow/实盘证据明确指出缺口，否则不继续增加：
 
-- `products=["*"]` 全市场扫描；
-- 每个商品单独优化一套参数；
+- 全市场 `products=["*"]`；
+- 每商品独立参数；
 - 在线自动调参；
-- 机器学习/AI 选标；
-- 跨品种/跨交易所/期现/期权新策略；
-- 默认开启夜盘；
-- 为追求回测收益提高杠杆；
+- 新套利品类或方向性策略；
+- 为提高回测收益扩大风险预算；
 - GUI、Web 后台、数据库、Redis、Kafka、微服务。
 
-当前最大不确定性是 **Alpha 是否真实**，不是功能不够多。
-
-## Feature Freeze 条件
-
-以下证据全部满足后应停止继续增加策略功能：
-
-1. 最终 Auto Portfolio 多年份 Walk-forward/OOS 通过；
-2. 2x 成本压力和数据/微观结构扰动没有明显崩塌；
-3. leave-one-product-out 没有灾难性依赖；
-4. Shadow 证明实时盘口中仍存在足够 Net Edge；
-5. CTP 测试柜台完成订单、部分成交、断线、交易日和恢复验证；
-6. 极小真实仓位连续多交易日无状态/对账/执行事故；
-7. 实际手续费/滑点没有吞掉大部分预期 Edge；
-8. 回撤符合预注册门。
-
-达到后主要工作应转为观察、维护、CTP/交易所变化适配和定期 OOS 复验，而不是继续堆特征。
-
-## 项目结构
-
-```text
-afuture/
-  auto.py               # CTP 合约发现、排名、动态生命周期
-  auto_runtime.py       # 非阻塞 CTP 元数据预取
-  auto_research.py      # 最终 Auto Portfolio Walk-forward/OOS/Stress
-  auto_acceptance.py    # 预注册 Auto 晋级门
-  data_quality.py       # 研究数据质量门
-  sample_store.py       # 有界 warm sampled history
-  quality.py            # candidate / decision / execution quality
-  strategy.py           # 跨期均值回归与结构失效
-  risk.py               # 账户/市场/动态仓位风控
-  portfolio_risk.py     # 相关性与风险组
-  execution.py          # 双腿执行、回滚、只减仓修复
-  engine.py             # 统一实时/回放事件链
-  broker/
-    sim.py              # 保守模拟撮合
-    shadow.py           # 真实行情 + 本地模拟订单
-    ctp.py              # VeighNa CTP
-```
+达到以下条件后应保持 Feature Freeze：多年份 OOS/成本压力不崩塌、Shadow 仍有真实 Net Edge、CTP 测试柜台通过异常场景、极小真实仓位连续运行无状态/对账事故、实际手续费和滑点没有吞掉主要 Edge、实际回撤符合预注册门。此后主要工作是观察、维护和定期 OOS 复验，而不是继续堆特征。
 
 详细说明：
 

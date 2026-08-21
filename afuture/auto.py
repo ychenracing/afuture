@@ -1,16 +1,17 @@
 """轻量级自动合约发现与跨期组合选择。
 
-这个模块只解决“从哪里交易”这一件事：从 CTP 合约目录中生成同品种相邻月份，
-观察实时盘口后按流动性、成交量、持仓量、均值回归和 Net Edge 排名。
-它不创建第二套策略、风控或执行系统，选中的组合仍交给 ``TradingEngine`` 处理。
+从 CTP 合约目录生成同品种相邻月份，观察盘口后按活动度、统计质量和净边际排名。
+选标只负责“从哪里交易”，正式策略、风险和执行仍走唯一生产链路。
 """
 
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from dataclasses import dataclass
-from datetime import date, datetime
+from dataclasses import asdict, dataclass
+from datetime import date, datetime, time
+from math import log
 from typing import Iterable
+from zoneinfo import ZoneInfo
 
 from .auto_runtime import MetadataPrefetcher
 from .models import ContractInfo, ContractSpec, PairConfig, Tick
@@ -18,13 +19,12 @@ from .sample_store import MarketSampleStore
 from .scanner import SpreadScanner
 
 
+_CHINA_TZ = ZoneInfo("Asia/Shanghai")
+
+
 @dataclass(frozen=True)
 class AutoConfig:
-    """自动发现的最小配置。
-
-    默认不自动启用；实盘示例会显式开启。``products`` 是品种白名单，避免个人程序
-    一次订阅全市场数百个合约，把复杂度和 CTP 流控风险无意义放大。
-    """
+    """自动发现的最小配置。"""
 
     enabled: bool = False
     products: tuple[str, ...] = ("m", "rb", "TA", "c", "p")
@@ -46,6 +46,14 @@ class AutoConfig:
     structural_mean_shift_z: float = 3.0
     structural_vol_ratio: float = 2.5
     legging_buffer: float = 0.0
+
+    signal_transform: str = "spread"
+    confirm_entry: bool = False
+    confirmation_retrace_z: float = 0.0
+    min_confirmed_entry_z: float = 0.0
+    entry_trend_window: int = 6
+    max_entry_z_slope: float = 999.0
+    daily_sample_window: str = ""
 
     min_volume: float = 5000.0
     min_open_interest: float = 10000.0
@@ -78,6 +86,17 @@ class AutoConfig:
             raise ValueError("auto z-score thresholds are invalid")
         if self.max_pair_volume <= 0:
             raise ValueError("auto max_pair_volume must be positive")
+        if self.signal_transform not in {"spread", "log_ratio"}:
+            raise ValueError("auto signal_transform must be spread or log_ratio")
+        if self.confirm_entry:
+            if self.confirmation_retrace_z <= 0:
+                raise ValueError("auto confirmation_retrace_z must be positive")
+            if not 0 < self.min_confirmed_entry_z < self.entry_z:
+                raise ValueError("auto min_confirmed_entry_z must be below entry_z")
+        if self.entry_trend_window < 2 or self.max_entry_z_slope <= 0:
+            raise ValueError("auto entry trend limits are invalid")
+        if self.daily_sample_window:
+            self._parse_daily_window(self.daily_sample_window)
         if self.min_volume < 0 or self.min_open_interest < 0:
             raise ValueError("auto activity thresholds cannot be negative")
         if not 0 <= self.min_liquidity_score <= 1:
@@ -86,6 +105,17 @@ class AutoConfig:
             raise ValueError("auto min_stationarity_score must be between 0 and 1")
         if self.max_half_life <= 0 or self.metadata_timeout_seconds <= 0:
             raise ValueError("auto half-life/metadata timeout must be positive")
+
+    @staticmethod
+    def _parse_daily_window(raw: str) -> tuple[time, time]:
+        try:
+            left, right = raw.split("-", 1)
+            start, end = time.fromisoformat(left), time.fromisoformat(right)
+        except ValueError as exc:
+            raise ValueError(f"invalid auto daily sample window: {raw}") from exc
+        if start >= end:
+            raise ValueError("auto daily sample window must be increasing")
+        return start, end
 
 
 class AutoPairSelector:
@@ -132,9 +162,8 @@ class AutoPairSelector:
         near: ContractInfo,
         far: ContractInfo,
     ) -> PairConfig:
-        pair_id = f"auto_{product}_{near.symbol}_{far.symbol}"
         return PairConfig(
-            pair_id=pair_id,
+            pair_id=f"auto_{product}_{near.symbol}_{far.symbol}",
             near_symbol=near.symbol,
             far_symbol=far.symbol,
             exchange=exchange,
@@ -153,6 +182,15 @@ class AutoPairSelector:
             legging_buffer=self.config.legging_buffer,
             risk_group=product,
             session_windows=self.config.session_windows,
+            signal_transform=self.config.signal_transform,
+            confirm_entry=self.config.confirm_entry,
+            confirmation_retrace_z=self.config.confirmation_retrace_z,
+            min_confirmed_entry_z=self.config.min_confirmed_entry_z,
+            entry_trend_window=self.config.entry_trend_window,
+            max_entry_z_slope=self.config.max_entry_z_slope,
+            min_stationarity_score=self.config.min_stationarity_score,
+            max_half_life=self.config.max_half_life,
+            daily_sample_window=self.config.daily_sample_window,
         )
 
 
@@ -184,7 +222,9 @@ class AutoPairManager:
         self._catalog_day: date | None = None
         self.last_eligible_ids: set[str] = set()
         self.sample_store = sample_store
-        self.metadata = metadata_prefetcher or MetadataPrefetcher(config.metadata_timeout_seconds)
+        self.metadata = metadata_prefetcher or MetadataPrefetcher(
+            config.metadata_timeout_seconds
+        )
         self.evidence = evidence_recorder
 
     @property
@@ -192,6 +232,7 @@ class AutoPairManager:
         return self._initialized
 
     def close(self) -> None:
+        self._flush_sample_store()
         self.metadata.close()
 
     def prepare_catalog(
@@ -203,12 +244,13 @@ class AutoPairManager:
         max_history = max(self.config.lookback * 4, self.config.lookback + 8)
         for pair in self.candidate_pairs:
             for symbol in (pair.near_symbol, pair.far_symbol):
-                if symbol not in self._history:
-                    history = deque(maxlen=max_history)
-                    if self.sample_store is not None:
-                        for row in self.sample_store.load(symbol)[-max_history:]:
-                            history.append(row)
-                    self._history[symbol] = history
+                if symbol in self._history:
+                    continue
+                history = deque(maxlen=max_history)
+                if self.sample_store is not None:
+                    for row in self.sample_store.load(symbol)[-max_history:]:
+                        history.append(row)
+                self._history[symbol] = history
         return list(self.candidate_pairs)
 
     def bootstrap(
@@ -216,12 +258,15 @@ class AutoPairManager:
         broker,
         today: date,
         restored_pairs: dict[str, dict] | None = None,
+        restored_history: dict[str, list[dict]] | None = None,
     ) -> list[tuple[PairConfig, dict[str, ContractSpec]]]:
-        """读取柜台目录、订阅候选，并恢复上次仍需管理的动态组合。"""
+        """读取柜台目录、恢复采样/动态组合状态并订阅候选。"""
         catalog = broker.get_contract_catalog()
         if not catalog:
             raise RuntimeError("auto discovery contract catalog is empty")
         self.prepare_catalog(catalog, today)
+        if restored_history:
+            self.restore_history(restored_history)
 
         restored: list[tuple[PairConfig, dict[str, ContractSpec]]] = []
         catalog_symbols = {item.symbol for item in catalog}
@@ -231,9 +276,13 @@ class AutoPairManager:
                 row["session_windows"] = tuple(row["session_windows"])
             pair = PairConfig(**row)
             if pair.near_symbol not in catalog_symbols or pair.far_symbol not in catalog_symbols:
-                raise RuntimeError(f"persisted auto pair is no longer in CTP catalog: {pair_id}")
+                raise RuntimeError(
+                    f"persisted auto pair is no longer in CTP catalog: {pair_id}"
+                )
             self._pairs[pair.pair_id] = pair
-            if all(existing.pair_id != pair.pair_id for existing in self.candidate_pairs):
+            if all(
+                existing.pair_id != pair.pair_id for existing in self.candidate_pairs
+            ):
                 self.candidate_pairs.append(pair)
             pair_specs = self._ensure_specs(broker, pair)
             restored.append((pair, pair_specs))
@@ -245,9 +294,9 @@ class AutoPairManager:
         }
         for symbol in sorted(symbols):
             pair = next(
-                p
-                for p in self.candidate_pairs
-                if symbol in {p.near_symbol, p.far_symbol}
+                item
+                for item in self.candidate_pairs
+                if symbol in {item.near_symbol, item.far_symbol}
             )
             broker.subscribe(symbol, pair.exchange)
         self._initialized = True
@@ -263,6 +312,7 @@ class AutoPairManager:
         """交易日变化时重新应用到期过滤并使前一日元数据缓存失效。"""
         if self._catalog_day == today:
             return False
+        self._flush_sample_store()
         self._specs.clear()
         self.metadata.invalidate()
         catalog = broker.get_contract_catalog()
@@ -300,32 +350,73 @@ class AutoPairManager:
         return True
 
     def observe(self, tick: Tick) -> None:
-        """按策略采样周期保留行情，并仅持久化有限 warm history。"""
+        """按采样语义保留行情；日频模式每天只保留收盘窗口内最后一笔。"""
         history = self._history.get(tick.symbol)
         if history is None:
             return
-        sample_seconds = self.config.sample_seconds
-        persisted = False
-        if sample_seconds <= 0 or not history:
-            history.append(tick)
-            persisted = True
-        else:
-            current_bucket = int(tick.timestamp.timestamp() // sample_seconds)
-            last_bucket = int(history[-1].timestamp.timestamp() // sample_seconds)
-            if current_bucket < last_bucket:
+        if self.config.daily_sample_window:
+            current = tick.timestamp.astimezone(_CHINA_TZ).timetz().replace(
+                tzinfo=None
+            )
+            start, end = AutoConfig._parse_daily_window(
+                self.config.daily_sample_window
+            )
+            if not start <= current <= end:
                 return
-            if current_bucket == last_bucket:
-                history[-1] = tick
+            if history and history[-1].trading_day == tick.trading_day:
+                if tick.timestamp >= history[-1].timestamp:
+                    history[-1] = tick
             else:
                 history.append(tick)
-                persisted = True
-        if persisted and self.sample_store is not None:
-            self.sample_store.save(tick.symbol, list(history))
+            return
+
+        sample_seconds = self.config.sample_seconds
+        if sample_seconds <= 0 or not history:
+            history.append(tick)
+            return
+        current_bucket = int(tick.timestamp.timestamp() // sample_seconds)
+        last_bucket = int(history[-1].timestamp.timestamp() // sample_seconds)
+        if current_bucket < last_bucket:
+            return
+        if current_bucket == last_bucket:
+            history[-1] = tick
+            return
+        history.append(tick)
+
+    def snapshot_history(self) -> dict[str, list[dict]]:
+        """导出有界采样历史，供兼容状态恢复和测试使用。"""
+        result: dict[str, list[dict]] = {}
+        for symbol, rows in self._history.items():
+            if not rows:
+                continue
+            payload: list[dict] = []
+            for tick in rows:
+                row = asdict(tick)
+                row["timestamp"] = tick.timestamp.isoformat()
+                payload.append(row)
+            result[symbol] = payload
+        return result
+
+    def restore_history(self, raw: dict[str, list[dict]]) -> None:
+        """只恢复当前候选目录仍需要的合约历史，并重新执行 Tick 校验。"""
+        for symbol, rows in raw.items():
+            history = self._history.get(symbol)
+            if history is None:
+                continue
+            history.clear()
+            for item in rows[-history.maxlen :]:
+                row = dict(item)
+                row["timestamp"] = datetime.fromisoformat(str(row["timestamp"]))
+                tick = Tick(**row)
+                tick.validate()
+                history.append(tick)
 
     def should_scan(self, now: datetime) -> bool:
         if self._last_scan is None:
             return True
-        return (now - self._last_scan).total_seconds() >= self.config.scan_interval_seconds
+        return (
+            now - self._last_scan
+        ).total_seconds() >= self.config.scan_interval_seconds
 
     def select(
         self,
@@ -334,62 +425,133 @@ class AutoPairManager:
         now: datetime,
         protected_pair_ids: set[str],
     ) -> list[PairConfig] | None:
-        """按硬门筛选并排序；已有持仓仅保留管理权，不自动获得新开仓资格。"""
+        """按硬门筛选并排序；已有持仓只保留管理权，不自动获得新开仓资格。"""
         if not self._initialized or not self.should_scan(now):
             return None
         self._last_scan = now
+        self._flush_sample_store()
 
         scored: list[tuple[PairConfig, float]] = []
         self.last_eligible_ids = set()
         for pair in self.candidate_pairs:
             near_history = self._history.get(pair.near_symbol, ())
             far_history = self._history.get(pair.far_symbol, ())
-            if len(near_history) < pair.lookback or len(far_history) < pair.lookback:
+            if (
+                len(near_history) < pair.lookback + 1
+                or len(far_history) < pair.lookback + 1
+            ):
                 continue
-            near = near_history[-1]
-            far = far_history[-1]
+            near, far = near_history[-1], far_history[-1]
             if min(near.volume, far.volume) < self.config.min_volume:
-                self._record_candidate(pair, near, far, None, None, "volume below minimum")
+                self._record_candidate(
+                    pair, near, far, None, None, "volume below minimum"
+                )
                 continue
             if min(near.open_interest, far.open_interest) < self.config.min_open_interest:
-                self._record_candidate(pair, near, far, None, None, "open interest below minimum")
+                self._record_candidate(
+                    pair,
+                    near,
+                    far,
+                    None,
+                    None,
+                    "open interest below minimum",
+                )
                 continue
 
             ticks = list(near_history) + list(far_history)
-            statistics = self.scanner.statistics(pair, ticks)
+            synchronized = self.scanner.synchronized_ticks(pair, ticks)
+            statistics = self.scanner.statistics(
+                pair, ticks, synchronized=synchronized
+            )
             if statistics is None:
-                self._record_candidate(pair, near, far, None, None, "insufficient synchronized statistics")
-                continue
-            if self.scanner.entry_signal(pair, near, far, statistics) is None:
-                self._record_candidate(pair, near, far, statistics, None, "executable entry threshold not reached")
+                self._record_candidate(
+                    pair,
+                    near,
+                    far,
+                    None,
+                    None,
+                    "insufficient synchronized statistics",
+                )
                 continue
             if statistics.stationarity_score < self.config.min_stationarity_score:
-                self._record_candidate(pair, near, far, statistics, None, "stationarity below minimum")
+                self._record_candidate(
+                    pair,
+                    near,
+                    far,
+                    statistics,
+                    None,
+                    "stationarity below minimum",
+                )
                 continue
             if statistics.half_life > self.config.max_half_life:
-                self._record_candidate(pair, near, far, statistics, None, "half-life above maximum")
+                self._record_candidate(
+                    pair,
+                    near,
+                    far,
+                    statistics,
+                    None,
+                    "half-life above maximum",
+                )
+                continue
+            if self.scanner.candidate_entry(pair, synchronized, statistics) is None:
+                self._record_candidate(
+                    pair,
+                    near,
+                    far,
+                    statistics,
+                    None,
+                    "confirmed executable entry threshold not reached",
+                )
                 continue
 
             pair_specs = self._prefetched_specs(broker, pair)
             if pair_specs is None:
-                reason = self.metadata.error((pair.near_symbol, pair.far_symbol)) or "metadata pending"
-                self._record_candidate(pair, near, far, statistics, None, reason)
+                reason = (
+                    self.metadata.error((pair.near_symbol, pair.far_symbol))
+                    or "metadata pending"
+                )
+                self._record_candidate(
+                    pair, near, far, statistics, None, reason
+                )
                 continue
             candidate = self.scanner.scan_pair(pair, ticks, pair_specs)
             if candidate is None:
-                self._record_candidate(pair, near, far, statistics, None, "net-edge candidate unavailable")
+                self._record_candidate(
+                    pair,
+                    near,
+                    far,
+                    statistics,
+                    None,
+                    "net-edge candidate unavailable",
+                )
                 continue
             if candidate.liquidity_score < self.config.min_liquidity_score:
-                self._record_candidate(pair, near, far, statistics, candidate, "liquidity below minimum")
+                self._record_candidate(
+                    pair,
+                    near,
+                    far,
+                    statistics,
+                    candidate,
+                    "liquidity below minimum",
+                )
                 continue
             if candidate.net_edge <= self.config.min_net_edge:
-                self._record_candidate(pair, near, far, statistics, candidate, "net edge below minimum")
+                self._record_candidate(
+                    pair,
+                    near,
+                    far,
+                    statistics,
+                    candidate,
+                    "net edge below minimum",
+                )
                 continue
             self.last_eligible_ids.add(pair.pair_id)
             scored.append((pair, candidate.score))
             self._record_candidate(pair, near, far, statistics, candidate, "")
 
-        return self.rank_candidates(scored, protected_pair_ids=protected_pair_ids)
+        return self.rank_candidates(
+            scored, protected_pair_ids=protected_pair_ids
+        )
 
     def rank_candidates(
         self,
@@ -425,40 +587,82 @@ class AutoPairManager:
         }
 
     def strategy_seed(self, pair: PairConfig) -> dict:
-        """用扫描阶段已经观察到的价差预热策略，避免激活后再等一个 lookback。"""
+        """用扫描阶段历史预热正式策略，并保留确认入场的武装状态。"""
         ticks = list(self._history.get(pair.near_symbol, ())) + list(
             self._history.get(pair.far_symbol, ())
         )
         synchronized = self.scanner.synchronized_ticks(pair, ticks)
         historical = synchronized[:-1]
-        history = [near.mid_price - far.mid_price for near, far in historical]
-        if len(history) > pair.lookback:
-            history = history[-pair.lookback :]
+        signal_history = [
+            log(near.mid_price / far.mid_price)
+            if pair.signal_transform == "log_ratio"
+            else near.mid_price - far.mid_price
+            for near, far in historical
+        ][-pair.lookback :]
+        raw_history = [
+            near.mid_price - far.mid_price for near, far in historical
+        ][-pair.lookback :]
+        z_history, armed, extreme = self.scanner.confirmation_seed(
+            pair, historical
+        )
         last_ts = ""
+        last_day = ""
         if historical:
-            last_ts = max(historical[-1][0].timestamp, historical[-1][1].timestamp).isoformat()
+            last_ts = max(
+                historical[-1][0].timestamp,
+                historical[-1][1].timestamp,
+            ).isoformat()
+            last_day = historical[-1][0].trading_day
         return {
-            "history": history,
+            "history": signal_history,
+            "raw_history": raw_history,
+            "z_history": z_history,
             "position": 0,
             "entry_mean": 0.0,
             "entry_std": 0.0,
             "last_sample_ts": last_ts,
+            "last_sample_trading_day": last_day,
+            "armed_direction": armed,
+            "armed_extreme": extreme,
         }
 
-    def _record_candidate(self, pair, near, far, statistics, candidate, reason: str) -> None:
+    def _record_candidate(
+        self, pair, near, far, statistics, candidate, reason: str
+    ) -> None:
         if self.evidence is None:
             return
         self.evidence.record_candidate(
             pair_id=pair.pair_id,
             timestamp=max(near.timestamp, far.timestamp).isoformat(),
-            zscore=(float(statistics.zscore) if statistics is not None else None),
-            stationarity=(float(statistics.stationarity_score) if statistics is not None else None),
-            half_life=(float(statistics.half_life) if statistics is not None else None),
+            zscore=(
+                float(statistics.zscore) if statistics is not None else None
+            ),
+            stationarity=(
+                float(statistics.stationarity_score)
+                if statistics is not None
+                else None
+            ),
+            half_life=(
+                float(statistics.half_life)
+                if statistics is not None
+                else None
+            ),
             volume=float(min(near.volume, far.volume)),
             open_interest=float(min(near.open_interest, far.open_interest)),
-            depth=float(min(near.bid_volume, near.ask_volume, far.bid_volume, far.ask_volume)),
-            expected_net_edge=(float(candidate.net_edge) if candidate is not None else None),
-            candidate_score=(float(candidate.score) if candidate is not None else None),
+            depth=float(
+                min(
+                    near.bid_volume,
+                    near.ask_volume,
+                    far.bid_volume,
+                    far.ask_volume,
+                )
+            ),
+            expected_net_edge=(
+                float(candidate.net_edge) if candidate is not None else None
+            ),
+            candidate_score=(
+                float(candidate.score) if candidate is not None else None
+            ),
             reject_reason=str(reason),
         )
 
@@ -495,3 +699,10 @@ class AutoPairManager:
                     raise RuntimeError(f"live contract spec missing: {symbol}")
             self._specs.update(rows)
         return self.pair_specs(pair)
+
+    def _flush_sample_store(self) -> None:
+        if self.sample_store is None:
+            return
+        for symbol, history in self._history.items():
+            if history:
+                self.sample_store.save(symbol, list(history))
