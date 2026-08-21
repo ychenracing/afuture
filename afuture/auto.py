@@ -1,7 +1,7 @@
 """轻量级自动合约发现与跨期组合选择。
 
 这个模块只解决“从哪里交易”这一件事：从 CTP 合约目录中生成同品种相邻月份，
-观察实时盘口后按流动性、成交量、持仓量、均值回归和 Net Edge 排名。
+观察实时盘口后按流动性、成交量、持仓量、均值回归、regime/carry 和 Net Edge 排名。
 它不创建第二套策略、风控或执行系统，选中的组合仍交给 ``TradingEngine`` 处理。
 """
 
@@ -13,7 +13,8 @@ from datetime import date, datetime
 from typing import Iterable
 
 from .auto_runtime import MetadataPrefetcher
-from .models import ContractInfo, ContractSpec, PairConfig, Tick
+from .models import ContractInfo, ContractSpec, PairConfig, SignalAction, Tick
+from .regime import evaluate_entry_regime, normalized_curve_carry
 from .sample_store import MarketSampleStore
 from .scanner import SpreadScanner
 
@@ -23,7 +24,8 @@ class AutoConfig:
     """自动发现的最小配置。
 
     默认不自动启用；实盘示例会显式开启。``products`` 是品种白名单，避免个人程序
-    一次订阅全市场数百个合约，把复杂度和 CTP 流控风险无意义放大。
+    一次订阅全市场数百个合约，把复杂度和 CTP 流控风险无意义放大。新增 regime/carry
+    门默认均为“关闭/零影响”，只有离线 OOS 证明有增量后才应在生产配置中收紧。
     """
 
     enabled: bool = False
@@ -53,6 +55,14 @@ class AutoConfig:
     min_stationarity_score: float = 0.02
     max_half_life: float = 120.0
     min_net_edge: float = 0.0
+
+    # 轻量 regime/carry 门。默认值保持旧版选择行为不变。
+    min_persistence_score: float = 0.0
+    max_volatility_percentile: float = 1.0
+    max_trend_shift_z: float = 12.0
+    min_carry_reversal_z: float = 0.0
+    carry_reversal_weight: float = 0.0
+
     slippage_ticks: int = 1
     metadata_timeout_seconds: float = 10.0
     session_windows: tuple[str, ...] = (
@@ -86,6 +96,16 @@ class AutoConfig:
             raise ValueError("auto min_stationarity_score must be between 0 and 1")
         if self.max_half_life <= 0 or self.metadata_timeout_seconds <= 0:
             raise ValueError("auto half-life/metadata timeout must be positive")
+        if not 0 <= self.min_persistence_score <= 1:
+            raise ValueError("auto min_persistence_score must be between 0 and 1")
+        if not 0 < self.max_volatility_percentile <= 1:
+            raise ValueError("auto max_volatility_percentile must be within (0, 1]")
+        if self.max_trend_shift_z <= 0:
+            raise ValueError("auto max_trend_shift_z must be positive")
+        if self.min_carry_reversal_z < 0:
+            raise ValueError("auto min_carry_reversal_z cannot be negative")
+        if self.carry_reversal_weight < 0:
+            raise ValueError("auto carry_reversal_weight cannot be negative")
 
 
 class AutoPairSelector:
@@ -361,19 +381,48 @@ class AutoPairManager:
                 continue
 
             ticks = list(near_history) + list(far_history)
-            statistics = self.scanner.statistics(pair, ticks)
+            synchronized = self.scanner.synchronized_ticks(pair, ticks)
+            statistics = self.scanner.statistics(pair, ticks, synchronized=synchronized)
             if statistics is None:
                 self._record_candidate(pair, near, far, None, None, "insufficient synchronized statistics")
                 continue
-            if self.scanner.entry_signal(pair, near, far, statistics) is None:
+            entry = self.scanner.entry_signal(pair, near, far, statistics)
+            if entry is None:
                 self._record_candidate(pair, near, far, statistics, None, "executable entry threshold not reached")
                 continue
+            action, _entry_z = entry
             if statistics.stationarity_score < self.config.min_stationarity_score:
                 self._record_candidate(pair, near, far, statistics, None, "stationarity below minimum")
                 continue
             if statistics.half_life > self.config.max_half_life:
                 self._record_candidate(pair, near, far, statistics, None, "half-life above maximum")
                 continue
+
+            spreads = [row_near.mid_price - row_far.mid_price for row_near, row_far in synchronized]
+            carries = normalized_curve_carry(
+                [row_near.mid_price for row_near, _row_far in synchronized],
+                [row_far.mid_price for _row_near, row_far in synchronized],
+            )
+            regime = evaluate_entry_regime(spreads, carries)
+            if regime.persistence_score < self.config.min_persistence_score:
+                self._record_candidate(pair, near, far, statistics, None, "mean-reversion persistence below minimum")
+                continue
+            if regime.volatility_percentile > self.config.max_volatility_percentile:
+                self._record_candidate(pair, near, far, statistics, None, "volatility percentile above maximum")
+                continue
+            if regime.trend_shift_z > self.config.max_trend_shift_z:
+                self._record_candidate(pair, near, far, statistics, None, "curve change-point/trend shift above maximum")
+                continue
+            if self.config.min_carry_reversal_z > 0:
+                if abs(regime.carry_z) < self.config.min_carry_reversal_z:
+                    self._record_candidate(pair, near, far, statistics, None, "normalized carry reversal below minimum")
+                    continue
+                if action is SignalAction.SHORT_SPREAD and not regime.supports_short:
+                    self._record_candidate(pair, near, far, statistics, None, "normalized carry conflicts with short-spread entry")
+                    continue
+                if action is SignalAction.LONG_SPREAD and not regime.supports_long:
+                    self._record_candidate(pair, near, far, statistics, None, "normalized carry conflicts with long-spread entry")
+                    continue
 
             pair_specs = self._prefetched_specs(broker, pair)
             if pair_specs is None:
@@ -390,8 +439,12 @@ class AutoPairManager:
             if candidate.net_edge <= self.config.min_net_edge:
                 self._record_candidate(pair, near, far, statistics, candidate, "net edge below minimum")
                 continue
+            score = candidate.score
+            if self.config.carry_reversal_weight > 0:
+                carry_strength = min(abs(regime.carry_z), 3.0) / 3.0
+                score *= 1.0 + self.config.carry_reversal_weight * carry_strength
             self.last_eligible_ids.add(pair.pair_id)
-            scored.append((pair, candidate.score))
+            scored.append((pair, score))
             self._record_candidate(pair, near, far, statistics, candidate, "")
 
         return self.rank_candidates(scored, protected_pair_ids=protected_pair_ids)
