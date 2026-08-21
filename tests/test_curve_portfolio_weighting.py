@@ -42,3 +42,31 @@ def test_curve_portfolio_keeps_missing_product_as_cash_sleeve():
 
     metrics = research.run(config)
     assert metrics["total_return"] == pytest.approx(expected)
+
+
+def test_curve_portfolio_counts_roll_day_as_zero_return_calendar_day():
+    research = CurveFamilyResearch.__new__(CurveFamilyResearch)
+    research.specs = {}
+    rows = [
+        CurveObservation("20260101", "N1", "F1", 100, 90),
+        CurveObservation("20260102", "N1", "F1", 101, 90),
+        CurveObservation("20260103", "N1", "F1", 102, 90),
+        # 同一天切换 F1/F2：不能记跨合约价格跳变，但这仍是研究窗口中的现金日。
+        CurveObservation("20260104", "N2", "F2", 500, 400),
+        CurveObservation("20260105", "N2", "F2", 501, 400),
+        CurveObservation("20260106", "N2", "F2", 502, 400),
+    ]
+    research._series = {"a": rows}
+    config = CurveFamilyConfig(
+        "basis_momentum",
+        fast_window=2,
+        slow_window=2,
+        mean_window=3,
+        rebalance_samples=1,
+        slippage_ticks=0,
+    )
+
+    metrics = research.run(config)
+    # 六个真实观察日形成五个持有区间；换月日只是其中一个 0-return 区间，不能
+    # 从年化分母消失。
+    assert metrics["trading_days"] == 5
