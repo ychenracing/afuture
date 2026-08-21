@@ -91,3 +91,23 @@ def test_pair_roll_does_not_create_artificial_return():
     )
     returns, _ = research._run_product(rows, config, None)
     assert "20260103" not in returns
+
+
+def test_basis_momentum_uses_roll_adjusted_role_index_history():
+    # Raw contract prices jump at the role switch, but the role indices preserve
+    # only daily returns of whichever contract is F1/F2 on each date.
+    rows = [
+        CurveObservation("20260101", "N1", "F1", 100, 90, 1.00, 1.00),
+        CurveObservation("20260102", "N1", "F1", 101, 90, 1.01, 1.00),
+        CurveObservation("20260103", "N1", "F1", 102, 90, 1.02, 1.00),
+        CurveObservation("20260104", "N2", "F2", 500, 400, 1.03, 1.00),
+        CurveObservation("20260105", "N2", "F2", 505, 400, 1.04, 1.00),
+        CurveObservation("20260106", "N2", "F2", 510, 400, 1.05, 1.00),
+    ]
+    config = CurveFamilyConfig(
+        "basis_momentum",
+        fast_window=2,
+        slow_window=5,
+        mean_window=5,
+    )
+    assert _research()._desired_position(rows, 5, 0, config) == 1
