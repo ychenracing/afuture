@@ -3,6 +3,7 @@ from afuture.curve_research import (
     CurveFamilyResearch,
     CurveObservation,
 )
+from afuture.models import ContractSpec
 
 
 def _rows(near, far):
@@ -111,3 +112,28 @@ def test_basis_momentum_uses_roll_adjusted_role_index_history():
         mean_window=5,
     )
     assert _research()._desired_position(rows, 5, 0, config) == 1
+
+
+def test_curve_pnl_uses_equal_lot_cash_return_not_equal_notional_percent_return():
+    research = _research()
+    research.specs = {
+        "N": ContractSpec("N", "DCE", 10, 1, 0.1, 0.1),
+        "F": ContractSpec("F", "DCE", 10, 1, 0.1, 0.1),
+    }
+    rows = [
+        CurveObservation("20260101", "N", "F", 100, 50, 1.00, 1.00),
+        CurveObservation("20260102", "N", "F", 101, 50, 1.01, 1.00),
+        CurveObservation("20260103", "N", "F", 102, 50, 1.02, 1.00),
+        CurveObservation("20260104", "N", "F", 103, 50, 1.03, 1.00),
+    ]
+    config = CurveFamilyConfig(
+        "basis_momentum",
+        fast_window=2,
+        slow_window=2,
+        mean_window=3,
+        rebalance_samples=1,
+        slippage_ticks=0,
+    )
+    returns, _ = research._run_product(rows, config, None)
+    expected = (103 - 102) * 10 / (102 * 10 + 50 * 10)
+    assert returns["20260104"] == expected
