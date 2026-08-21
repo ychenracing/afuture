@@ -63,8 +63,8 @@ def evaluate_entry_regime(
 
     ``spreads`` 和 ``carries`` 的最后一个值代表当前已经可见的行情；历史均值、
     波动分布和 carry 基准均只使用最后值之前的数据，因此不会把未来 bar 泄漏给
-    当前入场。短期波动分位可以包含“从上一可见值到当前值”的最新冲击，因为该
-    价格变化在当前决策时已经发生。
+    当前入场。这里的 ``carry_z`` 是“对当前价差偏离方向的确认强度”：若归一化
+    近远月曲线与当前价差偏离方向冲突则归零，硬门和软排名都不能奖励冲突信号。
     """
     spread_values = [float(value) for value in spreads]
     carry_values = [float(value) for value in carries]
@@ -76,7 +76,12 @@ def evaluate_entry_regime(
     persistence = _persistence_score(history)
     volatility_percentile = _volatility_percentile(spread_values)
     trend_shift_z = _trend_shift_z(history, current)
+    spread_z = _latest_z(spread_values)
     carry_z = _latest_z(carry_values) if len(carry_values) >= 3 else 0.0
+    if spread_z > 0 and carry_z < 0:
+        carry_z = 0.0
+    elif spread_z < 0 and carry_z > 0:
+        carry_z = 0.0
     return EntryRegimeMetrics(
         persistence_score=persistence,
         volatility_percentile=volatility_percentile,
