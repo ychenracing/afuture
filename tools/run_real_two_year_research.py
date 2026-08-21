@@ -104,8 +104,7 @@ def _contract_expiry(symbol: str, bars: list[DailyBar], end: date) -> date:
     month = int(digits[-2:])
     if (year, month) <= (end.year, end.month):
         return max(row.day for row in bars)
-    # DCE/CZCE 通常是第 10 个交易日，RB 为月中；20 日作为研究用保守边界，
-    # 只影响临近到期过滤，不用于收益价格。
+    # 20 日只是研究用临近到期过滤边界，不参与价格、收益或 OOS 参数选择。
     return date(year, month, 20)
 
 
@@ -280,6 +279,8 @@ def run_research(rows_by_symbol, start: date, end: date) -> dict:
     runner = AutoPortfolioRunner(config)
     research_window = dict(train_days=160, validation_days=60, oos_days=60, step_days=60)
 
+    # 搜索阶段不重复跑 leave-one/latency/impact 等后分析；它们不参与参数评分。
+    # 这样只减少重复计算，不改变 Train/Validation/OOS 候选或 holdout。
     baseline_cfg = AutoPortfolioResearchConfig(
         **research_window,
         parameter_grid=(
@@ -294,20 +295,30 @@ def run_research(rows_by_symbol, start: date, end: date) -> dict:
                 "max_pair_volume": config.auto.max_pair_volume,
             },
         ),
+        run_post_analysis=False,
     )
     baseline = runner.run(dev_ticks, baseline_cfg)
 
     stage1 = runner.run(
         dev_ticks,
-        AutoPortfolioResearchConfig(**research_window, parameter_grid=signal_grid(config)),
+        AutoPortfolioResearchConfig(
+            **research_window,
+            parameter_grid=signal_grid(config),
+            run_post_analysis=False,
+        ),
     )
     stage2_grid = risk_grid(stage1.selected_parameters)
     stage2 = runner.run(
         dev_ticks,
-        AutoPortfolioResearchConfig(**research_window, parameter_grid=stage2_grid),
+        AutoPortfolioResearchConfig(
+            **research_window,
+            parameter_grid=stage2_grid,
+            run_post_analysis=False,
+        ),
     )
     frozen = runner._config_with_parameters(stage2.selected_parameters)
 
+    # 参数冻结后才读取最后的 holdout；以下结果不再反向改变搜索空间。
     baseline_holdout = runner._run_portfolio(config, holdout_ticks)
     tuned_holdout = runner._run_portfolio(frozen, holdout_ticks)
     stress_15 = runner._run_portfolio(runner._cost_stress(frozen, 1.5), holdout_ticks)
@@ -325,6 +336,7 @@ def run_research(rows_by_symbol, start: date, end: date) -> dict:
     target_met = bool(
         annualized >= 1.0
         and drawdown <= 0.08
+        and not bool(tuned_holdout.get("halted", False))
         and float(stress_20.get("total_return", 0.0)) >= -0.02
         and int(tuned_holdout.get("final_position_count", 0)) == 0
     )
