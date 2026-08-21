@@ -20,8 +20,11 @@ from afuture.strategy import CalendarSpreadStrategy
 from afuture.broker.sim import SimBroker
 
 
+_CHINA_TZ = timezone(timedelta(hours=8))
+
+
 def tick(symbol, bid, ask, minute=0, *, day="20260821", depth=20, volume=10000, oi=50000):
-    return Tick(symbol, "DCE", datetime(2026, 8, 21, 9, minute, tzinfo=timezone.utc),
+    return Tick(symbol, "DCE", datetime(2026, 8, 21, 9, minute, tzinfo=_CHINA_TZ),
                 bid, ask, (bid + ask) / 2, depth, depth, day,
                 limit_up=3400, limit_down=2600, volume=volume, open_interest=oi)
 
