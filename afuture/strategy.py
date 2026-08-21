@@ -127,6 +127,37 @@ class CalendarSpreadStrategy:
             raise ValueError("invalid persisted confirmation direction")
         self._armed_extreme = float(state.get("armed_extreme", 0.0))
 
+    def restore_after_rejected_signal(self, previous_state: dict) -> None:
+        """执行层拒绝信号时恢复真实持仓语义，同时保留本次市场观测。
+
+        ``on_quotes`` 会先乐观更新目标仓位、确认状态和退出状态，以避免同一行情重复
+        发单。若随后风险或执行层拒绝，不能用 ``set_position`` 粗暴回滚，否则会
+        重建或丢失真实入场锚点。这里恢复信号前的真实持仓/锚点/确认状态，但保留
+        本次已经形成的 signal/raw/z 历史和采样时间；已有持仓的持有样本继续前进。
+        """
+        current_history = list(self._history)
+        current_raw_history = list(self._raw_history)
+        current_z_history = list(self._z_history)
+        current_last_sample_ts = self._last_sample_ts
+        current_last_sample_day = self._last_sample_trading_day
+        previous_position = int(previous_state.get("position", 0))
+        previous_holding = int(previous_state.get("holding_samples", 0))
+
+        self.restore_state(previous_state)
+        self._history.clear()
+        for value in current_history[-self.pair.lookback:]:
+            self._history.append(float(value))
+        self._raw_history.clear()
+        for value in current_raw_history[-self.pair.lookback:]:
+            self._raw_history.append(float(value))
+        self._z_history.clear()
+        for value in current_z_history[-self._z_history.maxlen:]:
+            self._z_history.append(float(value))
+        self._last_sample_ts = current_last_sample_ts
+        self._last_sample_trading_day = current_last_sample_day
+        if previous_position != 0:
+            self._holding_samples = previous_holding + 1
+
     def on_quotes(self, near: Tick, far: Tick) -> SpreadSignal:
         """按配置采样，在统一统计空间生成跨期交易信号。"""
         near.validate()
@@ -188,8 +219,6 @@ class CalendarSpreadStrategy:
             liquidation_spread = short_exec if self._position > 0 else long_exec
             chosen_spread = liquidation_spread
             if self.pair.signal_transform == "log_ratio":
-                # 平多价差使用 near.bid/far.ask；平空价差使用 near.ask/far.bid。
-                # 退出和止损必须基于真实可平仓方向，而不是乐观的 mid ratio。
                 liquidation_z = short_z if self._position > 0 else long_z
                 chosen_z = liquidation_z
                 reverted = (
