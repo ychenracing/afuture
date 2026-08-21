@@ -1,0 +1,46 @@
+name: research-2y
+
+on:
+  push:
+    branches:
+      - codex/afuture-2y-realdata-optimization-20260821
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: research-2y-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  real-data:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install akshare pandas
+      - name: Fetch recent two-year 60-minute universe
+        run: python tools/fetch_two_year_60m_universe.py
+      - name: Fetch independent prior two-year 60-minute universe
+        run: python tools/fetch_prior_two_year_60m_universe.py
+      - name: Validate two-window strategy evidence
+        run: python tools/evaluate_daily_relative_strategy.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: two-year-real-data-evidence
+          path: |
+            runtime/two_year_broad_60m.csv
+            runtime/two_year_broad_60m_summary.csv
+            runtime/two_year_broad_60m_failures.txt
+            runtime/prior_two_year_broad_60m.csv
+            runtime/prior_two_year_broad_60m_summary.csv
+            runtime/prior_two_year_broad_60m_failures.txt
+            runtime/two_year_strategy_report.json
+          retention-days: 14

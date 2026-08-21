@@ -1,4 +1,4 @@
-# CTP 自动套利示例。默认只扫描少量高流动性商品品种，避免个人程序无意义订阅全市场。
+# CTP 自动跨期套利示例。当前生产白名单来自独立两年真实数据资格门，不自动扩张到全市场。
 [system]
 mode = "live"
 initial_capital = 500000
@@ -8,12 +8,13 @@ environment = "test"
 td_address = "tcp://YOUR_TRADE_FRONT"
 md_address = "tcp://YOUR_MARKET_FRONT"
 
-# 自动发现只负责“选哪个跨期组合”；策略、风控、下单仍走同一套正式链路。
+# 自动发现负责在已通过资格门的品种中选择相邻月份；策略、风控、下单仍走同一生产链路。
 [auto]
 enabled = true
-# 品种白名单可以自行增删。默认保持较小，控制 CTP 订阅和元数据查询规模。
-products = ["m", "rb", "TA", "c", "p"]
-exchanges = ["DCE", "SHFE", "CZCE"]
+# 2024-08-21~2026-02-20 的 Train+Validation 在 2x 成本门下只晋级 M/OI；
+# 2026-02-21~2026-08-20 OOS 不参与品种选择。
+products = ["m", "OI"]
+exchanges = ["DCE", "CZCE"]
 max_active_pairs = 2
 max_pairs_per_product = 1
 max_contracts_per_product = 3
@@ -21,39 +22,48 @@ min_days_to_expiry = 20
 scan_interval_seconds = 30
 max_sync_seconds = 2.0
 
-# 动态组合统一使用的策略模板；实时原始 Tick 会先按 sample_seconds 桶化再进入统计窗口。
-lookback = 60
-entry_z = 2.0
-exit_z = 0.5
+# 两年真实数据中心参数：log-ratio 相对价值 + 极端偏离后等待回归确认。
+lookback = 25
+entry_z = 2.5
+exit_z = 0.75
 stop_z = 4.0
-max_pair_volume = 3
-sample_seconds = 60
-max_holding_samples = 120
+signal_transform = "log_ratio"
+confirm_entry = true
+confirmation_retrace_z = 0.30
+min_confirmed_entry_z = 1.75
+entry_trend_window = 6
+max_entry_z_slope = 0.75
+min_stationarity_score = 0.01
+max_half_life = 60
+
+# 研究按自然日最后一根 60 分钟 K 线（通常 23:00）验收；实盘在夜盘结束前取一次盘口。
+daily_sample_window = "22:55-23:00"
+sample_seconds = 0
+max_holding_samples = 20
+max_pair_volume = 20
 structural_mean_shift_z = 3.0
 structural_vol_ratio = 2.5
 legging_buffer = 50
 
-# 自动候选硬门。必须同时满足活动度、流动性、均值回归、可成交阈值和 Net Edge。
-min_volume = 5000
-min_open_interest = 10000
+# 活动度和执行硬门。历史研究至少要求 OI>=5000；实盘额外保留盘口深度和真实 Net Edge 门。
+min_volume = 1000
+min_open_interest = 5000
 min_liquidity_score = 0.5
-min_stationarity_score = 0.02
-max_half_life = 120
 min_net_edge = 100
 slippage_ticks = 1
 metadata_timeout_seconds = 15
 
-# 为保持个人系统简单，示例默认只做日盘。只有确认白名单内全部品种都匹配时再增加夜盘窗口。
-session_windows = ["09:00-10:15", "10:30-11:30", "13:30-15:00"]
+# 日盘用于健康监控，真正的新信号只在 daily_sample_window 采样；M/OI 夜盘均覆盖到 23:00。
+session_windows = ["09:00-10:15", "10:30-11:30", "13:30-15:00", "21:00-23:00"]
 
 [risk]
-max_margin_ratio = 0.30
+# 风险预算由历史 R 风险单位校准；2% 是候选上限，保证金、深度、单合约上限会进一步压缩手数。
+max_margin_ratio = 0.35
 max_daily_loss_ratio = 0.01
 max_total_drawdown_ratio = 0.08
 max_open_pairs = 2
-max_contract_volume = 5
+max_contract_volume = 20
 max_quote_age_seconds = 10
-# 两腿行情即使各自未过期，彼此时间戳差距过大也拒绝交易，避免伪价差信号。
 max_leg_skew_seconds = 2.0
 expiry_blackout_days = 5
 min_available_ratio = 0.55
@@ -62,7 +72,7 @@ max_orders_per_minute = 20
 min_depth_multiple = 2.0
 max_bid_ask_ticks = 3
 limit_distance_ticks = 3
-risk_budget_ratio = 0.0015
+risk_budget_ratio = 0.02
 risk_sigma_multiplier = 2.5
 open_cooldown_minutes = 2
 close_blackout_minutes = 5
@@ -72,12 +82,10 @@ slippage_ticks = 1
 aggressive_ticks = 1
 auto_flatten_imbalance = true
 legging_timeout_seconds = 2.0
-# 正常双腿报单会先提交当前可成交深度更薄的一腿，把更深的一腿留作第二腿对冲。
-# 实盘不使用以下模拟撮合参数；保留显式值便于同一份配置复制到研究环境。
+# 实盘不使用以下模拟撮合参数；保留显式值便于复制到压力回放。
 conservative_simulation = true
 latency_ticks = 1
 market_impact_ticks = 1
-# 静态 pair 模式使用本地参数和 CTP 比较；auto 模式的动态合约参数直接来自 CTP。
 require_live_metadata = true
 metadata_timeout_seconds = 15
 
