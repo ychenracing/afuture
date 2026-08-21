@@ -98,8 +98,11 @@ class SimBroker(Broker):
             int(tick.bid_volume),
             int(tick.ask_volume),
         ]
-        self._events.append(BrokerEvent("tick", tick))
+        # 当前行情可能使上一轮延迟 FAK/FOK 首次具备成交资格。先产生这些成交/撤单
+        # 回报，再把同一行情交给策略生成新决策，避免 broker 内部仓位已经变化而
+        # TradingEngine 的期望状态尚未推进的时间倒置。
         self._match_symbol(tick.symbol)
+        self._events.append(BrokerEvent("tick", tick))
 
     def send_order(self, request: OrderRequest) -> str:
         if not self._started:
