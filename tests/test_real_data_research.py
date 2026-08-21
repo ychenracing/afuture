@@ -103,3 +103,21 @@ def test_research_candidate_rejects_halt_open_positions_and_drawdown_limit():
     assert not runner._metrics_acceptable({**safe, "halted": True})
     assert not runner._metrics_acceptable({**safe, "final_position_count": 1})
     assert not runner._metrics_acceptable({**safe, "max_drawdown": -0.08})
+
+
+def test_research_search_stage_can_skip_post_analysis():
+    from afuture.auto_research import AutoPortfolioResearchConfig
+
+    runner = _research_runner()
+    result = runner.run(
+        [],
+        AutoPortfolioResearchConfig(
+            train_days=1,
+            validation_days=1,
+            oos_days=1,
+            step_days=1,
+            run_post_analysis=False,
+        ),
+    )
+    assert result.stress_results == {}
+    assert result.robustness == {}
