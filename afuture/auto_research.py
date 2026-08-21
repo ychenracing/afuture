@@ -38,6 +38,7 @@ class AutoPortfolioResearchConfig:
     data_gap_rates: tuple[float, ...] = (0.02, 0.05)
     quote_skew_seconds: tuple[float, ...] = (0.5, 1.0, 2.0)
     activity_missing_rates: tuple[float, ...] = (0.02, 0.05)
+    min_selection_trades: int = 0
     run_post_analysis: bool = True
 
 
@@ -139,7 +140,13 @@ class AutoPortfolioRunner:
                 candidate = self._config_with_parameters(parameters)
                 train_metrics = self._run_portfolio(candidate, train_ticks)
                 validation_metrics = self._run_portfolio(candidate, validation_ticks)
-                safe = self._metrics_acceptable(train_metrics) and self._metrics_acceptable(validation_metrics)
+                safe = self._metrics_acceptable(
+                    train_metrics,
+                    min_trades=research.min_selection_trades,
+                ) and self._metrics_acceptable(
+                    validation_metrics,
+                    min_trades=research.min_selection_trades,
+                )
                 score = (
                     0.35 * self._score(train_metrics) + 0.65 * self._score(validation_metrics)
                     if safe
@@ -304,6 +311,20 @@ class AutoPortfolioRunner:
                         broker.publish_tick(row)
                     engine.run_once()
                     equity_curve.append((batch[-1].trading_day, broker.get_account().equity))
+
+                pre_terminal_positions = len(broker.get_positions())
+                halted = bool(engine.halted or engine.state.kill_switch)
+                kill_reason = str(engine.state.kill_reason or "")
+                runtime_mode = str(engine.state.runtime_mode or "")
+                final_day = ticks[-1].trading_day
+                terminal_success, terminal_reason = self._terminal_liquidate(
+                    engine,
+                    broker,
+                    final_day,
+                )
+                if terminal_success:
+                    equity_curve.append((final_day, broker.get_account().equity))
+
                 trades = broker.get_trades()
                 metrics = calculate_performance(
                     equity_curve,
@@ -311,17 +332,83 @@ class AutoPortfolioRunner:
                     trade_count=len(trades),
                 )
                 metrics["commission_total"] = sum(float(row.commission) for row in trades)
+                metrics["pre_terminal_position_count"] = pre_terminal_positions
                 metrics["final_position_count"] = len(broker.get_positions())
-                metrics["halted"] = bool(engine.halted or engine.state.kill_switch)
+                metrics["halted"] = halted
+                metrics["runtime_mode"] = runtime_mode
+                metrics["kill_reason"] = kill_reason
+                metrics["terminal_liquidation_success"] = terminal_success
+                metrics["terminal_liquidation_reason"] = terminal_reason
                 return metrics
             finally:
                 engine.stop()
 
-    def _metrics_acceptable(self, metrics: dict) -> bool:
-        """搜索阶段的硬门：停机、残仓或触及最大回撤都不得靠历史高收益晋级。"""
+    @staticmethod
+    def _terminal_liquidate(engine, broker, final_trading_day: str) -> tuple[bool, str]:
+        """研究窗口末只用当日最后可见报价结清仓位，避免跨窗口免费丢弃持仓。
+
+        该路径只调用现有只减仓执行器，不改变生产 TradingEngine 的停机语义。
+        如果某条持仓腿没有窗口末当日报价，则拒绝用陈旧价格假装可以成交。
+        """
+        positions = [position for position in broker.get_positions() if not position.empty]
+        if not positions:
+            return True, ""
+
+        position_symbols = {position.symbol for position in positions}
+        covered_symbols: set[str] = set()
+        liquidation_pairs: list[tuple[object, Tick, Tick]] = []
+        for pair in engine.pairs.values():
+            pair_symbols = {pair.near_symbol, pair.far_symbol}
+            if not (pair_symbols & position_symbols):
+                continue
+            near = engine.quotes.get(pair.near_symbol)
+            far = engine.quotes.get(pair.far_symbol)
+            if near is None or far is None:
+                return False, f"terminal quote missing for pair: {pair.pair_id}"
+            if near.trading_day != final_trading_day or far.trading_day != final_trading_day:
+                return False, f"terminal quote is not from final trading day: {pair.pair_id}"
+            try:
+                engine.executor.flatten_imbalance(pair, near, far)
+            except Exception as exc:
+                return False, f"terminal liquidation submission failed for {pair.pair_id}: {exc}"
+            liquidation_pairs.append((pair, near, far))
+            covered_symbols.update(pair_symbols)
+
+        uncovered = position_symbols - covered_symbols
+        if uncovered:
+            return False, f"terminal positions are not mapped to managed pairs: {sorted(uncovered)}"
+
+        # conservative simulation 可能要求若干 Tick 才使 FAK 达到撮合时点。
+        max_cycles = max(1, int(getattr(broker, "latency_ticks", 0)) + 1)
+        for _ in range(max_cycles):
+            if not broker.get_active_orders():
+                break
+            for _pair, near, far in liquidation_pairs:
+                broker.publish_tick(near)
+                broker.publish_tick(far)
+        broker.poll_events()
+
+        if broker.get_active_orders():
+            for order in broker.get_active_orders():
+                broker.cancel_order(order.order_id)
+            broker.poll_events()
+            return False, "terminal liquidation left active orders"
+
+        remaining = [position for position in broker.get_positions() if not position.empty]
+        if remaining:
+            symbols = sorted(position.symbol for position in remaining)
+            return False, f"terminal liquidation left positions: {symbols}"
+        return True, ""
+
+    def _metrics_acceptable(self, metrics: dict, *, min_trades: int = 0) -> bool:
+        """搜索阶段的硬门：停机、残仓、无证据或触及最大回撤都不得晋级。"""
         if bool(metrics.get("halted", False)):
             return False
+        if not bool(metrics.get("terminal_liquidation_success", True)):
+            return False
         if int(metrics.get("final_position_count", 0)) != 0:
+            return False
+        if int(metrics.get("trade_count", 0)) < max(0, int(min_trades)):
             return False
         drawdown = abs(float(metrics.get("max_drawdown", 0.0)))
         return drawdown < float(self.base.risk.max_total_drawdown_ratio)
@@ -480,14 +567,21 @@ class AutoPortfolioRunner:
             "trading_days": 0,
             "trade_count": 0,
             "commission_total": 0.0,
+            "pre_terminal_position_count": 0,
             "final_position_count": 0,
             "halted": False,
+            "runtime_mode": "RUNNING",
+            "kill_reason": "",
+            "terminal_liquidation_success": True,
+            "terminal_liquidation_reason": "",
         }
 
     @staticmethod
     def _validate(config: AutoPortfolioResearchConfig) -> None:
         if any(value <= 0 for value in (config.train_days, config.validation_days, config.oos_days, config.step_days)):
             raise ValueError("auto walk-forward windows must be positive")
+        if config.min_selection_trades < 0:
+            raise ValueError("min_selection_trades cannot be negative")
         if not config.cost_stress_multipliers or any(value <= 0 for value in config.cost_stress_multipliers):
             raise ValueError("cost stress multipliers must be positive")
         if any(not 0 < value <= 1 for value in config.depth_haircuts):
