@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -35,7 +36,7 @@ PROFILE = {
     "confirm_delta":0.3, "min_entry":1.75, "exit_z":0.75, "stop":4.0,
     "maxhold":20, "trend_window":6, "max_z_slope":0.75,
     "min_stationarity":0.01, "max_half_life":60.0,
-    "cost_mult":2.0, "cost_ticks":5.0, "min_oi":5000.0, "min_bar_volume":1.0,
+    "cost_mult":2.0, "cost_ticks":5.0, "min_oi":5000.0, "min_bar_volume":1000.0,
 }
 EXPECTED_PRIOR_PRODUCTS = ("A",)
 EXPECTED_CURRENT_PRODUCTS = ("M","OI")
@@ -44,6 +45,12 @@ SAMPLE_END_MINUTE = 23 * 60
 DAY_SESSION_START_MINUTE = 8 * 60
 DAY_SESSION_END_MINUTE = 20 * 60
 NIGHT_SESSION_START_MINUTE = 20 * 60
+MIN_DAYS_TO_EXPIRY = 20
+MAX_CONTRACTS_PER_PRODUCT = 3
+# DCE/CZCE key-month contracts usually cease trading around mid delivery month.
+# The public 60m feed does not expose official expiry metadata, so research uses a
+# conservative fixed 15th calendar-day proxy and documents the approximation.
+DELIVERY_DAY_PROXY = 15
 
 
 def _contract_key(symbol: str) -> int:
@@ -51,15 +58,21 @@ def _contract_key(symbol: str) -> int:
     return int(match.group(1)) if match else 0
 
 
-def _prepare_intraday(raw: pd.DataFrame) -> pd.DataFrame:
-    """Normalize 60-minute rows and map calendar timestamps to futures trading days.
+def _delivery_date(symbol: str) -> pd.Timestamp | None:
+    match = re.search(r"(\d{4})$", str(symbol))
+    if not match:
+        return None
+    digits = match.group(1)
+    year = 2000 + int(digits[:2])
+    month = int(digits[2:])
+    try:
+        return pd.Timestamp(date(year, month, DELIVERY_DAY_PROXY))
+    except ValueError:
+        return None
 
-    China-futures night bars (>=20:00) belong to the next *observed* day-session
-    date. Using the next observed session rather than calendar +1 naturally maps
-    Friday night to Monday and avoids guessing the exchange holiday calendar.
-    If the next day session is unavailable in the downloaded evidence, the night
-    row is dropped fail-closed instead of assigning a speculative trading day.
-    """
+
+def _prepare_intraday(raw: pd.DataFrame) -> pd.DataFrame:
+    """Normalize 60-minute rows and map calendar timestamps to futures trading days."""
     frame=raw.copy()
     frame["datetime"]=pd.to_datetime(frame["datetime"], errors="coerce")
     for column in ("close","volume","hold"):
@@ -93,19 +106,17 @@ def _prepare_intraday(raw: pd.DataFrame) -> pd.DataFrame:
     frame["trading_day"]=pd.to_datetime(trading_days)
     frame=frame.dropna(subset=["trading_day"]).sort_values(["datetime","symbol"]).reset_index(drop=True)
     frame["visible_volume"]=(
-        frame.groupby(["product","symbol","trading_day"],sort=False)["volume"]
-        .cumsum()
+        frame.groupby(["product","symbol","trading_day"],sort=False)["volume"].cumsum()
     )
     return frame
 
 
 def build_pair_frames(prior: pd.DataFrame, current: pd.DataFrame) -> dict[tuple[str,str,str],pd.DataFrame]:
-    """Build one daily observation from the synchronized production-window bar.
+    """Build point-in-time front-three pair observations matching production Auto.
 
-    Price and OI come from the last *exact common* 60-minute timestamp inside
-    22:55-23:00. Volume is cumulative only through that sample timestamp within
-    the mapped futures trading day. If either leg has no quote in the production
-    window, the trading day is absent rather than falling back to day-session data.
+    Each futures trading day first removes contracts inside the 20-day delivery
+    blackout, then keeps only the front three eligible contracts and creates adjacent
+    pairs. Both legs must have the same exact 22:55-23:00 60-minute timestamp.
     """
     combined=_prepare_intraday(pd.concat([prior,current],ignore_index=True))
     if combined.empty:
@@ -120,22 +131,41 @@ def build_pair_frames(prior: pd.DataFrame, current: pd.DataFrame) -> dict[tuple[
         .tail(1)
     )
 
-    result={}
-    for product, group in sample.groupby("product"):
-        symbols=sorted(group["symbol"].astype(str).unique(), key=_contract_key)
-        for near_symbol, far_symbol in zip(symbols, symbols[1:]):
-            near=group[group.symbol==near_symbol][["trading_day","datetime","close","visible_volume","hold"]].rename(
-                columns={"datetime":"sample_timestamp","close":"near","visible_volume":"near_vol","hold":"near_hold"})
-            far=group[group.symbol==far_symbol][["trading_day","datetime","close","visible_volume","hold"]].rename(
-                columns={"datetime":"sample_timestamp","close":"far","visible_volume":"far_vol","hold":"far_hold"})
-            pair=near.merge(far,on=["trading_day","sample_timestamp"])
-            if pair.empty:
+    rows_by_pair: dict[tuple[str,str,str], list[dict]] = {}
+    for (product,trading_day), day_rows in sample.groupby(["product","trading_day"]):
+        day_ts=pd.Timestamp(trading_day)
+        eligible=[]
+        for _, row in day_rows.iterrows():
+            delivery=_delivery_date(str(row["symbol"]))
+            if delivery is None or (delivery-day_ts).days < MIN_DAYS_TO_EXPIRY:
                 continue
-            pair=pair.sort_values("sample_timestamp").reset_index(drop=True)
-            pair["datetime"]=pair["trading_day"]
-            pair["raw"]=pair["near"]-pair["far"]
-            pair["logratio"]=np.log(pair["near"]/pair["far"])
-            result[(str(product),near_symbol,far_symbol)]=pair
+            eligible.append((delivery,str(row["symbol"]),row))
+        eligible.sort(key=lambda item:(item[0],_contract_key(item[1]),item[1]))
+        eligible=eligible[:MAX_CONTRACTS_PER_PRODUCT]
+        for (_,near_symbol,near_row),(_,far_symbol,far_row) in zip(eligible,eligible[1:]):
+            near_time=pd.Timestamp(near_row["datetime"])
+            far_time=pd.Timestamp(far_row["datetime"])
+            if near_time != far_time:
+                continue
+            key=(str(product),near_symbol,far_symbol)
+            rows_by_pair.setdefault(key,[]).append({
+                "trading_day":day_ts,
+                "sample_timestamp":near_time,
+                "near":float(near_row["close"]),
+                "near_vol":float(near_row["visible_volume"]),
+                "near_hold":float(near_row["hold"]),
+                "far":float(far_row["close"]),
+                "far_vol":float(far_row["visible_volume"]),
+                "far_hold":float(far_row["hold"]),
+            })
+
+    result={}
+    for key, rows in rows_by_pair.items():
+        pair=pd.DataFrame(rows).sort_values("sample_timestamp").reset_index(drop=True)
+        pair["datetime"]=pair["trading_day"]
+        pair["raw"]=pair["near"]-pair["far"]
+        pair["logratio"]=np.log(pair["near"]/pair["far"])
+        result[key]=pair
     return result
 
 
@@ -191,10 +221,7 @@ def generate_trades(frame:pd.DataFrame, product:str, params:dict) -> pd.DataFram
                 armed=0;armed_extreme=None;continue
             slope=0.0
             trend_window=int(params["trend_window"])
-            if (
-                trend_window>1 and i>=trend_window-1
-                and np.all(np.isfinite(z[i-trend_window+1:i+1]))
-            ):
+            if trend_window>1 and i>=trend_window-1 and np.all(np.isfinite(z[i-trend_window+1:i+1])):
                 slope=float(np.polyfit(np.arange(trend_window),z[i-trend_window+1:i+1],1)[0])
             if armed==0:
                 if zi>=params["arm"]:
@@ -363,6 +390,7 @@ def main():
         "sample_reference":"last exact common 60-minute timestamp within 22:55-23:00 China-time production window; no day-session fallback",
         "trading_day_mapping":"night bars >=20:00 map to the next observed day-session date; unmatched tail nights are dropped fail-closed",
         "pair_alignment":"near/far price and open interest share the same 60-minute timestamp; volume is cumulative only through that sample within the mapped futures trading day",
+        "universe_alignment":"per futures trading day: 20-day delivery blackout using delivery-month 15th proxy, then front three contracts and adjacent pairs only",
         "windows":WINDOWS,
         "profile":PROFILE,
         "cost_stress":"2x conservative round-trip ticks",
@@ -383,8 +411,6 @@ def main():
         "neighbors":neighbors,
     }
 
-    # Hard evidence gates. Product eligibility is frozen before the following
-    # forward window; OOS is never used to select a product or parameter.
     assert all(coverage["current"].get(p)==484 for p in PRODUCTS)
     assert all(coverage["prior"].get(p)>=484 for p in PRODUCTS)
     assert tuple(qualified_prior)==EXPECTED_PRIOR_PRODUCTS, qualified_prior
