@@ -290,6 +290,10 @@ class TradingEngine:
 
                 spread = near.mid_price - far.mid_price
                 self.portfolio_risk.update(pair_id, spread, quote_time)
+                # 一腿已经成交、另一腿未完成时，只允许余额审计/修复路径接管；
+                # 不能让策略把“提交中的目标仓位”误当成真实双腿仓位后再生成新信号。
+                if not self.executor.pair_is_balanced(pair):
+                    continue
                 strategy = self.strategies[pair_id]
                 pre_signal_state = strategy.snapshot_state()
                 signal = strategy.on_quotes(near, far)
@@ -332,6 +336,11 @@ class TradingEngine:
                     far,
                     open_pair_count=self._open_pair_count(),
                     spread_std=strategy.spread_std,
+                    rate_limit_time=(
+                        signal.timestamp.timestamp()
+                        if self.historical_mode
+                        else None
+                    ),
                 )
                 self._record_quality_decision(pair, signal, near, far, result)
                 if not result.accepted:
@@ -631,7 +640,7 @@ class TradingEngine:
     def _audit_pair_balance(self) -> None:
         if self.halted or self.state.runtime_mode == RuntimeMode.REDUCE_ONLY.value:
             return
-        now = monotonic()
+        now = self._imbalance_clock()
         for pair in self.pairs.values():
             if self.executor.pair_is_balanced(pair):
                 self._imbalance_since.pop(pair.pair_id, None)
@@ -642,6 +651,12 @@ class TradingEngine:
                     f"pair imbalance detected: {pair.pair_id}"
                 )
                 return
+
+    def _imbalance_clock(self) -> float:
+        """实盘按进程单调时钟；历史回放按最新可见市场事件时间。"""
+        if self.historical_mode and self.quotes:
+            return max(tick.timestamp for tick in self.quotes.values()).timestamp()
+        return monotonic()
 
     def _apply_expected_trade(self, trade: Trade) -> None:
         book = PositionBook(
