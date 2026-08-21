@@ -1,87 +1,271 @@
 # afuture
 
-`afuture` 是一套面向个人投资者的国内商品期货**同品种跨期套利交易系统**。它把历史研究、保守模拟撮合和 CTP 实盘接入放在同一套策略、风控、执行和状态模型上，核心原则是：**先证明净交易边际，再允许开仓；任何状态不确定时优先减少风险。**
+`afuture` 是一套面向个人使用的国内商品期货**同品种跨期自动套利系统**。目标不是搭建庞大的交易平台，而是把真实数据研究、自动选标、风控、双腿执行、CTP 实盘和异常恢复收敛在一条可验证的生产链路中。
 
-> 个人期货账户通常通过期货公司的 CTP 交易/行情前置接入交易所，并不是程序直接连接交易所撮合主机。项目的实盘适配器基于 VeighNa `vnpy_ctp`。
+核心原则：**只交易被真实历史证据支持的价差机会；任何行情、账户或双腿状态不确定时，优先减少风险。**
 
-## 当前范围
+> 历史回测不能保证未来高收益或低回撤。当前版本的改造目标是提高风险调整后的历史收益质量，并通过独立 OOS、2x 成本压力和参数邻域稳定性降低过拟合风险。
 
-正式策略只做同一品种不同交割月份的跨期套利，例如豆粕近月/远月。项目**不**把股指期现套利、跨品种套利、高频做市或方向性期货交易混入当前生产链路。
+## 当前生产策略
 
-核心能力：
+正式策略仍只做同一品种不同交割月份的跨期套利，不引入方向性期货、跨品种套利、期权或高频做市。
 
-- **可成交价差**：多价差使用 `near.ask - far.bid`，空价差使用 `near.bid - far.ask`，不再只看 mid-price。
-- **Net Edge**：开仓前扣除手续费、滑点和裸腿风险缓冲；Z-score 异常但净边际不足时不交易。
-- **状态化均值回归**：滚动 Z-score、Entry-anchored stop、最长持有、结构性均值漂移/波动率突变退出。
-- **动态手数**：`volume` 是最大允许手数，实际手数由账户风险预算、价差波动、盘口深度和硬上限共同决定。
-- **市场微观结构保护**：盘口宽度、一档深度、涨跌停距离、开盘冷静期、收盘禁开仓窗口、到期日黑名单。
-- **组合风险**：滚动价差变化相关性和 `risk_group` 集中度限制。
-- **双腿异常恢复**：`RUNNING → REDUCE_ONLY → HALTED`；裸腿时持续只减仓修复，风险消除后仍要求人工复核才能恢复正常交易。
-- **自动发现/自动交易**：从 CTP 合约目录生成同品种相邻月份，实时按成交量、Open Interest、盘口深度、均值回归、Z-score 和 Net Edge 排名，只激活少量最佳组合并交给现有策略/风控/执行链自动下单。
-- **CTP 实盘**：行情、下单、撤单、账户、持仓、订单/成交回报、完整持仓快照、交易日处理。
-- **CTP 元数据安全门**：启动时查询合约乘数、price tick、保证金率和账户手续费；本地配置可以更保守，但不能低估柜台真实风险参数。
-- **启动与运行对账**：未知成交、未知活动订单、持仓漂移、CTP 断线或快照陈旧都会触发 fail-closed。
-- **状态完整性**：状态文件带 schema version、单调 sequence、SHA-256 checksum、最后订单/成交 ID，并兼容旧状态迁移。
-- **研究工具**：Scanner 计算成交量、Open Interest、深度、Z-score、半衰期、平稳性代理和 Net Edge；`accept` 执行 Train/Validation/OOS/成本压力 Walk-forward。
-- **保守模拟**：一档深度消耗、部分成交、FAK/FOK、滑点、延迟和 market impact。
-- **审计与告警**：JSONL 审计日志、本地关键告警文件和可选通用 Webhook。
+截至本仓库当前两年真实数据验收，生产白名单为：
+
+- `M`：豆粕
+- `OI`：菜籽油
+
+运行时不是写死某两个具体合约，而是从 CTP 合约目录中自动选择这两个品种当前可交易的相邻月份组合。
+
+策略使用：
+
+```text
+25 日 log(near / far) 相对价值
+    ↓
+达到 ±2.5σ 极端偏离
+    ↓
+不立即逆势交易
+    ↓
+等待至少 0.30σ 的回归确认
+    ↓
+仍保留至少 1.75σ 的有效偏离
+    ↓
+趋势斜率 + 平稳性 + 半衰期过滤
+    ↓
+实时 bid/ask + 深度 + Open Interest + Net Edge
+    ↓
+风险预算定仓
+    ↓
+双腿自动下单
+```
+
+生产中心参数见 `config/afuture.live.example.toml`：
+
+| 参数 | 当前值 |
+|---|---:|
+| `lookback` | 25 |
+| `entry_z` | 2.50 |
+| `confirmation_retrace_z` | 0.30 |
+| `min_confirmed_entry_z` | 1.75 |
+| `exit_z` | 0.75 |
+| `stop_z` | 4.00 |
+| `entry_trend_window` | 6 |
+| `max_entry_z_slope` | 0.75 |
+| `min_stationarity_score` | 0.01 |
+| `max_half_life` | 60 |
+| `max_holding_samples` | 20 天 |
+| `daily_sample_window` | 22:55-23:00 |
+
+研究按每个自然日最后一根 60 分钟真实 K 线形成日样本，通常对应中国时间 23:00；实盘在 22:55-23:00 使用同步盘口，保留几分钟执行缓冲。
+
+## 两年真实数据证据
+
+主验收使用 AKShare 的新浪**具体交割合约**历史接口，不使用连续合约或随机合成数据。
+
+最近窗口：
+
+```text
+2024-08-21 ~ 2026-08-20
+484 个交易日
+15 个商品期货品种
+约 9.9 万根具体合约 60 分钟 K 线
+```
+
+研究池包括：
+
+```text
+A C EG FG I M MA OI P PP RB RM SA TA Y
+```
+
+同时增加独立历史反证窗口：
+
+```text
+2022-08-22 ~ 2024-08-20
+```
+
+最近两年严格切分：
+
+```text
+Train       2024-08-21 ~ 2025-08-20
+Validation  2025-08-21 ~ 2026-02-20
+Final OOS   2026-02-21 ~ 2026-08-20
+```
+
+所有品种和参数资格都在 Train + Validation 固定，Final OOS 只负责否决。
+
+在 **2x 保守往返成本** 下，中心方案的关键历史结果：
+
+| 验收 | 合格品种 | 交易数 | 累计 R | 最大回撤 R | 胜率 |
+|---|---|---:|---:|---:|---:|
+| 2022-2024 资格 → 下一年 Forward | A | 4 | +0.193 | -0.062 | 50% |
+| Train + Validation → Final OOS | M、OI | 4 | +1.208 | -0.042 | 75% |
+| 最近两年 M/OI 全窗口，仅作描述 | M、OI | 15 | +7.588 | -0.182 | 86.7% |
+
+对 8 个核心参数各做上下单变量扰动，共 16 组邻域，9/16 同时通过两轮前向测试，通过率 56.25%。因此当前中心点不是单一历史峰值，但仍不代表未来必然盈利。
+
+完整方法、数据边界、风险预算代理和验收条件见：
+
+- `docs/two_year_real_data_validation.md`
+
+可重复研究门：
+
+```bash
+python tools/fetch_two_year_60m_universe.py
+python tools/fetch_prior_two_year_60m_universe.py
+python tools/evaluate_daily_relative_strategy.py
+```
+
+GitHub Actions 的 `research-2y` 会自动重新拉取真实数据并执行这些门。任一数据覆盖、OOS、回撤、2x 成本或参数邻域条件失败，工作流直接失败。
+
+## 自动选标与自动交易
+
+生产自动层保持很小：
+
+```text
+CTP 合约目录
+  ↓
+M / OI 白名单
+  ↓
+过滤临近到期合约
+  ↓
+每个品种取前 3 个可交易月份
+  ↓
+生成相邻月份 1-2、2-3
+  ↓
+恢复持久化的 25 日统计历史
+  ↓
+relative-value + confirmation + quality gates
+  ↓
+实时成交量 / OI / bid-ask / 深度 / Net Edge
+  ↓
+每品种最多 1 个，账户最多 2 个组合
+  ↓
+CalendarSpreadStrategy
+  ↓
+RiskManager
+  ↓
+PairExecutor
+  ↓
+CTP
+```
+
+已有持仓不会因为候选排名变化被强制轮换；如果某组合不再通过资格门，只是在平仓后退役，不会被自动重新开仓。
+
+### 重启一致性
+
+项目面向每天手动启动的个人场景。为避免每天重启都丢失 25 日统计窗口，系统会持久化：
+
+- 自动候选采样历史 `auto_history`
+- rolling signal/raw history
+- confirmation armed state
+- 当前策略仓位状态
+- 权益高水位和交易日状态
+
+状态文件使用 schema version、sequence 和 SHA-256 checksum。首次部署如果没有历史状态，必须自然积累 warm-up；系统不会用合成数据伪造 25 日窗口。
+
+## 实盘风险控制
+
+正式示例的主要上限：
+
+| 规则 | 当前示例 |
+|---|---:|
+| 最大保证金 / 权益 | 35% |
+| 最小可用资金 / 权益 | 55% |
+| 单交易日最大亏损 | 1% |
+| 权益高水位最大回撤 | 8% |
+| 最大同时套利组合 | 2 |
+| 单合约最大手数 | 20 |
+| 单组合风险预算上限 | 2% |
+| 最小一档深度倍数 | 2x |
+| 最大 bid/ask 宽度 | 3 ticks |
+| 两腿最大时间差 | 2 秒 |
+| 临近到期禁开仓 | 5 天 |
+
+`2%` 是候选风险预算上限，不是每笔必然使用 2%。最终手数还会被保证金、可用资金、价差波动、一档深度、单合约上限和 CTP 真实参数进一步限制。
+
+双腿异常状态机：
+
+```text
+RUNNING
+   │
+   ├─ 普通风险/数据异常 ───────────→ HALTED
+   │
+   └─ 双腿失衡/紧急退出失败 ─────→ REDUCE_ONLY
+                                      │
+                                      ├─ 撤单 + FAK 只减仓
+                                      └─ 风险消除 → HALTED → 人工复核
+```
+
+正常双腿报单会优先提交当前可成交深度更薄的一腿，把流动性更好的腿留作第二腿对冲，降低裸腿概率。
+
+## 可成交价格与 Net Edge
+
+研究中的统计偏离不等于实盘可交易利润。生产开仓使用真实盘口：
+
+```text
+多价差 = near.ask - far.bid
+空价差 = near.bid - far.ask
+```
+
+并计算：
+
+```text
+Net Edge
+= 预期回归收益
+- 往返手续费
+- 双腿滑点
+- 裸腿风险缓冲
+```
+
+只有 Net Edge、盘口深度、行情同步、保证金和账户风险同时通过才下单。
 
 ## 安装
 
-研究、回放和测试：
+研究/回放/测试：
 
 ```bash
 python -m venv .venv
 # Windows
 .venv\Scripts\activate
-# Linux/macOS
-# source .venv/bin/activate
+# Linux/macOS: source .venv/bin/activate
 python -m pip install -e ".[dev]"
 ```
 
-需要 CTP：
+CTP：
 
 ```bash
 python -m pip install -e ".[live,dev]"
 ```
 
-实盘适配器针对 `vnpy 4.4.x` 与 `vnpy_ctp 6.7.11.4` 的当前接口行为实现。上游版本变化后必须重新跑测试柜台验收，不能直接升级生产环境依赖。
+当前实盘适配器按 `vnpy 4.4.x` 与 `vnpy_ctp 6.7.11.4` 的接口行为实现；升级上游依赖后应重新执行测试柜台验收。
 
-## 快速开始
+## 常用命令
 
-校验研究配置：
+校验配置：
 
 ```bash
 afuture validate --config config/afuture.example.toml
 ```
 
-保守历史回放：
+历史回放：
 
 ```bash
-afuture replay \
-  --config config/afuture.example.toml \
-  --data examples/sample_ticks.csv
+afuture replay --config config/afuture.example.toml --data examples/sample_ticks.csv
 ```
 
-自动选标历史回放：
+自动选标回放：
 
 ```bash
-afuture replay \
-  --config config/afuture.auto-replay.example.toml \
-  --data examples/auto_sample_ticks.csv
+afuture replay --config config/afuture.auto-replay.example.toml --data examples/auto_sample_ticks.csv
 ```
 
-这条命令使用与实盘相同的合约生成、候选排名、激活和退役逻辑，适合先验证“自动选择策略”本身。
-
-扫描当前跨期候选：
+扫描候选：
 
 ```bash
-afuture scan \
-  --config config/afuture.example.toml \
-  --data examples/research_ticks.csv
+afuture scan --config config/afuture.example.toml --data examples/research_ticks.csv
 ```
 
-执行短窗口示例 Walk-forward；真实研究应使用更长窗口：
+Walk-forward：
 
 ```bash
 afuture accept \
@@ -95,82 +279,15 @@ afuture accept \
   --stress-multipliers 1.0,1.5,2.0
 ```
 
-## 自动发现与自动交易
+## CTP 实盘
 
-当前实盘示例默认使用 `auto` 模式，不要求手工填写具体合约月份。自动层保持很小，只做“选哪个同品种跨期组合”，不会复制策略、风控或执行器。
-
-流程：
-
-```text
-CTP 合约目录
-  ↓
-品种/交易所白名单
-  ↓
-过滤临近到期，只取每个品种前 3 个可交易月份
-  ↓
-生成相邻月份：1-2、2-3
-  ↓
-订阅实时 Tick
-  ↓
-成交量 + Open Interest + 一档深度
-  ↓
-异步两腿行情时间配对
-  ↓
-Z-score + 半衰期 + 平稳性代理 + Net Edge
-  ↓
-每个品种最多 1 个，账户最多激活 2 个
-  ↓
-CalendarSpreadStrategy → RiskManager → PairExecutor → CTP
-```
-
-自动轮换遵守三个原则：
-
-1. **不为排名轮换强平**：已有持仓即使排名下降，也继续由原策略管理退出。
-2. **排名失效后不再重开**：组合退出后，如果不再通过自动候选硬门，会自动退役。
-3. **交易日自动更新**：进入新交易日后重新应用到期过滤，新的前排合约自动订阅；临近到期合约停止新增风险。
-
-Scanner 不要求两个 CTP Tick 的时间戳完全相同，只在允许的小时间差内配对，避免异步行情导致自动发现长期得不到样本。
-
-`config/afuture.live.example.toml` 默认只扫描 `m/rb/TA/c/p` 且只启用日盘，是为了让个人系统保持简单。你可以修改白名单；`products = ["*"]` 可以扫描所有支持交易所的期货品种，但不建议个人账户一开始这样做，因为订阅、元数据查询和候选数量都会明显增加。
-
-自动筛选的目标是提高**风险调整后的机会质量**，不能保证高收益或低回撤。最终收益仍取决于真实价差规律、手续费、滑点、成交质量和市场结构变化。
-
-## 为什么不直接用 Z-score 开仓
-
-传统简化模型常用：
-
-```text
-spread = near.mid - far.mid
-```
-
-但真实双腿成交面对的是：
-
-```text
-多价差开仓 = near.ask - far.bid
-空价差开仓 = near.bid - far.ask
-```
-
-`afuture` 会进一步估算：
-
-```text
-Net Edge
-= 预期均值回归收益
-- 往返手续费
-- 双腿滑点
-- 裸腿风险缓冲
-```
-
-只有统计信号和 Net Edge 同时通过，才进入风险预算与盘口检查。这样能避免“回测看起来有价差，实盘一成交优势就消失”的常见套利假象。
-
-## 实盘配置
-
-复制示例：
+复制当前生产候选配置：
 
 ```bash
 cp config/afuture.live.example.toml config/live.toml
 ```
 
-CTP 密钥只从环境变量读取：
+密钥只从环境变量读取：
 
 ```text
 AFUTURE_CTP_USER
@@ -186,7 +303,7 @@ AFUTURE_CTP_AUTH_CODE
 afuture live --config config/live.toml
 ```
 
-生产柜台额外要求双重确认：
+生产柜台额外要求：
 
 ```text
 AFUTURE_LIVE_ACK=I_UNDERSTAND_FUTURES_RISK
@@ -196,111 +313,44 @@ AFUTURE_LIVE_ACK=I_UNDERSTAND_FUTURES_RISK
 afuture live --config config/live.toml --confirm-live
 ```
 
-### 实盘启动安全门
-
-程序不会在登录成功后立即发单。顺序是：
-
-1. CTP 行情和交易登录、合约初始化完成。
-2. `auto` 模式读取 CTP 合约目录，恢复上次仍需管理的动态组合，并订阅候选合约。
-3. 等待登录之后**新产生**的账户事件和一次完整持仓快照。
-4. 静态组合比较本地/CTP 元数据；动态组合的乘数、price tick、保证金和手续费直接从 CTP 获取。
-5. 若存在遗留活动订单，先撤单并停机。
-6. 本地期望持仓与柜台完整持仓逐合约对账。
-7. 已存在 Kill Switch 时，只有本次会话元数据校验和持仓对账都通过才允许解除。
-8. 进入 `RUNNING`；自动层持续观察候选，但只有通过全部硬门的少数组合才会被激活。
-
-如果人工交易或其他程序改变了同一账户的仓位，系统会把未知成交/持仓漂移视为异常。因此建议为该系统使用独立期货账户，至少不要让多个程序同时交易同一批合约。
-
-## 异常状态机
-
-```text
-RUNNING
-   │
-   ├─ 普通风险/数据异常 ───────────→ HALTED
-   │
-   └─ 双腿失衡/紧急退出失败 ─────→ REDUCE_ONLY
-                                      │
-                                      ├─ 持续撤单、FAK 只减仓
-                                      │
-                                      └─ 风险恢复 → HALTED → 人工复核
-```
-
-`HALTED` 只表示程序不再增加风险，并不等于仓位一定已经安全。对于裸腿场景，系统会先进入 `REDUCE_ONLY` 尝试降低风险，然后才进入需要人工复核的 `HALTED`。
-
-## 默认风控
-
-示例默认值面向约 50 万元级别的谨慎研究起点，不构成资金或品种建议：
-
-| 规则 | 示例值 |
-|---|---:|
-| 最大保证金 / 权益 | 35% |
-| 最小可用资金 / 权益 | 50% |
-| 单交易日最大亏损 | 1% |
-| 权益高水位最大回撤 | 8% |
-| 最大同时套利组合 | 3 |
-| 单合约最大手数 | 10 |
-| 风险预算 / 权益 / 组合 | 0.20% |
-| 最小一档深度倍数 | 2x |
-| 最大 bid/ask 宽度 | 4 ticks |
-| 涨跌停最小距离 | 3 ticks |
-| 临近到期禁开仓 | 5 天 |
-| 普通报单频率 | 20 次/分钟 |
-
-实盘必须按具体品种波动、账户手续费和期货公司保证金重新设置。
-
-## 研究晋级原则
-
-`accept` 不是“找最高收益参数”，而是：
-
-1. Train + Validation 选择参数。
-2. 参数必须位于相邻参数也表现稳定的区域；多个孤立峰值不自动选冠军。
-3. OOS 只用于验收，不参与前面的参数选择。
-4. 对最终候选执行 1x/1.5x/2x 等交易成本压力。
-5. OOS 正收益比例、最大回撤和成本压力同时达标才晋级。
-
-真实实盘前还应覆盖多年份、不同月份合约、不同波动状态、手续费/滑点扩大和删除单一优势区间等压力场景。
+启动后会先完成账户、持仓、合约元数据、遗留订单和本地状态对账，再允许进入 `RUNNING`。建议使用独立账户或至少不要让其他程序/人工同时交易相同合约，否则未知成交或持仓漂移会触发 fail-closed。
 
 ## 项目结构
 
 ```text
 afuture/
-  broker/
-    base.py             # 柜台统一接口
-    sim.py              # 模拟/保守撮合
-    ctp.py              # VeighNa CTP 实盘适配
-  models.py             # 统一领域模型
-  auto.py               # CTP 合约发现、候选排名和动态组合生命周期
-  economics.py          # 可成交价差与 Net Edge
-  strategy.py           # 跨期均值回归与结构失效
-  risk.py               # 账户、市场和动态仓位风控
-  portfolio_risk.py     # 滚动相关性与风险组
-  execution.py          # 双腿执行、回滚和只减仓修复
-  engine.py             # 实时/回放统一事件链
-  health/monitor.py     # 健康门
-  metadata.py           # CTP 实时参数校验
-  state.py              # 可校验状态持久化
-  scanner.py            # 候选扫描
-  calibration.py        # 稳定参数区域选择
-  research.py           # Walk-forward/OOS/Stress
-  alerts.py             # 本地/Webhook 告警
-  journal.py            # 结构化审计日志
-  cli.py                # 命令行入口
+  auto.py               # 合约发现、候选排名、日频历史恢复
+  strategy.py           # relative-value / confirmation / exits
+  scanner.py            # 统计质量与候选扫描
+  economics.py          # 可成交价差、手续费、滑点、Net Edge
+  risk.py               # 账户、市场、动态仓位风控
+  execution.py          # 双腿执行、回滚、只减仓修复
+  engine.py             # 实盘/回放统一事件链
+  state.py              # 可校验持久化状态
+  broker/ctp.py         # CTP 实盘适配
+  broker/sim.py         # 模拟/保守撮合
+  research.py           # Walk-forward / OOS / Stress
 ```
 
-进一步说明：
+进一步文档：
 
-- [架构与数据流](docs/architecture.md)
-- [实盘与恢复](docs/live-trading.md)
-- [数据、回放与研究](docs/data-and-backtest.md)
-- [生产上线检查表](docs/production-checklist.md)
+- `docs/two_year_real_data_validation.md`
+- `docs/architecture.md`
+- `docs/live-trading.md`
+- `docs/data-and-backtest.md`
+- `docs/production-checklist.md`
 
-## 仍然不能由代码仓库替代的验证
+## 不能由回测替代的最后验证
 
-代码可以建立完整的软件闭环，但以下事项只有你的期货公司测试/真实环境才能最终确认：
+代码和历史数据不能替代真实柜台环境。正式扩大风险预算之前仍应按顺序完成：
 
-- CTP 前置地址、BrokerID、AppID/AuthCode 和账户权限。
-- 账户实际保证金、手续费和平今费查询结果。
-- 测试柜台下单、撤单、部分成交、断线重连、夜盘交易日。
-- 特定期货公司柜台对 CTP 查询频率、风控和报单限制的差异。
+```text
+真实历史研究
+→ 保守回放
+→ CTP 测试柜台
+→ 极小真实仓位
+→ 多交易日观察
+→ 再决定是否提高风险预算
+```
 
-推荐上线顺序：**历史研究 → 保守回放 → CTP 测试柜台 → 极小真实仓位 → 多交易日验证 → 再扩大风险预算**。
+尤其需要验证期货公司真实手续费/平今费、保证金、夜盘交易日、部分成交、断线重连和报单流控。高收益是目标，不是软件能够保证的属性。
