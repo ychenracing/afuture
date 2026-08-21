@@ -1,7 +1,9 @@
 from datetime import date, datetime, timedelta, timezone
+from math import log
 
 from afuture.auto import AutoConfig, AutoPairManager, AutoPairSelector
 from afuture.models import ContractInfo, PairConfig, SignalAction, Tick
+from afuture.scanner import SpreadScanner
 from afuture.strategy import CalendarSpreadStrategy
 
 
@@ -13,6 +15,28 @@ def tick(symbol: str, when: datetime, mid: float, trading_day: str = "20260821")
         bid_price=mid - 0.5,
         ask_price=mid + 0.5,
         last_price=mid,
+        bid_volume=100,
+        ask_volume=100,
+        trading_day=trading_day,
+        volume=20000,
+        open_interest=80000,
+    )
+
+
+def book_tick(
+    symbol: str,
+    when: datetime,
+    bid: float,
+    ask: float,
+    trading_day: str = "20260821",
+) -> Tick:
+    return Tick(
+        symbol=symbol,
+        exchange="DCE",
+        timestamp=when,
+        bid_price=bid,
+        ask_price=ask,
+        last_price=(bid + ask) / 2,
         bid_volume=100,
         ask_volume=100,
         trading_day=trading_day,
@@ -114,6 +138,54 @@ def test_confirmation_waits_for_retrace_before_opening():
     assert "confirmed" in confirmed.reason
 
 
+def test_log_ratio_position_waits_for_executable_liquidation_reversion():
+    strategy = CalendarSpreadStrategy(
+        relative_pair(
+            daily_sample_window="",
+            confirm_entry=False,
+            stop_z=100.0,
+        )
+    )
+    strategy.restore_state(
+        {
+            "history": [log(1.0), log(1.001), log(0.999), log(1.0)],
+            "raw_history": [0.0, 3.0, -3.0, 0.0],
+            "position": 1,
+            "entry_mean": 0.0,
+            "entry_std": 2.0,
+        }
+    )
+    when = datetime(2026, 8, 21, 6, 56, tzinfo=timezone.utc)
+    signal = strategy.on_quotes(
+        book_tick("m2609", when, 2990, 3010),
+        book_tick("m2701", when, 2990, 3010),
+    )
+    # Mid prices look fully reverted, but selling near/buying far still realizes a
+    # strongly adverse relative value. A normal EXIT here would recreate the exact
+    # bid/ask optimism removed from the legacy spread path.
+    assert signal.action is SignalAction.HOLD
+
+
+def test_daily_scanner_keeps_historical_samples_when_leg_ticks_are_seconds_apart():
+    pair = relative_pair()
+    scanner = SpreadScanner(max_sync_seconds=2.0)
+    rows: list[Tick] = []
+    base = datetime(2026, 8, 17, 6, 56, tzinfo=timezone.utc)
+    for offset in range(5):
+        day = (date(2026, 8, 17) + timedelta(days=offset)).strftime("%Y%m%d")
+        when = base + timedelta(days=offset)
+        rows.append(tick("m2609", when, 3100 + offset, day))
+        rows.append(tick("m2701", when + timedelta(seconds=10), 3000, day))
+
+    synchronized = scanner.synchronized_ticks(pair, rows)
+    # The 2-second rule is an execution gate, not a reason to destroy a once-per-day
+    # statistical observation. Engine/RiskManager still rejects stale current books.
+    assert len(synchronized) == 5
+    assert [near.trading_day for near, _ in synchronized] == [
+        "20260817", "20260818", "20260819", "20260820", "20260821"
+    ]
+
+
 def test_auto_profile_copies_relative_daily_quality_parameters():
     config = AutoConfig(
         enabled=True,
@@ -131,7 +203,7 @@ def test_auto_profile_copies_relative_daily_quality_parameters():
         max_entry_z_slope=0.75,
         min_stationarity_score=0.01,
         max_half_life=60.0,
-        daily_sample_window="14:55-15:00",
+        daily_sample_window="22:55-23:00",
     )
     catalog = [
         ContractInfo("m2609", "DCE", "m", "2026-09-15"),
@@ -143,7 +215,7 @@ def test_auto_profile_copies_relative_daily_quality_parameters():
     assert pair.confirmation_retrace_z == 0.3
     assert pair.min_confirmed_entry_z == 1.75
     assert pair.max_entry_z_slope == 0.75
-    assert pair.daily_sample_window == "14:55-15:00"
+    assert pair.daily_sample_window == "22:55-23:00"
 
 
 def test_auto_history_round_trips_for_daily_restart_warmup():
