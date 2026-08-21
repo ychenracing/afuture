@@ -135,6 +135,9 @@ def build_research_inputs(rows_by_symbol: dict[str, list[DailyBar]], start: date
                     exchange=definition.exchange,
                     product=definition.product,
                     expiry=expiry.isoformat(),
+                    # 第一条真实日线是保守、可复现的挂牌可见性边界；即使官方实际
+                    # listing 更早，也不会把未来尚无任何市场数据的合约提前泄漏进 Universe。
+                    listing=min(row.day for row in bars).isoformat(),
                 )
             )
             product_symbols.append(symbol)
@@ -396,6 +399,7 @@ def run_research(rows_by_symbol, start: date, end: date) -> dict:
             "pair_volume_upper_bound": AutoPortfolioRunner.MAX_RESEARCH_PAIR_VOLUME,
             "holdout_used_for_optimization": False,
             "same_bar_close_lookahead": False,
+            "historical_listing_filter": True,
             "search_exhausted": True,
         },
         "baseline_development_oos": oos_summary(baseline.folds),
