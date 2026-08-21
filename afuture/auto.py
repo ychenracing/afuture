@@ -1,28 +1,28 @@
 """轻量级自动合约发现与跨期组合选择。
 
-这个模块只解决“从哪里交易”这一件事：从 CTP 合约目录中生成同品种相邻月份，
-观察实时盘口后按流动性、成交量、持仓量、均值回归和 Net Edge 排名。
-它不创建第二套策略、风控或执行系统，选中的组合仍交给 ``TradingEngine`` 处理。
+从 CTP 合约目录生成同品种相邻月份，观察盘口后按活动度、统计质量和净边际排名。
+选标只负责“从哪里交易”，正式策略、风险和执行仍走唯一生产链路。
 """
 
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from dataclasses import dataclass
-from datetime import date, datetime
+from dataclasses import asdict, dataclass
+from datetime import date, datetime, time
+from math import log
 from typing import Iterable
+from zoneinfo import ZoneInfo
 
 from .models import ContractInfo, ContractSpec, PairConfig, Tick
 from .scanner import SpreadScanner
 
 
+_CHINA_TZ = ZoneInfo("Asia/Shanghai")
+
+
 @dataclass(frozen=True)
 class AutoConfig:
-    """自动发现的最小配置。
-
-    默认不自动启用；实盘示例会显式开启。``products`` 是品种白名单，避免个人程序
-    一次订阅全市场数百个合约，把复杂度和 CTP 流控风险无意义放大。
-    """
+    """自动发现的最小配置。"""
 
     enabled: bool = False
     products: tuple[str, ...] = ("m", "rb", "TA", "c", "p")
@@ -44,6 +44,14 @@ class AutoConfig:
     structural_mean_shift_z: float = 3.0
     structural_vol_ratio: float = 2.5
     legging_buffer: float = 0.0
+
+    signal_transform: str = "spread"
+    confirm_entry: bool = False
+    confirmation_retrace_z: float = 0.0
+    min_confirmed_entry_z: float = 0.0
+    entry_trend_window: int = 6
+    max_entry_z_slope: float = 999.0
+    daily_sample_window: str = ""
 
     min_volume: float = 5000.0
     min_open_interest: float = 10000.0
@@ -76,6 +84,17 @@ class AutoConfig:
             raise ValueError("auto z-score thresholds are invalid")
         if self.max_pair_volume <= 0:
             raise ValueError("auto max_pair_volume must be positive")
+        if self.signal_transform not in {"spread", "log_ratio"}:
+            raise ValueError("auto signal_transform must be spread or log_ratio")
+        if self.confirm_entry:
+            if self.confirmation_retrace_z <= 0:
+                raise ValueError("auto confirmation_retrace_z must be positive")
+            if not 0 < self.min_confirmed_entry_z < self.entry_z:
+                raise ValueError("auto min_confirmed_entry_z must be below entry_z")
+        if self.entry_trend_window < 2 or self.max_entry_z_slope <= 0:
+            raise ValueError("auto entry trend limits are invalid")
+        if self.daily_sample_window:
+            self._parse_daily_window(self.daily_sample_window)
         if self.min_volume < 0 or self.min_open_interest < 0:
             raise ValueError("auto activity thresholds cannot be negative")
         if not 0 <= self.min_liquidity_score <= 1:
@@ -84,6 +103,17 @@ class AutoConfig:
             raise ValueError("auto min_stationarity_score must be between 0 and 1")
         if self.max_half_life <= 0 or self.metadata_timeout_seconds <= 0:
             raise ValueError("auto half-life/metadata timeout must be positive")
+
+    @staticmethod
+    def _parse_daily_window(raw: str) -> tuple[time, time]:
+        try:
+            left, right = raw.split("-", 1)
+            start, end = time.fromisoformat(left), time.fromisoformat(right)
+        except ValueError as exc:
+            raise ValueError(f"invalid auto daily sample window: {raw}") from exc
+        if start >= end:
+            raise ValueError("auto daily sample window must be increasing")
+        return start, end
 
 
 class AutoPairSelector:
@@ -130,9 +160,8 @@ class AutoPairSelector:
         near: ContractInfo,
         far: ContractInfo,
     ) -> PairConfig:
-        pair_id = f"auto_{product}_{near.symbol}_{far.symbol}"
         return PairConfig(
-            pair_id=pair_id,
+            pair_id=f"auto_{product}_{near.symbol}_{far.symbol}",
             near_symbol=near.symbol,
             far_symbol=far.symbol,
             exchange=exchange,
@@ -151,11 +180,20 @@ class AutoPairSelector:
             legging_buffer=self.config.legging_buffer,
             risk_group=product,
             session_windows=self.config.session_windows,
+            signal_transform=self.config.signal_transform,
+            confirm_entry=self.config.confirm_entry,
+            confirmation_retrace_z=self.config.confirmation_retrace_z,
+            min_confirmed_entry_z=self.config.min_confirmed_entry_z,
+            entry_trend_window=self.config.entry_trend_window,
+            max_entry_z_slope=self.config.max_entry_z_slope,
+            min_stationarity_score=self.config.min_stationarity_score,
+            max_half_life=self.config.max_half_life,
+            daily_sample_window=self.config.daily_sample_window,
         )
 
 
 class AutoPairManager:
-    """维护自动候选的行情历史、评分缓存和激活集合。"""
+    """维护自动候选的采样历史、评分缓存和激活集合。"""
 
     def __init__(self, config: AutoConfig) -> None:
         config.validate()
@@ -196,12 +234,15 @@ class AutoPairManager:
         broker,
         today: date,
         restored_pairs: dict[str, dict] | None = None,
+        restored_history: dict[str, list[dict]] | None = None,
     ) -> list[tuple[PairConfig, dict[str, ContractSpec]]]:
-        """读取柜台目录、订阅候选，并恢复上次仍需管理的动态组合。"""
+        """读取柜台目录、恢复采样/动态组合状态并订阅候选。"""
         catalog = broker.get_contract_catalog()
         if not catalog:
             raise RuntimeError("auto discovery contract catalog is empty")
         self.prepare_catalog(catalog, today)
+        if restored_history:
+            self.restore_history(restored_history)
 
         restored: list[tuple[PairConfig, dict[str, ContractSpec]]] = []
         catalog_symbols = {item.symbol for item in catalog}
@@ -225,9 +266,8 @@ class AutoPairManager:
         }
         for symbol in sorted(symbols):
             pair = next(
-                p
-                for p in self.candidate_pairs
-                if symbol in {p.near_symbol, p.far_symbol}
+                item for item in self.candidate_pairs
+                if symbol in {item.near_symbol, item.far_symbol}
             )
             broker.subscribe(symbol, pair.exchange)
         self._initialized = True
@@ -243,7 +283,6 @@ class AutoPairManager:
         """交易日变化时重新应用到期过滤并订阅新进入前排的合约。"""
         if self._catalog_day == today:
             return False
-        # 保证金/手续费可能跨交易日调整，不能把前一交易日的 CTP 查询结果永久缓存。
         self._specs.clear()
         catalog = broker.get_contract_catalog()
         if not catalog:
@@ -265,8 +304,7 @@ class AutoPairManager:
         for symbol in symbols:
             self._history.setdefault(symbol, deque(maxlen=max_history))
             pair = next(
-                item
-                for item in self.candidate_pairs
+                item for item in self.candidate_pairs
                 if symbol in {item.near_symbol, item.far_symbol}
             )
             broker.subscribe(symbol, pair.exchange)
@@ -275,24 +313,61 @@ class AutoPairManager:
         return True
 
     def observe(self, tick: Tick) -> None:
-        """按策略采样周期保留行情，避免高频原始 Tick 挤掉统计时间窗口。"""
+        """按采样语义保留行情；日频模式每天只留收盘窗口的最后一笔。"""
         history = self._history.get(tick.symbol)
         if history is None:
             return
+        if self.config.daily_sample_window:
+            current = tick.timestamp.astimezone(_CHINA_TZ).timetz().replace(tzinfo=None)
+            start, end = AutoConfig._parse_daily_window(self.config.daily_sample_window)
+            if not start <= current <= end:
+                return
+            if history and history[-1].trading_day == tick.trading_day:
+                history[-1] = tick
+            else:
+                history.append(tick)
+            return
+
         sample_seconds = self.config.sample_seconds
         if sample_seconds <= 0 or not history:
             history.append(tick)
             return
-
         current_bucket = int(tick.timestamp.timestamp() // sample_seconds)
         last_bucket = int(history[-1].timestamp.timestamp() // sample_seconds)
         if current_bucket < last_bucket:
-            # CTP 偶发乱序回报不应倒退统计窗口。
             return
         if current_bucket == last_bucket:
             history[-1] = tick
             return
         history.append(tick)
+
+    def snapshot_history(self) -> dict[str, list[dict]]:
+        """导出有界采样历史，供每日重启恢复统计预热。"""
+        result: dict[str, list[dict]] = {}
+        for symbol, rows in self._history.items():
+            if not rows:
+                continue
+            payload: list[dict] = []
+            for tick in rows:
+                row = asdict(tick)
+                row["timestamp"] = tick.timestamp.isoformat()
+                payload.append(row)
+            result[symbol] = payload
+        return result
+
+    def restore_history(self, raw: dict[str, list[dict]]) -> None:
+        """只恢复当前候选目录仍需要的合约历史，并重新执行 Tick 校验。"""
+        for symbol, rows in raw.items():
+            history = self._history.get(symbol)
+            if history is None:
+                continue
+            history.clear()
+            for item in rows[-history.maxlen:]:
+                row = dict(item)
+                row["timestamp"] = datetime.fromisoformat(str(row["timestamp"]))
+                tick = Tick(**row)
+                tick.validate()
+                history.append(tick)
 
     def should_scan(self, now: datetime) -> bool:
         if self._last_scan is None:
@@ -316,27 +391,26 @@ class AutoPairManager:
         for pair in self.candidate_pairs:
             near_history = self._history.get(pair.near_symbol, ())
             far_history = self._history.get(pair.far_symbol, ())
-            if len(near_history) < pair.lookback or len(far_history) < pair.lookback:
+            if len(near_history) < pair.lookback + 1 or len(far_history) < pair.lookback + 1:
                 continue
-            near = near_history[-1]
-            far = far_history[-1]
+            near, far = near_history[-1], far_history[-1]
             if min(near.volume, far.volume) < self.config.min_volume:
                 continue
             if min(near.open_interest, far.open_interest) < self.config.min_open_interest:
                 continue
 
             ticks = list(near_history) + list(far_history)
-            statistics = self.scanner.statistics(pair, ticks)
+            synchronized = self.scanner.synchronized_ticks(pair, ticks)
+            statistics = self.scanner.statistics(pair, ticks, synchronized=synchronized)
             if statistics is None:
-                continue
-            if self.scanner.entry_signal(pair, near, far, statistics) is None:
                 continue
             if statistics.stationarity_score < self.config.min_stationarity_score:
                 continue
             if statistics.half_life > self.config.max_half_life:
                 continue
+            if self.scanner.candidate_entry(pair, synchronized, statistics) is None:
+                continue
 
-            # 只有纯行情统计和可成交阈值都接近开仓时才查询 CTP 保证金/手续费，减少流控和阻塞。
             pair_specs = self._ensure_specs(broker, pair)
             candidate = self.scanner.scan_pair(pair, ticks, pair_specs)
             if candidate is None:
@@ -384,26 +458,41 @@ class AutoPairManager:
         }
 
     def strategy_seed(self, pair: PairConfig) -> dict:
-        """用扫描阶段已经观察到的价差预热策略，避免激活后再等一个 lookback。"""
+        """用扫描阶段历史预热正式策略，并保留确认入场的武装状态。"""
         ticks = list(self._history.get(pair.near_symbol, ())) + list(
             self._history.get(pair.far_symbol, ())
         )
         synchronized = self.scanner.synchronized_ticks(pair, ticks)
-        # 最后一组是触发本轮候选评分的当前行情，不能提前写进历史均值，
-        # 否则会把当前极端偏离“稀释”掉，导致激活后策略与 Scanner 判断不一致。
         historical = synchronized[:-1]
-        history = [near.mid_price - far.mid_price for near, far in historical]
-        if len(history) > pair.lookback:
-            history = history[-pair.lookback :]
+        signal_history = [
+            log(near.mid_price / far.mid_price)
+            if pair.signal_transform == "log_ratio"
+            else near.mid_price - far.mid_price
+            for near, far in historical
+        ][-pair.lookback:]
+        raw_history = [
+            near.mid_price - far.mid_price for near, far in historical
+        ][-pair.lookback:]
+        z_history, armed, extreme = self.scanner.confirmation_seed(pair, historical)
         last_ts = ""
+        last_day = ""
         if historical:
-            last_ts = max(historical[-1][0].timestamp, historical[-1][1].timestamp).isoformat()
+            last_ts = max(
+                historical[-1][0].timestamp,
+                historical[-1][1].timestamp,
+            ).isoformat()
+            last_day = historical[-1][0].trading_day
         return {
-            "history": history,
+            "history": signal_history,
+            "raw_history": raw_history,
+            "z_history": z_history,
             "position": 0,
             "entry_mean": 0.0,
             "entry_std": 0.0,
             "last_sample_ts": last_ts,
+            "last_sample_trading_day": last_day,
+            "armed_direction": armed,
+            "armed_extreme": extreme,
         }
 
     def _ensure_specs(
