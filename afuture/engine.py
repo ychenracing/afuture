@@ -12,6 +12,7 @@ from .alerts import AlertManager
 from .auto import AutoPairManager
 from .economics import estimate_net_edge
 from .execution import PairExecutor
+from .fees import calculate_commission
 from .health.monitor import HealthMonitor
 from .metadata import validate_contract_metadata
 from .models import (
@@ -794,7 +795,6 @@ class TradingEngine:
             if pair_id not in eligible_ids:
                 self._retiring_auto_pairs.add(pair_id)
         for pair in selected:
-            # Protected pair 即使仍在 selected，也只有真正通过本轮 hard gates 才恢复开仓权。
             if pair.pair_id in eligible_ids:
                 self._retiring_auto_pairs.discard(pair.pair_id)
             elif pair.pair_id in protected:
@@ -920,6 +920,18 @@ class TradingEngine:
                 "reduce_only": False,
             }
 
+    def _quality_commission(self, trade: Trade) -> tuple[float, str]:
+        """优先使用 Broker 回报；CTP 无单笔手续费时用已验证费率表估算。"""
+        if float(trade.commission) > 0:
+            return float(trade.commission), "broker_trade"
+        spec = self.specs.get(trade.symbol)
+        if spec is None:
+            return 0.0, "unavailable"
+        return (
+            float(calculate_commission(spec, trade.offset, trade.price, trade.volume)),
+            "verified_fee_schedule",
+        )
+
     def _capture_quality_trade(self, trade: Trade) -> None:
         if self.quality is None:
             return
@@ -930,6 +942,7 @@ class TradingEngine:
         pending = self._quality_pending.get(pair_id)
         if pending is None:
             return
+        commission, commission_source = self._quality_commission(trade)
         pending["trades"].append(
             {
                 "symbol": trade.symbol,
@@ -937,7 +950,8 @@ class TradingEngine:
                 "side": trade.side,
                 "volume": trade.volume,
                 "price": trade.price,
-                "commission": trade.commission,
+                "commission": commission,
+                "commission_source": commission_source,
                 "timestamp": trade.timestamp,
                 "reference": order.request.reference,
             }
@@ -983,6 +997,7 @@ class TradingEngine:
         else:
             gross = (entry_spread - exit_spread) * multiplier * volume
         commission = sum(float(row.get("commission", 0.0)) for row in rows)
+        commission_sources = sorted({str(row.get("commission_source", "unknown")) for row in rows})
         open_times = sorted(row["timestamp"] for row in opens)
         leg_latency_ms = 0.0
         if len(open_times) >= 2:
@@ -1004,6 +1019,7 @@ class TradingEngine:
             partial_fill=partial,
             rollback=bool(pending.get("rollback", False)),
             reduce_only=bool(pending.get("reduce_only", False)),
+            extra={"commission_sources": commission_sources},
         )
         self._quality_pending.pop(pair_id, None)
 
