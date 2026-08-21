@@ -6,6 +6,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, time, timezone
 from math import floor
+from zoneinfo import ZoneInfo
 
 from .models import (
     AccountSnapshot,
@@ -18,6 +19,9 @@ from .models import (
     SignalAction,
     Tick,
 )
+
+
+_CHINA_TZ = ZoneInfo("Asia/Shanghai")
 
 
 @dataclass(frozen=True)
@@ -167,14 +171,15 @@ class RiskManager:
         *,
         opening: bool,
     ) -> RiskDecision:
-        """临近任一腿最后交易日时禁止增加新风险。"""
+        """按中国期货本地日期检查临近最后交易日的新风险。"""
         if not opening:
             return RiskDecision(True)
+        local_date = self._china_timestamp(now).date()
         for raw in (pair.expiry_near, pair.expiry_far):
             if not raw:
                 continue
             expiry = datetime.fromisoformat(raw).date()
-            days = (expiry - now.date()).days
+            days = (expiry - local_date).days
             if days <= self.config.expiry_blackout_days:
                 return RiskDecision(
                     False, "contract is inside expiry blackout window"
@@ -359,7 +364,7 @@ class RiskManager:
         return RiskDecision(True)
 
     def is_pair_session_active(self, pair: PairConfig, timestamp: datetime) -> bool:
-        """判断组合当前是否处于配置的交易时段；未配置时默认活跃。"""
+        """判断组合当前是否处于中国本地交易时段；未配置时默认活跃。"""
         if not pair.session_windows:
             return True
         return self._inside_sessions(timestamp, pair.session_windows)
@@ -367,13 +372,15 @@ class RiskManager:
     def _inside_sessions(
         self, timestamp: datetime, windows: tuple[str, ...]
     ) -> bool:
-        now = timestamp.timetz().replace(tzinfo=None)
+        local = self._china_timestamp(timestamp)
+        now = local.timetz().replace(tzinfo=None)
         return any(self._inside_window(now, raw) for raw in windows)
 
     def _inside_open_close_buffer(
         self, timestamp: datetime, windows: tuple[str, ...]
     ) -> bool:
-        now_minutes = timestamp.hour * 60 + timestamp.minute
+        local = self._china_timestamp(timestamp)
+        now_minutes = local.hour * 60 + local.minute
         for raw in windows:
             start_raw, end_raw = raw.split("-", 1)
             start_hour, start_minute = map(int, start_raw.split(":"))
@@ -391,6 +398,12 @@ class RiskManager:
                     and current <= end - self.config.close_blackout_minutes
                 )
         return False
+
+    @staticmethod
+    def _china_timestamp(timestamp: datetime) -> datetime:
+        if timestamp.tzinfo is None:
+            return timestamp.replace(tzinfo=_CHINA_TZ)
+        return timestamp.astimezone(_CHINA_TZ)
 
     @staticmethod
     def _inside_window(now: time, raw: str) -> bool:

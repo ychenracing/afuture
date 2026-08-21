@@ -289,8 +289,14 @@ class TradingEngine:
                     continue
 
                 spread = near.mid_price - far.mid_price
-                self.portfolio_risk.update(pair_id, spread)
-                signal = self.strategies[pair_id].on_quotes(near, far)
+                self.portfolio_risk.update(pair_id, spread, quote_time)
+                # 一腿已经成交、另一腿未完成时，只允许余额审计/修复路径接管；
+                # 不能让策略把“提交中的目标仓位”误当成真实双腿仓位后再生成新信号。
+                if not self.executor.pair_is_balanced(pair):
+                    continue
+                strategy = self.strategies[pair_id]
+                pre_signal_state = strategy.snapshot_state()
+                signal = strategy.on_quotes(near, far)
                 if signal.action is SignalAction.HOLD:
                     continue
 
@@ -299,7 +305,7 @@ class TradingEngine:
                     SignalAction.SHORT_SPREAD,
                 }
                 if opening and not self._pair_open_eligible(pair_id):
-                    self.strategies[pair_id].set_position(0)
+                    strategy.restore_after_rejected_signal(pre_signal_state)
                     self._record(
                         "risk_reject",
                         {"pair": pair_id, "reason": "auto pair is managed but not open-eligible"},
@@ -312,7 +318,7 @@ class TradingEngine:
                         open_pairs=self._open_pair_groups(),
                     )
                     if not portfolio_decision.allowed:
-                        self.strategies[pair_id].set_position(0)
+                        strategy.restore_after_rejected_signal(pre_signal_state)
                         self._record(
                             "risk_reject",
                             {
@@ -329,11 +335,16 @@ class TradingEngine:
                     near,
                     far,
                     open_pair_count=self._open_pair_count(),
-                    spread_std=self.strategies[pair_id].spread_std,
+                    spread_std=strategy.spread_std,
+                    rate_limit_time=(
+                        signal.timestamp.timestamp()
+                        if self.historical_mode
+                        else None
+                    ),
                 )
                 self._record_quality_decision(pair, signal, near, far, result)
-                if not result.accepted and opening:
-                    self.strategies[pair_id].set_position(0)
+                if not result.accepted:
+                    strategy.restore_after_rejected_signal(pre_signal_state)
                 self._persist()
 
                 if (
@@ -456,7 +467,7 @@ class TradingEngine:
             self.emergency_stop(decision.reason)
 
     def _market_health_reason(self) -> str:
-        """按运行模式检查行情健康：回放使用事件时间，实盘使用墙钟。"""
+        """按运行模式检查行情健康：回放按事件门控，实盘使用墙钟时效。"""
         if not self.pairs:
             return ""
 
@@ -485,11 +496,18 @@ class TradingEngine:
         if not quotes_ready and self._quote_initialization_grace_active():
             return ""
 
-        max_quote_age = self._max_quote_age(
-            required, reference, quotes_ready
-        )
-        if max_quote_age is None:
-            return "market quote timestamp is in the future"
+        # 历史事件流可能是分钟/日频抽样：某一腿的新样本先到时，另一腿下一条
+        # 已存在于未来事件队列但尚未发布。此时不能把“回放采样间隔”误当成实时
+        # 柜台 stale quote 并永久停机；每次真正交易前仍由 check_quotes 严格检查
+        # quote age / cross-leg skew。实盘则继续用墙钟执行全局 stale 停机。
+        if self.historical_mode:
+            max_quote_age = 0.0
+        else:
+            max_quote_age = self._max_quote_age(
+                required, reference, quotes_ready
+            )
+            if max_quote_age is None:
+                return "market quote timestamp is in the future"
 
         try:
             self.broker.get_account()
@@ -622,7 +640,7 @@ class TradingEngine:
     def _audit_pair_balance(self) -> None:
         if self.halted or self.state.runtime_mode == RuntimeMode.REDUCE_ONLY.value:
             return
-        now = monotonic()
+        now = self._imbalance_clock()
         for pair in self.pairs.values():
             if self.executor.pair_is_balanced(pair):
                 self._imbalance_since.pop(pair.pair_id, None)
@@ -633,6 +651,12 @@ class TradingEngine:
                     f"pair imbalance detected: {pair.pair_id}"
                 )
                 return
+
+    def _imbalance_clock(self) -> float:
+        """实盘按进程单调时钟；历史回放按最新可见市场事件时间。"""
+        if self.historical_mode and self.quotes:
+            return max(tick.timestamp for tick in self.quotes.values()).timestamp()
+        return monotonic()
 
     def _apply_expected_trade(self, trade: Trade) -> None:
         book = PositionBook(
@@ -776,7 +800,7 @@ class TradingEngine:
                 self._trading_date(),
                 retained_pairs=[
                     self.pairs[pair_id]
-                    for pair_id in self._auto_pair_ids
+                    for pair_id in sorted(protected)
                     if pair_id in self.pairs
                 ],
             )
@@ -784,6 +808,9 @@ class TradingEngine:
                 self.broker, now=now, protected_pair_ids=protected
             )
         except Exception as exc:
+            # 当日目录或扫描不可确认时，旧的无持仓 Auto pair 不再拥有开仓权。
+            # 已有持仓 pair 仍保留管理/退出权限，等待下一次成功刷新恢复候选资格。
+            self._retiring_auto_pairs.update(self._auto_pair_ids - protected)
             self._record("auto_scan_error", {"reason": str(exc)})
             return
         if selected is None:

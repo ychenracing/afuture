@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from time import monotonic
 
 from .economics import estimate_net_edge
 from .models import (
@@ -57,6 +56,7 @@ class PairExecutor:
         *,
         open_pair_count: int,
         spread_std: float = 0.0,
+        rate_limit_time: float | None = None,
     ) -> ExecutionResult:
         if signal.action is SignalAction.HOLD:
             return ExecutionResult(False, reason="hold signal")
@@ -98,13 +98,19 @@ class PairExecutor:
                 )
             volume = max(request.volume for request in requests)
 
-        # 先提交当前可成交深度较薄的一腿，把更深的一腿留作第二腿对冲，
-        # 降低第一腿成交后第二腿因流动性不足而留下裸腿的概率。
+        # 两腿属于同一批交易意图，必须使用同一个限速时钟值。信号时间来自已经
+        # 通过行情时效/双腿同步校验的市场事件：历史回放因此不会把数月订单压缩
+        # 到 CPU 的几秒钟；实盘若行情时间戳陈旧或跳变，则上游健康门会先失败关闭。
+        limiter_now = (
+            signal.timestamp.timestamp()
+            if rate_limit_time is None
+            else float(rate_limit_time)
+        )
         requests = self._prioritize_requests(requests, near, far)
         order_ids: list[str] = []
         try:
             for request in requests:
-                if not self.rate_limiter.allow(monotonic()):
+                if not self.rate_limiter.allow(limiter_now):
                     raise RuntimeError("order rate limit reached")
                 order_ids.append(self.broker.send_order(request))
         except Exception as exc:
