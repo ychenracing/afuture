@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from .base import Broker
 from .sim import SimBroker
 from ..models import BrokerEvent, ContractSpec, OrderRequest, Tick
@@ -55,7 +57,6 @@ class ShadowBroker(Broker):
 
     def subscribe(self, symbol: str, exchange: str) -> None:
         self.live.subscribe(symbol, exchange)
-        # SimBroker 不需要真正订阅；若元数据已经存在则调用以复用其校验。
         if symbol in self.sim.specs:
             self.sim.subscribe(symbol, exchange)
 
@@ -76,7 +77,11 @@ class ShadowBroker(Broker):
         return self.sim.get_positions()
 
     def get_account(self):
-        return self.sim.get_account()
+        """资金和仓位来自 Shadow 虚拟账户，交易日锚定真实 CTP。"""
+        return replace(
+            self.sim.get_account(),
+            trading_day=self.live.get_trading_day(),
+        )
 
     def owns_order(self, order_id: str) -> bool:
         return self.sim.owns_order(order_id)
@@ -115,7 +120,6 @@ class ShadowBroker(Broker):
             elif event.event_type == "broker_error":
                 result.append(event)
 
-        # SimBroker 会产生自己的 tick/order/trade 事件；真实 tick 已经加入 result，避免重复。
         for event in self.sim.poll_events():
             if event.event_type != "tick":
                 result.append(event)
@@ -124,6 +128,5 @@ class ShadowBroker(Broker):
     def publish_tick(self, tick: Tick) -> None:
         """测试和真实 poll 都通过这一入口驱动本地撮合。"""
         if tick.symbol not in self.sim.specs:
-            # 候选尚未拿到元数据时只保留真实行情，不允许模拟下单。
             return
         self.sim.publish_tick(tick)
