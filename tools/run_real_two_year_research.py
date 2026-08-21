@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """下载两年真实合约日线并执行严格 Auto Portfolio 调优。
 
-研究窗口固定为 2024-08-21 至 2026-08-20。最后 120 个交易日一次性作为 holdout；
-信号参数和风险缩放都只使用此前数据的 Train+Validation 选择。若 holdout 未达到 100%
-年化，脚本会如实输出 target_met=false，而不会用 holdout 反向扩大搜索空间。
+研究窗口固定为 2024-08-21 至 2026-08-20。最后 120 个交易日作为锁定基准区间；
+信号、机会质量、Regime/Carry 和风险缩放都只使用此前数据的 Train+Validation 选择。
+历史基准区间在上一代策略研究中已经被观察过，因此新一代能力不能再把它描述成
+“从未看过的最终 holdout”；真正新的证据必须来自滚动 OOS、后续 Shadow/实盘数据。
+若年化目标未达到，脚本如实输出 target_met=false，不用基准区间反向扩大搜索空间。
 """
 
 from __future__ import annotations
@@ -34,6 +36,13 @@ from afuture.risk import RiskConfig
 DEFAULT_START = date(2024, 8, 21)
 DEFAULT_END = date(2026, 8, 20)
 PRODUCTS = ("m", "rb", "TA", "c", "p")
+REGIME_KEYS = (
+    "min_persistence_score",
+    "max_volatility_percentile",
+    "max_trend_shift_z",
+    "min_carry_reversal_z",
+    "carry_reversal_weight",
+)
 
 
 def _bar_to_dict(row: DailyBar) -> dict:
@@ -175,6 +184,12 @@ def base_config(specs, catalog) -> AppConfig:
         min_stationarity_score=0.005,
         max_half_life=60.0,
         min_net_edge=50.0,
+        # 参考项目迁移能力默认关闭；只有开发集滚动 OOS 选择后才冻结。
+        min_persistence_score=0.0,
+        max_volatility_percentile=1.0,
+        max_trend_shift_z=12.0,
+        min_carry_reversal_z=0.0,
+        carry_reversal_weight=0.0,
         slippage_ticks=1,
         session_windows=("09:00-15:00",),
     )
@@ -262,10 +277,14 @@ def quality_grid(signal_parameters: dict) -> tuple[dict, ...]:
     return tuple(rows)
 
 
-def risk_grid(signal_parameters: dict) -> tuple[dict, ...]:
-    rows = []
+def regime_grid(quality_parameters: dict) -> tuple[dict, ...]:
+    """开发集第三阶段：单轴搜索关系持久性、波动、变化点和曲线 carry。
+
+    不做五维笛卡尔积。每个候选只改变一个 Regime/Carry 维度，让稳定区域选择和
+    后续消融都能解释“哪一项能力提供了增量”，同时限制研究自由度。
+    """
     fixed = {
-        key: signal_parameters[key]
+        key: quality_parameters[key]
         for key in (
             "lookback",
             "entry_z",
@@ -274,12 +293,80 @@ def risk_grid(signal_parameters: dict) -> tuple[dict, ...]:
             "min_stationarity_score",
             "max_half_life",
         )
-        if key in signal_parameters
+        if key in quality_parameters
     }
+    baseline = {
+        **fixed,
+        "min_persistence_score": 0.0,
+        "max_volatility_percentile": 1.0,
+        "max_trend_shift_z": 12.0,
+        "min_carry_reversal_z": 0.0,
+        "carry_reversal_weight": 0.0,
+        "risk_budget_ratio": 0.004,
+        "max_pair_volume": 20,
+    }
+    rows = [baseline]
+    for key, values in (
+        ("min_persistence_score", (0.34, 0.67)),
+        ("max_volatility_percentile", (0.95, 0.85)),
+        ("max_trend_shift_z", (4.0, 2.5)),
+        ("min_carry_reversal_z", (0.5, 1.0)),
+        ("carry_reversal_weight", (0.5, 1.0)),
+    ):
+        for value in values:
+            row = dict(baseline)
+            row[key] = value
+            rows.append(row)
+    return tuple(rows)
+
+
+def risk_grid(selected_parameters: dict) -> tuple[dict, ...]:
+    """开发集最后阶段：冻结信号、机会质量和 Regime，只缩放受限风险预算。"""
+    fixed = {
+        key: selected_parameters[key]
+        for key in (
+            "lookback",
+            "entry_z",
+            "exit_z",
+            "min_net_edge",
+            "min_stationarity_score",
+            "max_half_life",
+            *REGIME_KEYS,
+        )
+        if key in selected_parameters
+    }
+    for key, default in (
+        ("min_persistence_score", 0.0),
+        ("max_volatility_percentile", 1.0),
+        ("max_trend_shift_z", 12.0),
+        ("min_carry_reversal_z", 0.0),
+        ("carry_reversal_weight", 0.0),
+    ):
+        fixed.setdefault(key, default)
+    rows = []
     for ratio in (0.002, 0.004, 0.006, 0.008, 0.010, 0.015, 0.020):
         for volume in (5, 8, 12, 20):
             rows.append({**fixed, "risk_budget_ratio": ratio, "max_pair_volume": volume})
     return tuple(rows)
+
+
+def regime_ablations(selected_parameters: dict) -> dict[str, dict]:
+    """只关闭一个已选能力，用于开发集滚动 OOS 归因，不参与参数选择。"""
+    disabled = {
+        "persistence": {"min_persistence_score": 0.0},
+        "volatility": {"max_volatility_percentile": 1.0},
+        "trend_shift": {"max_trend_shift_z": 12.0},
+        "carry": {
+            "min_carry_reversal_z": 0.0,
+            "carry_reversal_weight": 0.0,
+        },
+    }
+    result: dict[str, dict] = {}
+    for name, updates in disabled.items():
+        row = dict(selected_parameters)
+        row.update(updates)
+        result[name] = row
+    return result
 
 
 def oos_summary(folds) -> dict:
@@ -333,6 +420,11 @@ def run_research(rows_by_symbol, start: date, end: date) -> dict:
             "min_net_edge": config.auto.min_net_edge,
             "min_stationarity_score": config.auto.min_stationarity_score,
             "max_half_life": config.auto.max_half_life,
+            "min_persistence_score": config.auto.min_persistence_score,
+            "max_volatility_percentile": config.auto.max_volatility_percentile,
+            "max_trend_shift_z": config.auto.max_trend_shift_z,
+            "min_carry_reversal_z": config.auto.min_carry_reversal_z,
+            "carry_reversal_weight": config.auto.carry_reversal_weight,
             "risk_budget_ratio": config.risk.risk_budget_ratio,
             "max_pair_volume": config.auto.max_pair_volume,
         },
@@ -341,12 +433,27 @@ def run_research(rows_by_symbol, start: date, end: date) -> dict:
     stage_signal = _search_stage(runner, dev_ticks, research_window, signal_grid(config))
     stage_quality_grid = quality_grid(stage_signal.selected_parameters)
     stage_quality = _search_stage(runner, dev_ticks, research_window, stage_quality_grid)
-    stage_risk_grid = risk_grid(stage_quality.selected_parameters)
+    stage_regime_grid = regime_grid(stage_quality.selected_parameters)
+    stage_regime = _search_stage(runner, dev_ticks, research_window, stage_regime_grid)
+    stage_risk_grid = risk_grid(stage_regime.selected_parameters)
     stage_risk = _search_stage(runner, dev_ticks, research_window, stage_risk_grid)
-    selection_valid = bool(stage_signal.folds and stage_quality.folds and stage_risk.folds)
+
+    selection_valid = bool(
+        stage_signal.folds
+        and stage_quality.folds
+        and stage_regime.folds
+        and stage_risk.folds
+    )
     frozen = runner._config_with_parameters(stage_risk.selected_parameters)
 
-    # 参数冻结后才读取最后的 holdout；以下结果不再反向改变搜索空间。
+    # 消融只用于解释开发集滚动 OOS；结果不得反向修改已冻结参数。
+    ablation_results = {
+        name: _search_stage(runner, dev_ticks, research_window, (parameters,))
+        for name, parameters in regime_ablations(stage_risk.selected_parameters).items()
+    }
+
+    # 参数冻结后才读取最后基准区间；该区间已在上一代研究中被观察过，不能再称
+    # 为“全新 holdout”，也绝不根据这里的表现追加参数搜索。
     baseline_holdout = runner._run_portfolio(config, holdout_ticks)
     tuned_holdout = runner._run_portfolio(frozen, holdout_ticks)
     stress_15 = runner._run_portfolio(runner._cost_stress(frozen, 1.5), holdout_ticks)
@@ -386,6 +493,10 @@ def run_research(rows_by_symbol, start: date, end: date) -> dict:
             "holdout_days": len(holdout_days),
             "holdout_start": min(holdout_days),
             "holdout_end": max(holdout_days),
+            "holdout_role": (
+                "locked benchmark reused after prior-generation observation; "
+                "not pristine for the new regime/carry feature generation"
+            ),
         },
         "data": {
             "source": "Sina Finance contract daily bars",
@@ -401,19 +512,27 @@ def run_research(rows_by_symbol, start: date, end: date) -> dict:
         "search": {
             "signal_candidates": len(signal_grid(config)),
             "quality_candidates": len(stage_quality_grid),
+            "regime_candidates": len(stage_regime_grid),
             "risk_candidates": len(stage_risk_grid),
             "min_selection_trades": 1,
             "risk_budget_upper_bound": AutoPortfolioRunner.MAX_RESEARCH_RISK_BUDGET,
             "pair_volume_upper_bound": AutoPortfolioRunner.MAX_RESEARCH_PAIR_VOLUME,
             "holdout_used_for_optimization": False,
+            "holdout_is_pristine_for_current_generation": False,
             "same_bar_close_lookahead": False,
             "historical_listing_filter": True,
+            "regime_search_is_single_axis": True,
             "selection_valid": selection_valid,
             "search_exhausted": True,
         },
         "baseline_development_oos": oos_summary(baseline.folds),
         "signal_development_oos": oos_summary(stage_signal.folds),
         "quality_development_oos": oos_summary(stage_quality.folds),
+        "regime_development_oos": oos_summary(stage_regime.folds),
+        "regime_ablation_development_oos": {
+            name: oos_summary(result.folds)
+            for name, result in ablation_results.items()
+        },
         "tuned_development_oos": oos_summary(stage_risk.folds),
         "selected_parameters": stage_risk.selected_parameters,
         "baseline_holdout": baseline_holdout,
