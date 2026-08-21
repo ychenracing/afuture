@@ -11,8 +11,8 @@ from .models import ContractSpec
 class MetadataPrefetcher:
     """单工作线程的有界元数据预取器。
 
-    Auto 扫描只负责提交查询请求；真正的 CTP 保证金/手续费等待发生在后台线程。
-    当前 Tick 循环如果缓存尚未完成就跳过该候选，下一轮扫描再使用结果。
+    Auto 扫描只负责提交真实柜台查询请求；真正的 CTP 保证金/手续费等待发生在后台线程。
+    确定性的 SimBroker 元数据是内存读取，继续同步完成，避免研究回放引入线程调度噪声。
     """
 
     def __init__(self, timeout_seconds: float = 10.0) -> None:
@@ -30,7 +30,7 @@ class MetadataPrefetcher:
         return tuple(sorted(set(str(symbol) for symbol in symbols)))
 
     def request(self, broker, symbols) -> bool:
-        """缓存已齐全返回 True；否则只安排后台查询并立即返回 False。"""
+        """缓存已齐全返回 True；真实慢查询只安排后台任务并立即返回 False。"""
         key = self._key(symbols)
         if not key:
             return True
@@ -38,6 +38,20 @@ class MetadataPrefetcher:
             self._harvest_locked(key)
             if all(symbol in self._cache for symbol in key):
                 return True
+
+        # SimBroker 的查询只是字典读取，研究/回放不需要线程化。
+        if broker.__class__.__module__.endswith(".sim"):
+            try:
+                rows = broker.get_live_contract_specs(list(key), self.timeout_seconds)
+            except Exception as exc:
+                with self._lock:
+                    self._errors[key] = str(exc)
+                return False
+            with self._lock:
+                self._apply_rows_locked(key, rows)
+                return all(symbol in self._cache for symbol in key)
+
+        with self._lock:
             future = self._futures.get(key)
             if future is None:
                 self._errors.pop(key, None)
