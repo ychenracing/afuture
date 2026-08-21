@@ -79,8 +79,9 @@ def test_auto_selector_excludes_contract_before_historical_listing_date():
     ]
 
 
-def test_historical_auto_manager_can_preload_known_contract_specs_without_async_wait():
+def test_historical_auto_manager_can_use_static_metadata_cache_without_async_wait():
     from afuture.auto import AutoConfig, AutoPairManager
+    from afuture.auto_runtime import StaticMetadataCache
     from afuture.models import ContractInfo, ContractSpec
 
     config = AutoConfig(
@@ -98,9 +99,12 @@ def test_historical_auto_manager_can_preload_known_contract_specs_without_async_
 
     class Broker:
         def get_live_contract_specs(self, symbols, timeout_seconds=10.0):
-            raise AssertionError("historical research should not query known static specs asynchronously")
+            raise AssertionError("historical research must use the preloaded static cache")
 
-    manager = AutoPairManager(config, known_specs=specs)
+    manager = AutoPairManager(
+        config,
+        metadata_prefetcher=StaticMetadataCache(specs),
+    )
     pair = manager.selector.build_pairs(catalog, date(2025, 1, 1))[0]
     assert manager._prefetched_specs(Broker(), pair) == specs
     manager.close()
