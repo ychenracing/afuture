@@ -6,6 +6,10 @@ from ..models import AccountSnapshot, BrokerEvent, ContractInfo, ContractPositio
 
 
 class Broker(ABC):
+    """交易柜台最小接口。真实柜台元数据查询默认可能阻塞。"""
+
+    metadata_query_blocks = True
+
     @abstractmethod
     def start(self): ...
     @abstractmethod
@@ -31,13 +35,19 @@ class Broker(ABC):
 
     def owns_order(self, order_id: str) -> bool:
         return self.get_order(order_id) is not None
+
     def health_error(self) -> str | None:
         return None
+
     def publish_tick(self, tick: Tick) -> None:
         raise NotImplementedError
+
     def get_trading_day(self) -> str:
         return self.get_account().trading_day
-    def get_live_contract_specs(self, symbols: list[str], timeout_seconds: float = 10.0) -> dict[str, ContractSpec]:
+
+    def get_live_contract_specs(
+        self, symbols: list[str], timeout_seconds: float = 10.0
+    ) -> dict[str, ContractSpec]:
         """实盘适配器应覆盖；模拟柜台直接返回本地参数。"""
         return {}
 
