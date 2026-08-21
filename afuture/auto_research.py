@@ -6,6 +6,7 @@ PairExecutor + SimBroker，验证最终生产组合的自动发现、资金竞�
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, replace
 from itertools import groupby
 from math import isfinite
@@ -33,6 +34,9 @@ class AutoPortfolioResearchConfig:
     depth_haircuts: tuple[float, ...] = (1.0, 0.5)
     extra_latency_ticks: tuple[int, ...] = (0, 1, 2)
     extra_impact_ticks: tuple[int, ...] = (0, 1)
+    data_gap_rates: tuple[float, ...] = (0.02, 0.05)
+    quote_skew_seconds: tuple[float, ...] = (0.5, 1.0, 2.0)
+    activity_missing_rates: tuple[float, ...] = (0.02, 0.05)
 
 
 @dataclass(frozen=True)
@@ -175,6 +179,18 @@ class AutoPortfolioRunner:
             )
             for value in research.extra_impact_ticks
         }
+        data_gap = {
+            self._ratio_key(value): self._run_portfolio(config, self._drop_data(ticks, value))
+            for value in research.data_gap_rates
+        }
+        quote_skew = {
+            str(value): self._run_portfolio(config, self._skew_far_legs(ticks, config.contract_catalog, value))
+            for value in research.quote_skew_seconds
+        }
+        activity_missing = {
+            self._ratio_key(value): self._run_portfolio(config, self._remove_activity(ticks, value))
+            for value in research.activity_missing_rates
+        }
         return {
             "leave_one_product_out": leave_one,
             "single_product": single,
@@ -182,6 +198,9 @@ class AutoPortfolioRunner:
             "depth_haircut": depth,
             "latency": latency,
             "market_impact": impact,
+            "data_gap": data_gap,
+            "quote_skew": quote_skew,
+            "activity_missing": activity_missing,
         }
 
     def _remove_best_period(self, config, ticks, folds) -> dict:
@@ -205,7 +224,6 @@ class AutoPortfolioRunner:
                 market_impact_ticks=config.market_impact_ticks,
                 contract_catalog=config.contract_catalog,
             )
-            # Auto Universe 必须用该 fold 的历史交易日，而不是运行测试机器的自然日。
             broker._trading_day = ticks[0].trading_day
             engine = TradingEngine(
                 broker,
@@ -230,11 +248,15 @@ class AutoPortfolioRunner:
                         broker.publish_tick(row)
                     engine.run_once()
                     equity_curve.append((batch[-1].trading_day, broker.get_account().equity))
-                return calculate_performance(
+                trades = broker.get_trades()
+                metrics = calculate_performance(
                     equity_curve,
                     initial_capital=config.initial_capital,
-                    trade_count=len(broker.get_trades()),
+                    trade_count=len(trades),
                 )
+                metrics["commission_total"] = sum(float(row.commission) for row in trades)
+                metrics["final_position_count"] = len(broker.get_positions())
+                return metrics
             finally:
                 engine.stop()
 
@@ -280,7 +302,6 @@ class AutoPortfolioRunner:
     @staticmethod
     def _with_products(config, products: tuple[str, ...]):
         if not products:
-            # 保持合法配置但使用不存在的产品，从而得到真实“删除唯一品种”空组合结果。
             products = ("__none__",)
         return replace(config, auto=replace(config.auto, products=products))
 
@@ -295,6 +316,55 @@ class AutoPortfolioRunner:
             )
             for row in ticks
         ]
+
+    @staticmethod
+    def _drop_data(ticks: list[Tick], ratio: float) -> list[Tick]:
+        """确定性删除少量 Tick，避免随机种子让 CI 不可复现。"""
+        if ratio <= 0:
+            return list(ticks)
+        every = max(2, int(round(1.0 / ratio)))
+        counters: dict[str, int] = defaultdict(int)
+        result: list[Tick] = []
+        for row in sorted(ticks, key=lambda item: (item.timestamp, item.symbol)):
+            counters[row.symbol] += 1
+            if counters[row.symbol] % every == 0:
+                continue
+            result.append(row)
+        return result
+
+    @staticmethod
+    def _skew_far_legs(
+        ticks: list[Tick], catalog: list[ContractInfo], seconds: float
+    ) -> list[Tick]:
+        """把每个品种较远月份向后移动，验证异步双腿行情不会制造虚假 Alpha。"""
+        grouped: dict[tuple[str, str], list[ContractInfo]] = defaultdict(list)
+        for item in catalog:
+            grouped[(item.product.lower(), item.exchange.upper())].append(item)
+        far_symbols: set[str] = set()
+        for rows in grouped.values():
+            ordered = sorted(rows, key=lambda item: (item.expiry, item.symbol))
+            far_symbols.update(item.symbol for item in ordered[1:])
+        delta = __import__("datetime").timedelta(seconds=max(0.0, float(seconds)))
+        return [
+            replace(row, timestamp=row.timestamp + delta)
+            if row.symbol in far_symbols
+            else row
+            for row in ticks
+        ]
+
+    @staticmethod
+    def _remove_activity(ticks: list[Tick], ratio: float) -> list[Tick]:
+        """确定性制造少量 volume/OI 缺失，验证 selector 会安全拒绝而不是猜测。"""
+        if ratio <= 0:
+            return list(ticks)
+        every = max(2, int(round(1.0 / ratio)))
+        result: list[Tick] = []
+        for index, row in enumerate(sorted(ticks, key=lambda item: (item.timestamp, item.symbol)), start=1):
+            if index % every == 0:
+                result.append(replace(row, volume=0.0, open_interest=0.0))
+            else:
+                result.append(row)
+        return result
 
     @staticmethod
     def _slice(ticks: list[Tick], days: list[str]) -> list[Tick]:
@@ -322,7 +392,13 @@ class AutoPortfolioRunner:
             "sharpe": 0.0,
             "trading_days": 0,
             "trade_count": 0,
+            "commission_total": 0.0,
+            "final_position_count": 0,
         }
+
+    @staticmethod
+    def _ratio_key(value: float) -> str:
+        return f"{float(value):.4g}"
 
     @staticmethod
     def _validate(config: AutoPortfolioResearchConfig) -> None:
@@ -334,3 +410,7 @@ class AutoPortfolioRunner:
             raise ValueError("depth haircuts must be within (0, 1]")
         if any(value < 0 for value in config.extra_latency_ticks + config.extra_impact_ticks):
             raise ValueError("latency/impact stress cannot be negative")
+        if any(not 0 < value < 1 for value in config.data_gap_rates + config.activity_missing_rates):
+            raise ValueError("data gap/activity missing rates must be within (0, 1)")
+        if any(value < 0 for value in config.quote_skew_seconds):
+            raise ValueError("quote skew stress cannot be negative")
