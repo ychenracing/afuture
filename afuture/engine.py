@@ -290,7 +290,9 @@ class TradingEngine:
 
                 spread = near.mid_price - far.mid_price
                 self.portfolio_risk.update(pair_id, spread)
-                signal = self.strategies[pair_id].on_quotes(near, far)
+                strategy = self.strategies[pair_id]
+                pre_signal_state = strategy.snapshot_state()
+                signal = strategy.on_quotes(near, far)
                 if signal.action is SignalAction.HOLD:
                     continue
 
@@ -299,7 +301,7 @@ class TradingEngine:
                     SignalAction.SHORT_SPREAD,
                 }
                 if opening and not self._pair_open_eligible(pair_id):
-                    self.strategies[pair_id].set_position(0)
+                    strategy.restore_after_rejected_signal(pre_signal_state)
                     self._record(
                         "risk_reject",
                         {"pair": pair_id, "reason": "auto pair is managed but not open-eligible"},
@@ -312,7 +314,7 @@ class TradingEngine:
                         open_pairs=self._open_pair_groups(),
                     )
                     if not portfolio_decision.allowed:
-                        self.strategies[pair_id].set_position(0)
+                        strategy.restore_after_rejected_signal(pre_signal_state)
                         self._record(
                             "risk_reject",
                             {
@@ -329,11 +331,11 @@ class TradingEngine:
                     near,
                     far,
                     open_pair_count=self._open_pair_count(),
-                    spread_std=self.strategies[pair_id].spread_std,
+                    spread_std=strategy.spread_std,
                 )
                 self._record_quality_decision(pair, signal, near, far, result)
-                if not result.accepted and opening:
-                    self.strategies[pair_id].set_position(0)
+                if not result.accepted:
+                    strategy.restore_after_rejected_signal(pre_signal_state)
                 self._persist()
 
                 if (
