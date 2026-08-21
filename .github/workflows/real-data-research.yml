@@ -4,10 +4,14 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
-      - "afuture/real_data.py"
-      - "afuture/auto_research.py"
+      # 两年研究复用完整生产链；任一 afuture 交易/研究模块变化都可能改变结果。
+      - "afuture/**"
       - "tools/run_real_two_year_research.py"
       - "tests/test_real_data_research.py"
+      - "tests/test_research_calibration_grid.py"
+      - "tests/test_research_terminal_boundaries.py"
+      - "tests/test_auto_refresh_retention.py"
+      - "tests/test_strategy_rejection_state.py"
       - ".github/workflows/real-data-research.yml"
 
 # 同一个 PR 只保留最新 HEAD 的联网研究，旧方法版本不再占用 Runner。
