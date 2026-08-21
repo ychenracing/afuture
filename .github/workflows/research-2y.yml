@@ -23,6 +23,7 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install akshare pandas
       - run: python tools/probe_two_year_real_data.py
+      - run: python tools/fetch_two_year_60m_universe.py
       - uses: actions/upload-artifact@v4
         with:
           name: two-year-real-data-probe
@@ -30,4 +31,7 @@ jobs:
             runtime/realdata_probe.json
             runtime/two_year_specific_contract_daily.csv
             runtime/two_year_specific_contract_60m.csv
+            runtime/two_year_broad_60m.csv
+            runtime/two_year_broad_60m_summary.csv
+            runtime/two_year_broad_60m_failures.txt
           retention-days: 7
