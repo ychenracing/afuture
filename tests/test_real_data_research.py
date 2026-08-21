@@ -1,4 +1,5 @@
 from datetime import date
+from unittest.mock import patch
 
 import pytest
 
@@ -16,6 +17,25 @@ def test_sina_daily_parser_preserves_real_fields():
     assert row.volume == pytest.approx(12345)
     assert row.open_interest == pytest.approx(67890)
     assert row.settle == pytest.approx(3008)
+
+
+def test_sina_client_accepts_valid_empty_response_without_retry():
+    from afuture.real_data import SinaDailyClient
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b"var x=([]);"
+
+    with patch("afuture.real_data.urlopen", return_value=Response()) as mocked:
+        rows = SinaDailyClient(timeout_seconds=1.0, retries=3).fetch("M9999")
+    assert rows == []
+    assert mocked.call_count == 1
 
 
 def test_daily_bar_conversion_marks_execution_proxy():
