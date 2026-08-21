@@ -76,7 +76,11 @@ class CurveFamilyResearch:
         config: CurveFamilyConfig,
         allowed_days: set[str] | None = None,
     ) -> dict:
-        """返回等权产品组合的成本后研究指标。"""
+        """返回固定等权商品 sleeves 的成本后研究指标。
+
+        某个品种在换月、缺样本或没有信号的交易日视为该 sleeve 持有现金、收益为
+        0；不能从当日分母消失，否则其余商品会被隐式放大仓位。
+        """
         self._validate(config)
         product_returns: dict[str, dict[str, float]] = {}
         product_trades: dict[str, int] = {}
@@ -92,14 +96,16 @@ class CurveFamilyResearch:
             all_days.update(returns)
 
         daily: list[float] = []
-        for trading_day in sorted(all_days):
-            rows = [
-                values[trading_day]
-                for values in product_returns.values()
-                if trading_day in values
-            ]
-            if rows:
-                daily.append(sum(rows) / len(rows))
+        sleeve_count = len(product_returns)
+        if sleeve_count:
+            for trading_day in sorted(all_days):
+                daily.append(
+                    sum(
+                        values.get(trading_day, 0.0)
+                        for values in product_returns.values()
+                    )
+                    / sleeve_count
+                )
 
         metrics = self._metrics(daily)
         metrics["trading_days"] = len(daily)
