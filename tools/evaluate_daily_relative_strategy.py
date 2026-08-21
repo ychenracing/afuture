@@ -39,6 +39,8 @@ PROFILE = {
 }
 EXPECTED_PRIOR_PRODUCTS = ("A",)
 EXPECTED_CURRENT_PRODUCTS = ("M","OI")
+SAMPLE_START_MINUTE = 22 * 60 + 55
+SAMPLE_END_MINUTE = 23 * 60
 
 
 def _contract_key(symbol: str) -> int:
@@ -46,34 +48,58 @@ def _contract_key(symbol: str) -> int:
     return int(match.group(1)) if match else 0
 
 
-def _daily(raw: pd.DataFrame) -> pd.DataFrame:
+def _prepare_intraday(raw: pd.DataFrame) -> pd.DataFrame:
+    """Normalize raw 60-minute rows without collapsing the two legs separately."""
     frame=raw.copy()
     frame["datetime"]=pd.to_datetime(frame["datetime"], errors="coerce")
-    frame=frame.dropna(subset=["datetime","close","volume","hold"])
+    for column in ("close","volume","hold"):
+        frame[column]=pd.to_numeric(frame[column],errors="coerce")
+    frame=frame.dropna(subset=["datetime","close","volume","hold","symbol","product"])
+    frame=frame.drop_duplicates(["symbol","datetime"],keep="last")
     frame["date"]=frame["datetime"].dt.normalize()
-    return (
-        frame.sort_values("datetime")
-        .groupby(["product","symbol","date"], as_index=False)
-        .agg(close=("close","last"), volume=("volume","sum"), hold=("hold","last"))
-    )
+    return frame.sort_values(["datetime","symbol"]).reset_index(drop=True)
 
 
 def build_pair_frames(prior: pd.DataFrame, current: pd.DataFrame) -> dict[tuple[str,str,str],pd.DataFrame]:
-    combined=pd.concat([prior,current],ignore_index=True)
-    combined=combined.drop_duplicates(["symbol","datetime"], keep="last")
-    daily=_daily(combined)
+    """Build one daily observation only from a synchronized production-window bar.
+
+    Prices and OI come from the last *exact common* 60-minute timestamp inside
+    22:55-23:00. Daily volume remains the full-day sum, approximating the
+    cumulative activity visible to live CTP at the sampling time. If either leg
+    has no quote in the production window, that date is absent rather than
+    falling back to an earlier day-session price.
+    """
+    combined=_prepare_intraday(pd.concat([prior,current],ignore_index=True))
+    if combined.empty:
+        return {}
+    daily_volume=(
+        combined.groupby(["product","symbol","date"],as_index=False)
+        .agg(day_volume=("volume","sum"))
+    )
+    minute=combined["datetime"].dt.hour*60+combined["datetime"].dt.minute
+    sample=combined[(minute>=SAMPLE_START_MINUTE)&(minute<=SAMPLE_END_MINUTE)].copy()
+    if sample.empty:
+        return {}
+    sample=(
+        sample.sort_values("datetime")
+        .groupby(["product","symbol","date"],as_index=False)
+        .tail(1)
+        .merge(daily_volume,on=["product","symbol","date"],how="left")
+    )
+
     result={}
-    for product, group in daily.groupby("product"):
+    for product, group in sample.groupby("product"):
         symbols=sorted(group["symbol"].astype(str).unique(), key=_contract_key)
         for near_symbol, far_symbol in zip(symbols, symbols[1:]):
-            near=group[group.symbol==near_symbol][["date","close","volume","hold"]].rename(
-                columns={"close":"near","volume":"near_vol","hold":"near_hold"})
-            far=group[group.symbol==far_symbol][["date","close","volume","hold"]].rename(
-                columns={"close":"far","volume":"far_vol","hold":"far_hold"})
-            pair=near.merge(far,on="date")
+            near=group[group.symbol==near_symbol][["date","datetime","close","day_volume","hold"]].rename(
+                columns={"datetime":"sample_timestamp","close":"near","day_volume":"near_vol","hold":"near_hold"})
+            far=group[group.symbol==far_symbol][["date","datetime","close","day_volume","hold"]].rename(
+                columns={"datetime":"sample_timestamp","close":"far","day_volume":"far_vol","hold":"far_hold"})
+            pair=near.merge(far,on=["date","sample_timestamp"])
             if pair.empty:
                 continue
-            pair=pair.rename(columns={"date":"datetime"}).sort_values("datetime").reset_index(drop=True)
+            pair=pair.sort_values("sample_timestamp").reset_index(drop=True)
+            pair["datetime"]=pair["date"]
             pair["raw"]=pair["near"]-pair["far"]
             pair["logratio"]=np.log(pair["near"]/pair["far"])
             result[(str(product),near_symbol,far_symbol)]=pair
@@ -301,7 +327,8 @@ def main():
 
     report={
         "source":"AKShare Sina specific-contract 60-minute bars",
-        "sample_reference":"calendar-day final 60-minute bar, normally 23:00 China time; live profile samples 22:55-23:00",
+        "sample_reference":"last exact common 60-minute timestamp within 22:55-23:00 China-time production window; no day-session fallback",
+        "pair_alignment":"near/far price and open interest must share the same 60-minute timestamp; daily volume is full-day accumulated volume",
         "windows":WINDOWS,
         "profile":PROFILE,
         "cost_stress":"2x conservative round-trip ticks",
