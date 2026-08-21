@@ -7,7 +7,7 @@ from datetime import time
 from math import exp, inf, log, sqrt
 from zoneinfo import ZoneInfo
 
-from .economics import estimate_net_edge, executable_spreads
+from .economics import estimate_net_edge
 from .models import ContractSpec, PairConfig, SignalAction, Tick
 
 
@@ -107,7 +107,11 @@ class SpreadScanner:
             return None
 
         slope_values = [value for _, value in z_values[-pair.entry_trend_window:]]
-        slope = self._linear_slope(slope_values) if len(slope_values) >= pair.entry_trend_window else 0.0
+        slope = (
+            self._linear_slope(slope_values)
+            if len(slope_values) >= pair.entry_trend_window
+            else 0.0
+        )
         if abs(slope) > pair.max_entry_z_slope:
             return None
 
@@ -160,9 +164,11 @@ class SpreadScanner:
         pair: PairConfig,
         synchronized: list[tuple[Tick, Tick]],
     ) -> tuple[list[float], int, float]:
-        """为刚激活的策略恢复最近 Z 序列和未完成的确认武装状态。"""
+        """为刚激活的策略恢复最近 Z 序列和尚未消费的确认武装状态。"""
         z_values = self._rolling_mid_z(pair, synchronized)
-        history = [value for _, value in z_values[-max(pair.entry_trend_window, 2):]]
+        history = [
+            value for _, value in z_values[-max(pair.entry_trend_window, 2):]
+        ]
         armed = 0
         extreme = 0.0
         for _, zscore in z_values:
@@ -174,12 +180,21 @@ class SpreadScanner:
                 continue
             if armed < 0:
                 extreme = max(extreme, zscore)
-                if zscore < pair.min_confirmed_entry_z:
-                    armed, extreme = 0, 0.0
+                confirmed = (
+                    zscore <= extreme - pair.confirmation_retrace_z
+                    and zscore >= pair.min_confirmed_entry_z
+                )
+                disarmed = zscore < pair.min_confirmed_entry_z
             else:
                 extreme = min(extreme, zscore)
-                if zscore > -pair.min_confirmed_entry_z:
-                    armed, extreme = 0, 0.0
+                confirmed = (
+                    zscore >= extreme + pair.confirmation_retrace_z
+                    and zscore <= -pair.min_confirmed_entry_z
+                )
+                disarmed = zscore > -pair.min_confirmed_entry_z
+            # 已经完成过一次确认的 armed 状态不能跨重启重复消费。
+            if confirmed or disarmed:
+                armed, extreme = 0, 0.0
         return history, armed, extreme
 
     def scan_pair(
@@ -209,13 +224,22 @@ class SpreadScanner:
             legging_buffer=pair.legging_buffer,
         )
 
-        depth = min(near.bid_volume, near.ask_volume, far.bid_volume, far.ask_volume)
+        depth = min(
+            near.bid_volume,
+            near.ask_volume,
+            far.bid_volume,
+            far.ask_volume,
+        )
         liquidity_score = min(1.0, depth / max(pair.volume * 2.0, 1.0))
-        volume_score = 1.0 - exp(-max(min(near.volume, far.volume), 0.0) / 5000.0)
+        volume_score = 1.0 - exp(
+            -max(min(near.volume, far.volume), 0.0) / 5000.0
+        )
         open_interest_score = 1.0 - exp(
             -max(min(near.open_interest, far.open_interest), 0.0) / 10000.0
         )
-        activity_score = 0.25 + 0.375 * volume_score + 0.375 * open_interest_score
+        activity_score = (
+            0.25 + 0.375 * volume_score + 0.375 * open_interest_score
+        )
         score = (
             abs(zscore)
             * liquidity_score
@@ -243,11 +267,20 @@ class SpreadScanner:
         synchronized: list[tuple[Tick, Tick]] | None = None,
     ) -> SpreadStatistics | None:
         """只用历史行情计算统计预筛，当前样本不进入参考均值。"""
-        synchronized = synchronized if synchronized is not None else self.synchronized_ticks(pair, ticks)
+        synchronized = (
+            synchronized
+            if synchronized is not None
+            else self.synchronized_ticks(pair, ticks)
+        )
         if len(synchronized) < pair.lookback + 1:
             return None
-        raw_values = [near.mid_price - far.mid_price for near, far in synchronized]
-        signal_values = [self._signal_value(pair, near.mid_price, far.mid_price) for near, far in synchronized]
+        raw_values = [
+            near.mid_price - far.mid_price for near, far in synchronized
+        ]
+        signal_values = [
+            self._signal_value(pair, near.mid_price, far.mid_price)
+            for near, far in synchronized
+        ]
         signal_history = signal_values[-pair.lookback - 1:-1]
         raw_history = raw_values[-pair.lookback - 1:-1]
         if len(signal_history) < pair.lookback:
@@ -278,7 +311,7 @@ class SpreadScanner:
     def synchronized_ticks(
         self, pair: PairConfig, ticks: list[Tick]
     ) -> list[tuple[Tick, Tick]]:
-        """按最近时间配对两腿行情，并按策略采样语义降采样。"""
+        """按策略采样语义配对历史；实时执行同步由 RiskManager 独立硬门负责。"""
         near_ticks = sorted(
             (tick for tick in ticks if tick.symbol == pair.near_symbol),
             key=lambda item: item.timestamp,
@@ -290,15 +323,31 @@ class SpreadScanner:
         if not near_ticks or not far_ticks:
             return []
 
+        if pair.daily_sample_window:
+            start, end = self._parse_window(pair.daily_sample_window)
+            near_by_day = self._daily_ticks_by_trading_day(near_ticks, start, end)
+            far_by_day = self._daily_ticks_by_trading_day(far_ticks, start, end)
+            common_days = sorted(set(near_by_day) & set(far_by_day))
+            return [
+                (near_by_day[trading_day], far_by_day[trading_day])
+                for trading_day in common_days
+            ]
+
         result: list[tuple[Tick, Tick]] = []
         far_index = 0
         last_sample = None
-        last_trading_day = ""
         for near in near_ticks:
             while (
                 far_index + 1 < len(far_ticks)
-                and abs((far_ticks[far_index + 1].timestamp - near.timestamp).total_seconds())
-                <= abs((far_ticks[far_index].timestamp - near.timestamp).total_seconds())
+                and abs(
+                    (
+                        far_ticks[far_index + 1].timestamp
+                        - near.timestamp
+                    ).total_seconds()
+                )
+                <= abs(
+                    (far_ticks[far_index].timestamp - near.timestamp).total_seconds()
+                )
             ):
                 far_index += 1
             far = far_ticks[far_index]
@@ -306,24 +355,32 @@ class SpreadScanner:
             if skew > self.max_sync_seconds or near.trading_day != far.trading_day:
                 continue
             timestamp = max(near.timestamp, far.timestamp)
-            if pair.daily_sample_window:
-                current = timestamp.astimezone(_CHINA_TZ).timetz().replace(tzinfo=None)
-                start, end = self._parse_window(pair.daily_sample_window)
-                if not start <= current <= end:
-                    continue
-                if near.trading_day == last_trading_day:
-                    if result:
-                        result[-1] = (near, far)
-                    continue
-                last_trading_day = near.trading_day
-            elif (
+            if (
                 last_sample is not None
                 and pair.sample_seconds > 0
-                and (timestamp - last_sample).total_seconds() < pair.sample_seconds
+                and (timestamp - last_sample).total_seconds()
+                < pair.sample_seconds
             ):
                 continue
             result.append((near, far))
             last_sample = timestamp
+        return result
+
+    @staticmethod
+    def _daily_ticks_by_trading_day(
+        ticks: list[Tick], start: time, end: time
+    ) -> dict[str, Tick]:
+        """每个交易日保留窗口内最后一笔；统计历史不套用 2 秒执行 skew。"""
+        result: dict[str, Tick] = {}
+        for tick in ticks:
+            current = tick.timestamp.astimezone(_CHINA_TZ).timetz().replace(
+                tzinfo=None
+            )
+            if not start <= current <= end:
+                continue
+            previous = result.get(tick.trading_day)
+            if previous is None or tick.timestamp > previous.timestamp:
+                result[tick.trading_day] = tick
         return result
 
     def _rolling_mid_z(
@@ -331,7 +388,10 @@ class SpreadScanner:
         pair: PairConfig,
         synchronized: list[tuple[Tick, Tick]],
     ) -> list[tuple[int, float]]:
-        values = [self._signal_value(pair, near.mid_price, far.mid_price) for near, far in synchronized]
+        values = [
+            self._signal_value(pair, near.mid_price, far.mid_price)
+            for near, far in synchronized
+        ]
         result: list[tuple[int, float]] = []
         for index in range(pair.lookback, len(values)):
             history = values[index - pair.lookback:index]
@@ -341,7 +401,9 @@ class SpreadScanner:
         return result
 
     @staticmethod
-    def _signal_value(pair: PairConfig, near_price: float, far_price: float) -> float:
+    def _signal_value(
+        pair: PairConfig, near_price: float, far_price: float
+    ) -> float:
         if pair.signal_transform == "log_ratio":
             return log(near_price / far_price)
         return near_price - far_price
@@ -350,7 +412,9 @@ class SpreadScanner:
     def _std(values: list[float], mean: float) -> float:
         if not values:
             return 0.0
-        return sqrt(sum((value - mean) ** 2 for value in values) / len(values))
+        return sqrt(
+            sum((value - mean) ** 2 for value in values) / len(values)
+        )
 
     @staticmethod
     def _linear_slope(values: list[float]) -> float:
@@ -358,7 +422,9 @@ class SpreadScanner:
             return 0.0
         x_mean = (len(values) - 1) / 2.0
         y_mean = sum(values) / len(values)
-        denominator = sum((index - x_mean) ** 2 for index in range(len(values)))
+        denominator = sum(
+            (index - x_mean) ** 2 for index in range(len(values))
+        )
         if denominator <= 0:
             return 0.0
         return sum(
@@ -395,10 +461,15 @@ class SpreadScanner:
         if len(values) < 4:
             return 999.0, 0.0
         levels = values[:-1]
-        changes = [values[index + 1] - values[index] for index in range(len(values) - 1)]
+        changes = [
+            values[index + 1] - values[index]
+            for index in range(len(values) - 1)
+        ]
         level_mean = sum(levels) / len(levels)
         change_mean = sum(changes) / len(changes)
-        denominator = sum((value - level_mean) ** 2 for value in levels)
+        denominator = sum(
+            (value - level_mean) ** 2 for value in levels
+        )
         if denominator <= 1e-12:
             return 999.0, 0.0
         beta = sum(
@@ -407,4 +478,6 @@ class SpreadScanner:
         ) / denominator
         if beta >= 0:
             return 999.0, 0.0
-        return max(0.1, -log(2.0) / beta), min(1.0, max(0.0, -beta))
+        return max(0.1, -log(2.0) / beta), min(
+            1.0, max(0.0, -beta)
+        )
