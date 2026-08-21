@@ -5,7 +5,8 @@ import pytest
 
 from afuture.auto import AutoConfig, AutoPairManager
 from afuture.broker.sim import SimBroker
-from afuture.models import ContractInfo, ContractSpec, Tick
+from afuture.models import ContractInfo, ContractSpec, SignalAction, Tick
+from afuture.regime import EntryRegimeMetrics
 
 
 _CHINA_TZ = ZoneInfo("Asia/Shanghai")
@@ -143,3 +144,14 @@ def test_carry_reversal_gate_rejects_raw_spread_signal_with_conflicting_curve_sh
     broker.stop()
 
     assert selected == []
+
+
+def test_carry_weight_boosts_only_direction_aligned_signal():
+    manager = AutoPairManager(_config(carry_reversal_weight=1.0))
+    aligned = EntryRegimeMetrics(1.0, 0.5, 0.0, 2.0)
+    conflicting = EntryRegimeMetrics(1.0, 0.5, 0.0, -2.0)
+
+    assert manager._score_with_carry(100.0, SignalAction.SHORT_SPREAD, aligned) == pytest.approx(
+        100.0 * (1.0 + 2.0 / 3.0)
+    )
+    assert manager._score_with_carry(100.0, SignalAction.SHORT_SPREAD, conflicting) == 100.0
