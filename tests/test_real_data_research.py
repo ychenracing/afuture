@@ -38,7 +38,7 @@ def test_sina_client_accepts_valid_empty_response_without_retry():
     assert mocked.call_count == 1
 
 
-def test_daily_bar_conversion_marks_execution_proxy():
+def test_daily_bar_conversion_uses_open_and_lagged_activity_without_lookahead():
     from afuture.real_data import DailyBar, ProductDefinition, daily_bars_to_ticks
 
     definition = ProductDefinition(
@@ -51,13 +51,22 @@ def test_daily_bar_conversion_marks_execution_proxy():
         close_fee=2.0,
         contract_months=(1, 5, 9),
     )
-    row = DailyBar("M2609", date(2026, 8, 20), 3000, 3020, 2990, 3010, 100000, 200000, 3008)
-    result = daily_bars_to_ticks([row], definition)
-    assert result.execution_proxy == "close +/- one price tick; historical L1 unavailable"
-    assert result.ticks[0].volume == pytest.approx(100000)
-    assert result.ticks[0].open_interest == pytest.approx(200000)
-    assert result.ticks[0].bid_price == pytest.approx(3009)
-    assert result.ticks[0].ask_price == pytest.approx(3011)
+    rows = [
+        DailyBar("M2609", date(2026, 8, 19), 2990, 3010, 2980, 3000, 100000, 200000, 2998),
+        # 当天 close/volume/OI 都是开盘时未知的信息，转换后不得进入当日决策。
+        DailyBar("M2609", date(2026, 8, 20), 3000, 3020, 2990, 3010, 999999, 888888, 3008),
+    ]
+    result = daily_bars_to_ticks(rows, definition)
+    assert result.execution_proxy == (
+        "open +/- one price tick; prior-day volume/open_interest; historical L1 unavailable"
+    )
+    assert len(result.ticks) == 1
+    current = result.ticks[0]
+    assert current.last_price == pytest.approx(3000)
+    assert current.bid_price == pytest.approx(2999)
+    assert current.ask_price == pytest.approx(3001)
+    assert current.volume == pytest.approx(100000)
+    assert current.open_interest == pytest.approx(200000)
 
 
 def _research_runner():
