@@ -149,22 +149,23 @@ class CalendarSpreadStrategy:
             ) or (
                 self._position < 0 and liquidation_z <= self.pair.exit_z
             )
+            structural_break = (
+                mean_shift_z >= self.pair.structural_mean_shift_z
+                or vol_ratio >= self.pair.structural_vol_ratio
+            )
             stop_reached = (
                 self._position > 0 and liquidation_z <= -self.pair.stop_z
             ) or (
                 self._position < 0 and liquidation_z >= self.pair.stop_z
             )
-            # 只有真实可平仓价差回到入场锚点附近才正常退出，避免 mid 已回归但
-            # bid/ask 成本仍吞噬退出边际时过早平仓。
-            if reverted:
-                action = SignalAction.EXIT
-                reason = "executable spread reverted to entry anchor"
-            elif (
-                mean_shift_z >= self.pair.structural_mean_shift_z
-                or vol_ratio >= self.pair.structural_vol_ratio
-            ):
+            # 结构突变必须优先于“表面回归”：极端跳变或波动制度变化不能被
+            # 有利方向越过均值误标为普通止盈。
+            if structural_break:
                 action = SignalAction.EMERGENCY_EXIT
                 reason = "structural break detected"
+            elif reverted:
+                action = SignalAction.EXIT
+                reason = "executable spread reverted to entry anchor"
             elif stop_reached:
                 action = SignalAction.EMERGENCY_EXIT
                 reason = "entry anchored executable stop reached"
