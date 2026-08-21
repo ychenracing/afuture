@@ -85,12 +85,14 @@ class ContractSpec:
 class ContractInfo:
     """用于自动发现的期货合约目录信息。
 
-    这里只保留构建跨期组合真正需要的字段，避免把 CTP SDK 对象泄漏到策略层。
+    ``listing`` 仅在历史研究需要重建“当日真实可见目录”时使用；实盘 CTP 本身只
+    返回已挂牌合约，因此该字段可以为空。这样不会为了研究再创建第二套 Universe。
     """
     symbol: str
     exchange: str
     product: str
     expiry: str
+    listing: str = ""
 
 
 @dataclass(frozen=True)
