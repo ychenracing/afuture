@@ -1,12 +1,23 @@
-# 实盘、停机与恢复
+# 实盘、Shadow、停机与恢复
 
-## 上线前提
+## 1. 上线顺序
 
-先完成历史研究和 CTP 测试柜台验证，再考虑真实资金。不要把“程序能连接 CTP”理解为“策略已经证明可盈利”。
+不要把“代码能连接 CTP”理解为“策略已经证明可盈利”。推荐顺序固定为：
 
-## 密钥和配置
+```text
+多年份 data-check
+→ accept-auto
+→ Shadow
+→ CTP doctor
+→ CTP 测试柜台订单/异常验证
+→ 极小真实仓位
+→ 多交易日 execution-quality 核对
+→ 再决定是否扩大风险预算
+```
 
-真实账号信息只放环境变量，不写进仓库：
+## 2. 密钥
+
+CTP 账号只从环境变量读取：
 
 ```text
 AFUTURE_CTP_USER
@@ -22,65 +33,213 @@ AFUTURE_CTP_AUTH_CODE
 AFUTURE_LIVE_ACK=I_UNDERSTAND_FUTURES_RISK
 ```
 
-并显式传 `--confirm-live`。
+并显式传 `--confirm-live`。该确认同样适用于生产柜台的 Shadow/Doctor，因为它们仍会访问真实账户和行情，虽然不会发单。
 
-## 启动流程
+## 3. Doctor：只检查，不下单
 
-`afuture live` 依次执行：
-
-1. 创建 CTP 行情/交易会话，等待交易、行情登录和合约初始化。
-2. `auto` 模式读取 CTP 合约目录，恢复持久化动态组合，并订阅白名单品种的前排月份。
-3. 在“已就绪”之后等待新的账户事件和一次完整持仓查询快照。
-4. 静态组合执行本地/CTP 参数比较；动态候选在激活前直接查询 CTP 保证金和手续费。
-5. 检查是否存在遗留活动订单；存在则撤单并停机。
-6. 本地期望持仓与柜台完整持仓对账。
-7. 已有 Kill Switch 时，只有本次元数据校验、账户风险和对账全部通过才清除。
-8. 进入事件循环；自动层持续扫描候选，只有排名和全部风险门都通过时才把组合加入正式交易引擎。
-
-固定 `sleep` 不能替代完整快照边界，因此代码使用账户/持仓 generation marker 判断是否真的收到一轮新快照。
-
-
-## 自动发现模式
-
-`config/afuture.live.example.toml` 已切换为自动发现示例。它不是“全市场乱扫”，而是使用一个小的品种白名单，然后自动决定具体交易哪个月份组合。
-
-关键规则：
-
-- 每个品种只看前几个未临近到期的月份；
-- 只做相邻月份跨期，避免组合数量平方级膨胀；
-- 成交量、Open Interest、盘口、均值回归和 Net Edge 都不合格时保持空仓；
-- 每个品种最多激活一个组合，账户同时只激活少数组合；
-- 已有持仓不因候选排名变化强制退出；退出后若排名失效则自动退役；
-- 动态组合写入状态文件，重启后先恢复再做持仓对账；
-- 交易日变化自动重算临近到期过滤。
-
-示例只配置日盘窗口，目的是避免不同商品夜盘结束时间不一致引入额外复杂度。若要做夜盘，应确认 `auto.products` 中所有品种的真实夜盘时段后再增加窗口。
-
-## 行情健康时钟
-
-实盘使用墙钟持续计算最新 Tick 的年龄，所以不仅能发现单腿落后，也能发现两腿同时停止推送的行情整体冻结。组合配置了交易时段时，仅在对应活跃时段执行该行情陈旧检查；开盘初始订阅保留一个短暂的行情初始化窗口。
-
-## REDUCE_ONLY
-
-CTP 跨合约报单不是原子交易。出现一腿成交、一腿失败时，系统不会继续开风险仓位，而会进入：
-
-```text
-REDUCE_ONLY
+```bash
+afuture doctor --config config/live.toml
 ```
 
-行为：
+检查：
 
-- 撤销当前活动订单；
-- 禁止新增风险；
-- 使用 FAK 只减仓修复裸腿；
-- 每轮事件继续检查风险；
-- 仓位重新平衡/清空后转 `HALTED`，要求人工复核。
+- CTP 行情/交易登录；
+- fresh account event；
+- fresh complete position snapshot；
+- contract catalog；
+- 少量候选合约的 multiplier/price tick/margin/commission metadata。
 
-如果市场封板或无流动性，`HALTED` 不代表裸腿已经消失。应根据本地告警和期货公司终端立即人工处理。
+输出包含：
 
-## 人工恢复状态
+```text
+ready
+trading_day
+account_equity
+position_count
+contract_catalog_count
+metadata_symbols
+orders_sent = 0
+```
 
-只有确认状态文件与真实账户脱节，并且你已经通过期货公司终端人工核验仓位时，才使用：
+`doctor` 没有下单入口，不要把测试订单逻辑塞进 doctor。
+
+## 4. Shadow：真实市场，虚拟账户
+
+```bash
+afuture shadow --config config/live.toml
+```
+
+Shadow 使用：
+
+- 真实 CTP contract catalog；
+- 真实 Tick；
+- 真实 trading day；
+- 真实 margin/commission query；
+- 正式 AutoPairManager；
+- 正式 TradingEngine / RiskManager / PairExecutor。
+
+但账户、订单、持仓和成交由本地保守 SimBroker 维护。`ShadowBroker.send_order()` 不调用真实 CTP `send_order()`。
+
+每次 Shadow 会话从新的虚拟账户开始，避免上次模拟持仓与新行情错配。Shadow sampled history 和执行证据与 Live 分开：
+
+```text
+runtime/shadow_market_samples/
+runtime/shadow_execution_quality.jsonl
+runtime/shadow_audit.jsonl
+runtime/shadow_state.json
+```
+
+可限制一次观察时长：
+
+```bash
+afuture shadow --config config/live.toml --duration-seconds 3600
+```
+
+汇总：
+
+```bash
+afuture quality-report --config config/live.toml --shadow
+```
+
+## 5. 实盘启动安全门
+
+```bash
+afuture live --config config/live.toml
+```
+
+顺序：
+
+1. 创建 CTP 会话；
+2. 等待交易/行情登录和合约初始化；
+3. Auto 读取 CTP 合约目录，恢复仍需管理的动态 pair；
+4. warm-load 最近 sampled history；
+5. 等待 ready 之后新产生的账户事件和完整持仓快照；
+6. 静态 pair 比较本地/CTP 元数据；动态 pair 从 CTP 取真实元数据；
+7. 遗留活动订单存在则撤单并停机；
+8. 本地期望持仓与柜台完整快照逐合约对账；
+9. Kill Switch 只有本会话元数据、账户风险和对账全部通过才允许解除；
+10. 进入 `RUNNING`。
+
+固定 `sleep` 不能替代 snapshot generation marker。
+
+## 6. Auto 元数据查询不阻塞 Tick
+
+恢复已有动态仓位时可以在启动安全门同步查询元数据。
+
+正常运行中，候选接近开仓时：
+
+```text
+statistical prefilter
+→ background metadata request
+→ current candidate skipped
+→ next scan consumes cache
+```
+
+CTP margin/commission query 不在 Tick 主循环中等待。交易日变化会清空缓存并重新刷新。
+
+## 7. Warm History
+
+Live 只保存桶化后的最近样本：
+
+```text
+runtime/market_samples/
+```
+
+上限约为 `lookback * 4` 级别，不保存长期原始 Tick。重启后新候选可以从最近 sampled history 恢复，不必完全从零等待。
+
+## 8. Auto 退役
+
+必须区分：
+
+```text
+managed
+open-eligible
+```
+
+组合有仓位时即使 ranking/hard gate 失效，仍保持 `managed=true`，保证原策略能退出；同时立刻 `open-eligible=false`，不能在退出后的下一次 scan 前重新开仓。
+
+平仓且无活动订单后立即 unregister。
+
+## 9. 行情健康
+
+实盘使用墙钟，因此能够发现：
+
+- 单腿延迟；
+- 双腿时间差超限；
+- 两腿同时停止推送；
+- 行情 timestamp 未来漂移。
+
+仅在组合配置的活跃 session 中执行陈旧行情门，并保留启动初始化宽限。
+
+## 10. REDUCE_ONLY
+
+跨合约订单不是原子操作。出现双腿失衡或紧急退出失败时：
+
+```text
+RUNNING → REDUCE_ONLY
+```
+
+REDUCE_ONLY：
+
+- 撤活动订单；
+- 禁止新开仓；
+- FAK 只减仓；
+- 每轮继续审计；
+- 风险消失后转 `HALTED`；
+- 必须人工复核后才能恢复。
+
+封板/无流动性时，`HALTED` 不代表裸腿已消失。
+
+## 11. Execution Quality
+
+Live：
+
+```text
+runtime/execution_quality.jsonl
+```
+
+三类事件：
+
+### candidate
+
+- pair；
+- zscore；
+- stationarity；
+- half-life；
+- volume/OI；
+- depth；
+- candidate score；
+- expected Net Edge；
+- reject reason。
+
+### decision
+
+- signal action；
+- risk size；
+- accepted/rejected；
+- executor reject reason。
+
+### round_trip
+
+- expected spread；
+- entry/exit realized spread；
+- slippage；
+- commission；
+- leg latency；
+- partial fill；
+- rollback；
+- REDUCE_ONLY；
+- realized edge。
+
+```bash
+afuture quality-report --config config/live.toml
+```
+
+CTP trade callback 通常不直接提供结算单意义上的单笔实际手续费。系统质量证据应使用**实际成交价 + 已实时查询的账户费率**估算，并定期与期货公司结算单核对。差异持续明显时，应修正费用模型或停止该品种，而不是调高风险预算掩盖偏差。
+
+## 12. 人工恢复
+
+只有已经通过期货公司终端核验真实仓位时：
 
 ```text
 AFUTURE_RECOVERY_ACK=I_VERIFIED_CTP_POSITIONS
@@ -92,32 +251,29 @@ afuture recover-state \
   --confirm-adopt-state
 ```
 
-生产柜台还需要 `--confirm-live`。
+生产环境同时需要 `--confirm-live`。
 
-恢复规则：
+恢复只接受：
 
-- 只接受静态配置组合或状态文件中已经持久化的动态组合；
-- 每个套利组合必须双腿等量、方向相反；
-- 实际手数可以小于配置 `volume`（动态仓位），但不能超过它；
-- 有活动订单时不接纳状态；
-- 恢复后 Kill Switch **仍保持**；
-- `metadata_verified` 被清空；
-- 下一次 `live` 必须重新连接、重新查询元数据并完成第二次独立对账。
+- 静态配置 pair 或状态中已持久化的动态 pair；
+- 双腿等量反向；
+- 手数不超过 pair cap；
+- 无活动订单。
 
-## CTP 元数据限制
+恢复后 Kill Switch **不解除**，`metadata_verified` 清空；下一次 `live` 必须重新连接、重新查元数据并独立对账。
 
-当前模型能表达按成交额和按手手续费，以及按成交额比例保证金。若 CTP 返回当前模型不能可靠映射的固定金额保证金，系统会拒绝通过元数据门，而不是用猜测值继续运行。
+## 13. 测试柜台必须人工/真实完成的项
 
-## 告警
+仓库没有你的 BrokerID、账号、前置地址和权限，因此以下结果不能由 CI 伪造：
 
-关键事件会写入 `runtime/alerts.jsonl`。配置 `alert.webhook` 后还会向通用 Webhook POST JSON。Webhook 失败不会阻塞核心交易线程，但本地告警仍保留。
+- 实际登录；
+- FAK 下单/撤单；
+- 部分成交；
+- 拒单；
+- 平今/平昨；
+- 断线重连；
+- 夜盘跨交易日；
+- 期货公司查询/报单流控差异；
+- 实际结算手续费。
 
-应至少关注：
-
-- `REDUCE_ONLY`；
-- Kill Switch / HALTED；
-- 持仓漂移；
-- 未知成交或未知活动订单；
-- CTP 断线/快照陈旧；
-- 元数据校验失败；
-- 日亏损、总回撤和保证金风险。
+这些必须按 `production-checklist.md` 在测试柜台留下证据后再进入极小真实资金。
