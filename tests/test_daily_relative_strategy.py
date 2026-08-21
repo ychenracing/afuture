@@ -1,4 +1,4 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from afuture.auto import AutoConfig, AutoPairManager, AutoPairSelector
 from afuture.models import ContractInfo, PairConfig, SignalAction, Tick
@@ -79,27 +79,35 @@ def test_log_ratio_history_is_scale_invariant():
 
 
 def test_confirmation_waits_for_retrace_before_opening():
-    strategy = CalendarSpreadStrategy(relative_pair(daily_sample_window=""))
-    base = datetime(2026, 8, 21, 1, 0, tzinfo=timezone.utc)
+    # Confirmation is a rolling-window behavior. Use a realistic 20-sample window so
+    # the armed extreme does not dominate the very next reference distribution.
+    strategy = CalendarSpreadStrategy(
+        relative_pair(
+            daily_sample_window="",
+            lookback=20,
+            entry_trend_window=6,
+            max_entry_z_slope=999.0,
+        )
+    )
+    base = datetime(2026, 8, 1, 1, 0, tzinfo=timezone.utc)
 
-    # Warm up a stable relative-value window around 1.00.
-    for index, ratio in enumerate([1.000, 1.002, 0.998, 1.001]):
-        when = base.replace(hour=1 + index)
+    for index, ratio in enumerate([1.000, 1.002, 0.998, 1.001] * 5):
+        when = base + timedelta(hours=index)
         strategy.on_quotes(
             tick("m2609", when, 3000 * ratio),
             tick("m2701", when, 3000),
         )
 
-    extreme_time = base.replace(hour=6)
+    extreme_time = base + timedelta(hours=21)
     extreme = strategy.on_quotes(
         tick("m2609", extreme_time, 3060),
         tick("m2701", extreme_time, 3000),
     )
     assert extreme.action is SignalAction.HOLD
 
-    confirm_time = base.replace(hour=7)
+    confirm_time = base + timedelta(hours=22)
     confirmed = strategy.on_quotes(
-        tick("m2609", confirm_time, 3048),
+        tick("m2609", confirm_time, 3054),
         tick("m2701", confirm_time, 3000),
     )
     assert confirmed.action is SignalAction.SHORT_SPREAD
