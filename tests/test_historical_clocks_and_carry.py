@@ -125,16 +125,20 @@ def test_historical_legging_timeout_uses_market_event_time(tmp_path: Path):
         )
         broker.poll_events()
         assert broker.get_positions()[0].long_total == 1
+        assert not engine.executor.pair_is_balanced(pair)
 
         engine.quotes = {"N": near, "F": far}
         engine._audit_pair_balance()
         assert engine.state.runtime_mode == RuntimeMode.RUNNING.value
+        assert engine._imbalance_since["p"] == pytest.approx(start.timestamp())
 
         later = start + timedelta(seconds=3)
         engine.quotes = {
             "N": _tick("N", later, 99, 100),
             "F": _tick("F", later, 89, 90),
         }
+        assert engine._imbalance_clock() == pytest.approx(later.timestamp())
+        assert not engine.executor.pair_is_balanced(pair)
         engine._audit_pair_balance()
         assert engine.state.runtime_mode == RuntimeMode.REDUCE_ONLY.value
     finally:
