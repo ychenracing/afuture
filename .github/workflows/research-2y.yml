@@ -7,6 +7,7 @@ on:
   pull_request:
     paths:
       - "tools/evaluate_daily_relative_strategy.py"
+      - "tools/diagnose_two_year_selection.py"
       - "tools/test_alignment.py"
       - "tools/fetch_two_year_60m_universe.py"
       - "tools/fetch_prior_two_year_60m_universe.py"
@@ -30,15 +31,18 @@ jobs:
           python-version: "3.13"
       - run: python -m pip install --upgrade pip
       - run: python -m pip install akshare pandas
-      - name: 验证跨期日样本必须来自同一 60 分钟时间戳
+      - name: 验证生产采样、交易日、front-3 和活动度语义
         run: python tools/test_alignment.py
       - name: Fetch recent two-year 60-minute universe
         run: python tools/fetch_two_year_60m_universe.py
       - name: Fetch independent prior two-year 60-minute universe
         run: python tools/fetch_prior_two_year_60m_universe.py
+      - name: 输出修正后选择与经济诊断
+        run: python tools/diagnose_two_year_selection.py
       - name: Validate two-window strategy evidence
         run: python tools/evaluate_daily_relative_strategy.py
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: two-year-real-data-evidence
           path: |
@@ -48,5 +52,6 @@ jobs:
             runtime/prior_two_year_broad_60m.csv
             runtime/prior_two_year_broad_60m_summary.csv
             runtime/prior_two_year_broad_60m_failures.txt
+            runtime/two_year_diagnostic.json
             runtime/two_year_strategy_report.json
           retention-days: 14
