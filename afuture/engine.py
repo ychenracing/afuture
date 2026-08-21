@@ -289,7 +289,7 @@ class TradingEngine:
                     continue
 
                 spread = near.mid_price - far.mid_price
-                self.portfolio_risk.update(pair_id, spread)
+                self.portfolio_risk.update(pair_id, spread, quote_time)
                 strategy = self.strategies[pair_id]
                 pre_signal_state = strategy.snapshot_state()
                 signal = strategy.on_quotes(near, far)
@@ -458,7 +458,7 @@ class TradingEngine:
             self.emergency_stop(decision.reason)
 
     def _market_health_reason(self) -> str:
-        """按运行模式检查行情健康：回放使用事件时间，实盘使用墙钟。"""
+        """按运行模式检查行情健康：回放按事件门控，实盘使用墙钟时效。"""
         if not self.pairs:
             return ""
 
@@ -487,11 +487,18 @@ class TradingEngine:
         if not quotes_ready and self._quote_initialization_grace_active():
             return ""
 
-        max_quote_age = self._max_quote_age(
-            required, reference, quotes_ready
-        )
-        if max_quote_age is None:
-            return "market quote timestamp is in the future"
+        # 历史事件流可能是分钟/日频抽样：某一腿的新样本先到时，另一腿下一条
+        # 已存在于未来事件队列但尚未发布。此时不能把“回放采样间隔”误当成实时
+        # 柜台 stale quote 并永久停机；每次真正交易前仍由 check_quotes 严格检查
+        # quote age / cross-leg skew。实盘则继续用墙钟执行全局 stale 停机。
+        if self.historical_mode:
+            max_quote_age = 0.0
+        else:
+            max_quote_age = self._max_quote_age(
+                required, reference, quotes_ready
+            )
+            if max_quote_age is None:
+                return "market quote timestamp is in the future"
 
         try:
             self.broker.get_account()
