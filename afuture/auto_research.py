@@ -8,10 +8,11 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, replace
+from datetime import timedelta
 from itertools import groupby
 from math import isfinite
-from tempfile import TemporaryDirectory
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from .auto import AutoPairManager
 from .broker.sim import SimBroker
@@ -64,6 +65,45 @@ class AutoPortfolioRunner:
             raise ValueError("accept-auto requires auto.enabled=true")
         self.base = base_config
 
+    def parameter_grid(
+        self,
+        research: AutoPortfolioResearchConfig,
+    ) -> list[dict]:
+        """返回预先限定的小型全局参数邻域，不做高维全空间搜索。
+
+        风险参数和仓位参数不参与收益优化；这里只对少量信号/候选参数做单变量邻域扰动，
+        让 Calibrator 能选择稳定区域，同时避免商品逐个调参造成自由度爆炸。
+        """
+        if research.parameter_grid:
+            return [dict(row) for row in research.parameter_grid]
+        base = self._parameter_row(self.base.auto)
+        rows = [dict(base)]
+
+        def add(**updates) -> None:
+            row = dict(base)
+            row.update(updates)
+            if not 0 <= row["exit_z"] < row["entry_z"] < self.base.auto.stop_z:
+                return
+            key = tuple(sorted(row.items()))
+            if key not in {tuple(sorted(existing.items())) for existing in rows}:
+                rows.append(row)
+
+        add(lookback=max(2, int(round(base["lookback"] * 0.8))))
+        add(lookback=max(2, int(round(base["lookback"] * 1.2))))
+        add(entry_z=max(base["exit_z"] + 0.05, base["entry_z"] * 0.9))
+        add(entry_z=min(self.base.auto.stop_z - 0.05, base["entry_z"] * 1.1))
+        add(exit_z=max(0.0, base["exit_z"] * 0.9))
+        add(exit_z=min(base["entry_z"] - 0.05, base["exit_z"] * 1.1))
+        if base["min_net_edge"] > 0:
+            add(min_net_edge=base["min_net_edge"] * 0.8)
+            add(min_net_edge=base["min_net_edge"] * 1.2)
+        if base["min_stationarity_score"] > 0:
+            add(min_stationarity_score=max(0.0, base["min_stationarity_score"] * 0.8))
+            add(min_stationarity_score=min(1.0, base["min_stationarity_score"] * 1.2))
+        add(max_half_life=max(0.1, base["max_half_life"] * 0.8))
+        add(max_half_life=base["max_half_life"] * 1.2)
+        return rows
+
     def run(
         self,
         ticks: list[Tick],
@@ -72,7 +112,7 @@ class AutoPortfolioRunner:
         self._validate(research)
         days = sorted({row.trading_day for row in ticks})
         total = research.train_days + research.validation_days + research.oos_days
-        grid = list(research.parameter_grid) or [self._parameter_row(self.base.auto)]
+        grid = self.parameter_grid(research)
         folds: list[AutoPortfolioFold] = []
         selected_rows: list[dict] = []
 
@@ -116,7 +156,6 @@ class AutoPortfolioRunner:
                     "lookback",
                     "entry_z",
                     "exit_z",
-                    "stop_z",
                     "min_net_edge",
                     "min_stationarity_score",
                     "max_half_life",
@@ -274,7 +313,6 @@ class AutoPortfolioRunner:
             "lookback": auto.lookback,
             "entry_z": auto.entry_z,
             "exit_z": auto.exit_z,
-            "stop_z": auto.stop_z,
             "min_net_edge": auto.min_net_edge,
             "min_stationarity_score": auto.min_stationarity_score,
             "max_half_life": auto.max_half_life,
@@ -344,7 +382,7 @@ class AutoPortfolioRunner:
         for rows in grouped.values():
             ordered = sorted(rows, key=lambda item: (item.expiry, item.symbol))
             far_symbols.update(item.symbol for item in ordered[1:])
-        delta = __import__("datetime").timedelta(seconds=max(0.0, float(seconds)))
+        delta = timedelta(seconds=max(0.0, float(seconds)))
         return [
             replace(row, timestamp=row.timestamp + delta)
             if row.symbol in far_symbols
