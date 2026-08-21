@@ -188,23 +188,26 @@ class CalendarSpreadStrategy:
             liquidation_spread = short_exec if self._position > 0 else long_exec
             chosen_spread = liquidation_spread
             if self.pair.signal_transform == "log_ratio":
-                chosen_z = mid_z
+                # 平多价差使用 near.bid/far.ask；平空价差使用 near.ask/far.bid。
+                # 退出和止损必须基于真实可平仓方向，而不是乐观的 mid ratio。
+                liquidation_z = short_z if self._position > 0 else long_z
+                chosen_z = liquidation_z
                 reverted = (
-                    self._position > 0 and mid_z >= -self.pair.exit_z
+                    self._position > 0 and liquidation_z >= -self.pair.exit_z
                 ) or (
-                    self._position < 0 and mid_z <= self.pair.exit_z
+                    self._position < 0 and liquidation_z <= self.pair.exit_z
                 )
                 stop_reached = (
-                    self._position > 0 and mid_z <= -self.pair.stop_z
+                    self._position > 0 and liquidation_z <= -self.pair.stop_z
                 ) or (
-                    self._position < 0 and mid_z >= self.pair.stop_z
+                    self._position < 0 and liquidation_z >= self.pair.stop_z
                 )
                 if reverted:
                     action = SignalAction.EXIT
-                    reason = "relative value reverted"
+                    reason = "executable relative value reverted"
                 elif stop_reached:
                     action = SignalAction.EMERGENCY_EXIT
-                    reason = "relative-value stop reached"
+                    reason = "executable relative-value stop reached"
                 elif (
                     self.pair.max_holding_samples > 0
                     and self._holding_samples >= self.pair.max_holding_samples
