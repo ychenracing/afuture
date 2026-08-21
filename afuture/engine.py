@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from .alerts import AlertManager
 from .auto import AutoPairManager
+from .economics import estimate_net_edge
 from .execution import PairExecutor
 from .health.monitor import HealthMonitor
 from .metadata import validate_contract_metadata
@@ -17,6 +18,7 @@ from .models import (
     ContractPosition,
     ContractSpec,
     Order,
+    Offset,
     PairConfig,
     RiskDecision,
     RuntimeMode,
@@ -26,6 +28,7 @@ from .models import (
 )
 from .portfolio_risk import PortfolioRiskAnalyzer
 from .position import PositionBook
+from .quality import ExecutionQualityRecorder
 from .reconcile import compare_positions
 from .risk import RiskManager
 from .state import RuntimeState, StateStore
@@ -55,6 +58,7 @@ class TradingEngine:
         portfolio_risk: PortfolioRiskAnalyzer | None = None,
         alert_manager: AlertManager | None = None,
         auto_manager: AutoPairManager | None = None,
+        quality_recorder: ExecutionQualityRecorder | None = None,
         require_live_metadata: bool = False,
         metadata_timeout_seconds: float = 10.0,
         historical_mode: bool = False,
@@ -85,6 +89,7 @@ class TradingEngine:
         self.halted = False
         self.auto_flatten_imbalance = auto_flatten_imbalance
         self.legging_timeout_seconds = max(0.0, legging_timeout_seconds)
+        self.slippage_ticks = max(0, slippage_ticks)
         self._imbalance_since: dict[str, float] = {}
         self._initialized = False
         self._metadata_verified_session = False
@@ -98,6 +103,8 @@ class TradingEngine:
         self.portfolio_risk = portfolio_risk or PortfolioRiskAnalyzer()
         self.alerts = alert_manager or AlertManager()
         self.auto_manager = auto_manager
+        self.quality = quality_recorder
+        self._quality_pending: dict[str, dict] = {}
         self.require_live_metadata = require_live_metadata
         self.metadata_timeout_seconds = metadata_timeout_seconds
         self.historical_mode = historical_mode
@@ -174,7 +181,7 @@ class TradingEngine:
         self._persist()
 
     def _validate_live_metadata(self) -> RiskDecision:
-        """从柜台刷新合约参数；任何查询异常都按失败关闭处理。"""
+        """从柜台刷新静态合约参数；任何查询异常都按失败关闭处理。"""
         try:
             if not self._static_spec_symbols:
                 return RiskDecision(True)
@@ -193,8 +200,10 @@ class TradingEngine:
             )
 
     def stop(self) -> None:
-        """保存期望状态后关闭柜台。"""
+        """保存期望状态、关闭 Auto 后台 worker，再关闭柜台。"""
         self._persist()
+        if self.auto_manager is not None:
+            self.auto_manager.close()
         self.broker.stop()
 
     def reconcile_startup(self) -> bool:
@@ -288,8 +297,12 @@ class TradingEngine:
                     SignalAction.LONG_SPREAD,
                     SignalAction.SHORT_SPREAD,
                 }
-                if opening and pair_id in self._retiring_auto_pairs:
+                if opening and not self._pair_open_eligible(pair_id):
                     self.strategies[pair_id].set_position(0)
+                    self._record(
+                        "risk_reject",
+                        {"pair": pair_id, "reason": "auto pair is managed but not open-eligible"},
+                    )
                     continue
                 if opening:
                     portfolio_decision = self.portfolio_risk.allow_open(
@@ -317,6 +330,7 @@ class TradingEngine:
                     open_pair_count=self._open_pair_count(),
                     spread_std=self.strategies[pair_id].spread_std,
                 )
+                self._record_quality_decision(pair, signal, near, far, result)
                 if not result.accepted and opening:
                     self.strategies[pair_id].set_position(0)
                 self._persist()
@@ -388,6 +402,7 @@ class TradingEngine:
             )
             return
         self.state.last_trade_id = trade.trade_id
+        self._capture_quality_trade(trade)
         try:
             self._apply_expected_trade(trade)
         except Exception as exc:
@@ -395,6 +410,7 @@ class TradingEngine:
                 f"expected position update failed: {exc}"
             )
             return
+        self._finalize_quality_if_flat(trade)
         self._audit_pair_balance()
         self._cleanup_retired_auto_pairs()
 
@@ -506,7 +522,6 @@ class TradingEngine:
 
     def _quote_initialization_grace_active(self) -> bool:
         if self.historical_mode:
-            # 历史回放按批次推进；缺腿时等待下一批，不用墙钟误判。
             return True
         grace = self.risk_manager.config.max_quote_age_seconds
         return bool(
@@ -547,6 +562,8 @@ class TradingEngine:
         self.state.kill_switch = True
         self.state.kill_reason = reason
         self.halted = False
+        for pending in self._quality_pending.values():
+            pending["reduce_only"] = True
         for order in self.broker.get_active_orders():
             self.broker.cancel_order(order.order_id)
         self.alerts.critical("进入 REDUCE_ONLY", {"reason": reason})
@@ -658,6 +675,10 @@ class TradingEngine:
             order.request.reference.startswith(pair_id)
             for order in self.broker.get_active_orders()
         )
+
+    def _pair_open_eligible(self, pair_id: str) -> bool:
+        """管理权与开仓权分离：retiring Auto pair 可退出但不能重新开仓。"""
+        return pair_id not in self._retiring_auto_pairs
 
     def _open_pair_count(self) -> int:
         return len(self._open_pair_groups())
@@ -773,9 +794,18 @@ class TradingEngine:
             if pair_id not in eligible_ids:
                 self._retiring_auto_pairs.add(pair_id)
         for pair in selected:
-            self._retiring_auto_pairs.discard(pair.pair_id)
+            # Protected pair 即使仍在 selected，也只有真正通过本轮 hard gates 才恢复开仓权。
+            if pair.pair_id in eligible_ids:
+                self._retiring_auto_pairs.discard(pair.pair_id)
+            elif pair.pair_id in protected:
+                self._retiring_auto_pairs.add(pair.pair_id)
             if pair.pair_id in self.pairs:
-                self.specs.update(self.auto_manager.pair_specs(pair))
+                try:
+                    self.specs.update(self.auto_manager.pair_specs(pair))
+                except KeyError:
+                    pass
+                continue
+            if pair.pair_id not in eligible_ids:
                 continue
             self._register_auto_pair(
                 pair,
@@ -848,6 +878,135 @@ class TradingEngine:
         for pair_id in list(self._retiring_auto_pairs):
             self._unregister_auto_pair(pair_id)
 
+    def _record_quality_decision(self, pair, signal, near, far, result) -> None:
+        if self.quality is None:
+            return
+        expected_edge = 0.0
+        expected_spread = float(signal.spread)
+        if signal.action in {SignalAction.LONG_SPREAD, SignalAction.SHORT_SPREAD} and result.volume > 0:
+            try:
+                edge = estimate_net_edge(
+                    signal.action,
+                    reference_mean=signal.reference_mean,
+                    near=near,
+                    far=far,
+                    specs=self.specs,
+                    volume=result.volume,
+                    slippage_ticks=self.slippage_ticks,
+                    legging_buffer=pair.legging_buffer,
+                )
+                expected_edge = float(edge.net_edge)
+                expected_spread = float(edge.executable_spread)
+            except Exception:
+                pass
+        self.quality.record_decision(
+            pair_id=pair.pair_id,
+            action=signal.action.value,
+            zscore=float(signal.zscore),
+            accepted=bool(result.accepted),
+            reject_reason=result.reason,
+            volume=int(result.volume),
+            expected_net_edge=expected_edge,
+            expected_spread=expected_spread,
+        )
+        if result.accepted and signal.action in {SignalAction.LONG_SPREAD, SignalAction.SHORT_SPREAD}:
+            self._quality_pending[pair.pair_id] = {
+                "pair": pair,
+                "action": signal.action,
+                "expected_net_edge": expected_edge,
+                "expected_spread": expected_spread,
+                "volume": result.volume,
+                "trades": [],
+                "reduce_only": False,
+            }
+
+    def _capture_quality_trade(self, trade: Trade) -> None:
+        if self.quality is None:
+            return
+        order = self.broker.get_order(trade.order_id)
+        if order is None:
+            return
+        pair_id = str(order.request.reference).split(":", 1)[0]
+        pending = self._quality_pending.get(pair_id)
+        if pending is None:
+            return
+        pending["trades"].append(
+            {
+                "symbol": trade.symbol,
+                "offset": trade.offset,
+                "side": trade.side,
+                "volume": trade.volume,
+                "price": trade.price,
+                "commission": trade.commission,
+                "timestamp": trade.timestamp,
+                "reference": order.request.reference,
+            }
+        )
+        if ":rollback" in order.request.reference or ":repair" in order.request.reference:
+            pending["rollback"] = True
+
+    def _finalize_quality_if_flat(self, trade: Trade) -> None:
+        if self.quality is None:
+            return
+        order = self.broker.get_order(trade.order_id)
+        if order is None:
+            return
+        pair_id = str(order.request.reference).split(":", 1)[0]
+        pending = self._quality_pending.get(pair_id)
+        pair = self.pairs.get(pair_id)
+        if pending is None or pair is None or self._pair_has_position(pair):
+            return
+        rows = pending.get("trades", [])
+        opens = [row for row in rows if row["offset"] is Offset.OPEN]
+        closes = [row for row in rows if row["offset"] is not Offset.OPEN]
+        if not opens or not closes:
+            return
+
+        def weighted(symbol: str, items: list[dict]) -> float:
+            selected = [row for row in items if row["symbol"] == symbol]
+            volume = sum(int(row["volume"]) for row in selected)
+            return (
+                sum(float(row["price"]) * int(row["volume"]) for row in selected) / volume
+                if volume > 0
+                else 0.0
+            )
+
+        entry_spread = weighted(pair.near_symbol, opens) - weighted(pair.far_symbol, opens)
+        exit_spread = weighted(pair.near_symbol, closes) - weighted(pair.far_symbol, closes)
+        multiplier = min(
+            self.specs[pair.near_symbol].multiplier,
+            self.specs[pair.far_symbol].multiplier,
+        )
+        volume = max(1, int(pending.get("volume", 1)))
+        if pending["action"] is SignalAction.LONG_SPREAD:
+            gross = (exit_spread - entry_spread) * multiplier * volume
+        else:
+            gross = (entry_spread - exit_spread) * multiplier * volume
+        commission = sum(float(row.get("commission", 0.0)) for row in rows)
+        open_times = sorted(row["timestamp"] for row in opens)
+        leg_latency_ms = 0.0
+        if len(open_times) >= 2:
+            leg_latency_ms = (open_times[1] - open_times[0]).total_seconds() * 1000.0
+        open_by_symbol = {
+            symbol: sum(int(row["volume"]) for row in opens if row["symbol"] == symbol)
+            for symbol in (pair.near_symbol, pair.far_symbol)
+        }
+        partial = len(set(open_by_symbol.values())) > 1 or min(open_by_symbol.values(), default=0) < volume
+        self.quality.record_round_trip(
+            pair_id=pair_id,
+            expected_net_edge=float(pending.get("expected_net_edge", 0.0)),
+            realized_net_edge=gross - commission,
+            expected_spread=float(pending.get("expected_spread", entry_spread)),
+            entry_spread=entry_spread,
+            exit_spread=exit_spread,
+            commission=commission,
+            leg_latency_ms=leg_latency_ms,
+            partial_fill=partial,
+            rollback=bool(pending.get("rollback", False)),
+            reduce_only=bool(pending.get("reduce_only", False)),
+        )
+        self._quality_pending.pop(pair_id, None)
+
     def _record(self, event_type: str, payload: object) -> None:
         if self.journal is not None:
             self.journal.record(event_type, payload)
@@ -871,6 +1030,5 @@ class TradingEngine:
                 self.risk_manager.high_watermark
             )
         except Exception:
-            # 柜台关闭或尚未初始化时仍要保存已有期望状态。
             pass
         self.state_store.save(self.state)
