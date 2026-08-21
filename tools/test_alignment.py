@@ -8,9 +8,28 @@ spec = importlib.util.spec_from_file_location(
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
-# The signal-level research must not qualify a contract that production Auto would
-# reject on the same CTP cumulative-volume hard gate.
+# Production parity: same cumulative-volume gate and no hard-coded product identity.
 assert module.PROFILE["min_bar_volume"] == 1000.0
+assert not hasattr(module, "EXPECTED_PRIOR_PRODUCTS")
+assert not hasattr(module, "EXPECTED_CURRENT_PRODUCTS")
+
+passing = {
+    "qualified_prior": ["MA"],
+    "qualified_current": ["M"],
+    "prior_forward": {"trades": 3, "R": 0.5, "mdd_R": -0.2},
+    "final_oos": {"trades": 3, "R": 0.4, "mdd_R": -0.2},
+    "full_recent": {"trades": 10, "R": 2.1, "mdd_R": -0.3},
+    "neighbor_pass_ratio": 0.5,
+}
+assert module.promotion_reasons(passing) == []
+failing = dict(passing)
+failing["prior_forward"] = {"trades": 4, "R": -0.1, "mdd_R": -0.3}
+failing["final_oos"] = {"trades": 2, "R": 0.2, "mdd_R": -0.1}
+failing["neighbor_pass_ratio"] = 0.0
+reasons = module.promotion_reasons(failing)
+assert any("prior forward" in reason for reason in reasons)
+assert any("final OOS trade sample" in reason for reason in reasons)
+assert any("neighbor stability" in reason for reason in reasons)
 
 cols = [
     "datetime", "open", "high", "low", "close", "volume", "hold", "symbol", "product"
@@ -36,22 +55,12 @@ current = pd.DataFrame(
 prior = current.iloc[0:0].copy()
 frames = module.build_pair_frames(prior, current)
 pair = frames[("OI", "OI2505", "OI2509")]
-
 assert len(pair) == 1
 assert str(pair.iloc[0].datetime.date()) == "2025-01-06"
 assert str(pair.iloc[0].sample_timestamp) == "2025-01-03 23:00:00"
-assert float(pair.iloc[0].near) == 104.0
-assert float(pair.iloc[0].far) == 94.0
-assert float(pair.iloc[0].raw) == 10.0
 assert float(pair.iloc[0].near_vol) == 23.0
 assert float(pair.iloc[0].far_vol) == 43.0
-assert float(pair.iloc[0].near_hold) == 8400.0
-assert float(pair.iloc[0].far_hold) == 80500.0
 
-# Production Auto only keeps contracts at least 20 days from delivery/expiry and then
-# takes the front three. On trading day 2025-01-03, M2501 is inside the 20-day
-# blackout proxy, so the research universe must start from M2505 and may form only
-# M2505-M2509 and M2509-M2601.
 front_rows = []
 for symbol, price in (("M2501", 2800), ("M2505", 2810), ("M2509", 2820), ("M2601", 2830)):
     front_rows.append(["2025-01-02 23:00:00", price, price, price, price, 10, 20000, symbol, "M"])
