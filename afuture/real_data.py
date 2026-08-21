@@ -144,7 +144,7 @@ def parse_sina_daily_jsonp(payload: str, symbol: str) -> list[DailyBar]:
 
 
 class SinaDailyClient:
-    """只用于研究的数据下载器；带低频重试，避免无边界请求公开接口。"""
+    """只用于研究的数据下载器；网络/解析异常重试，合法空合约不重试。"""
 
     def __init__(self, timeout_seconds: float = 20.0, retries: int = 3) -> None:
         if timeout_seconds <= 0 or retries <= 0:
@@ -154,33 +154,32 @@ class SinaDailyClient:
 
     def fetch(self, symbol: str) -> list[DailyBar]:
         symbol = symbol.upper()
+        # 与 AKShare futures_zh_daily_sina 当前实现保持同一个 Sina endpoint；
+        # JSONP callback 名本身与请求 symbol 无关。
+        url = (
+            "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/"
+            "var%20_V21052021_4_12=/InnerFuturesNewService.getDailyKLine"
+        )
         params = urlencode({"symbol": symbol, "type": "2021_04_12"})
-        urls = (
-            f"https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20_{symbol}2021_4_12=/InnerFuturesNewService.getDailyKLine?{params}",
-            f"https://stock2.finance.sina.com.cn/futures/api/jsonp.php//InnerFuturesNewService.getDailyKLine?symbol={symbol}",
+        request = Request(
+            f"{url}?{params}",
+            headers={
+                "User-Agent": "Mozilla/5.0 afuture-research/1.0",
+                "Referer": f"https://finance.sina.com.cn/futures/quotes/{symbol}.shtml",
+            },
         )
         last_error: Exception | None = None
         for attempt in range(self.retries):
-            for url in urls:
-                request = Request(
-                    url,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 afuture-research/1.0",
-                        "Referer": f"https://finance.sina.com.cn/futures/quotes/{symbol}.shtml",
-                    },
-                )
-                try:
-                    with urlopen(request, timeout=self.timeout_seconds) as response:
-                        text = response.read().decode("utf-8", errors="replace")
-                    rows = parse_sina_daily_jsonp(text, symbol)
-                    if rows:
-                        return rows
-                except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
-                    last_error = exc
-            sleep(0.5 * (attempt + 1))
-        if last_error is not None:
-            raise RuntimeError(f"Sina daily fetch failed for {symbol}: {last_error}") from last_error
-        return []
+            try:
+                with urlopen(request, timeout=self.timeout_seconds) as response:
+                    text = response.read().decode("utf-8", errors="replace")
+                # HTTP + JSONP 成功时，[] 就表示该合约没有历史数据，不能继续重试。
+                return parse_sina_daily_jsonp(text, symbol)
+            except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+                last_error = exc
+                if attempt + 1 < self.retries:
+                    sleep(0.5 * (attempt + 1))
+        raise RuntimeError(f"Sina daily fetch failed for {symbol}: {last_error}") from last_error
 
 
 def contract_symbols(
