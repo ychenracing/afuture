@@ -8,22 +8,22 @@ spec = importlib.util.spec_from_file_location(
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
+# The signal-level research must not qualify a contract that production Auto would
+# reject on the same CTP cumulative-volume hard gate.
+assert module.PROFILE["min_bar_volume"] == 1000.0
+
 cols = [
     "datetime", "open", "high", "low", "close", "volume", "hold", "symbol", "product"
 ]
 current = pd.DataFrame(
     [
-        # 1/2 白天属于 1/2 交易日。
         ["2025-01-02 15:00:00", 100, 100, 100, 100, 100, 8000, "OI2505", "OI"],
         ["2025-01-02 15:00:00", 90, 90, 90, 90, 200, 80000, "OI2509", "OI"],
-        # 1/2 夜盘属于 1/3 交易日，但近月缺 23:00，因此 1/3 不得形成 pair sample。
         ["2025-01-02 21:00:00", 101, 101, 101, 101, 10, 8100, "OI2505", "OI"],
         ["2025-01-02 21:00:00", 91, 91, 91, 91, 20, 80100, "OI2509", "OI"],
         ["2025-01-02 23:00:00", 92, 92, 92, 92, 30, 80200, "OI2509", "OI"],
-        # 1/3 日盘证明 1/2 夜盘的下一真实交易日确实是 1/3。
         ["2025-01-03 09:00:00", 102, 102, 102, 102, 300, 8200, "OI2505", "OI"],
         ["2025-01-03 09:00:00", 92, 92, 92, 92, 400, 80300, "OI2509", "OI"],
-        # 周五 1/3 夜盘按中国期货语义属于下一个日盘交易日 1/6。
         ["2025-01-03 21:00:00", 103, 103, 103, 103, 11, 8300, "OI2505", "OI"],
         ["2025-01-03 21:00:00", 93, 93, 93, 93, 21, 80400, "OI2509", "OI"],
         ["2025-01-03 23:00:00", 104, 104, 104, 104, 12, 8400, "OI2505", "OI"],
