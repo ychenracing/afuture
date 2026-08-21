@@ -25,6 +25,7 @@ jobs:
       - run: python tools/probe_two_year_real_data.py
       - run: python tools/fetch_two_year_60m_universe.py
       - run: python tools/fetch_oi_extended_60m.py
+      - run: python tools/fetch_two_year_30m_universe.py
       - uses: actions/upload-artifact@v4
         with:
           name: two-year-real-data-probe
@@ -36,4 +37,7 @@ jobs:
             runtime/two_year_broad_60m_summary.csv
             runtime/two_year_broad_60m_failures.txt
             runtime/oi_2022_2024_60m.csv
+            runtime/two_year_broad_30m.csv
+            runtime/two_year_broad_30m_summary.csv
+            runtime/two_year_broad_30m_failures.txt
           retention-days: 7
