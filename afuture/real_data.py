@@ -2,11 +2,13 @@
 
 Sina 日线提供真实 OHLC、成交量、持仓量和结算价；公开历史接口不提供两年完整
 L1 bid/ask 深度，因此本模块把盘口相关字段明确建模为保守执行代理，禁止把它们
-描述成真实历史盘口。生产实盘仍只使用 CTP 实时 L1。
+描述成真实历史盘口。日频研究只使用当日开盘价和上一交易日已经可知的成交量/OI，
+避免用当日收盘后才能知道的信息在同一根 bar 上成交。生产实盘仍只使用 CTP 实时 L1。
 """
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 import json
@@ -23,7 +25,9 @@ from .models import ContractInfo, ContractSpec, FeeSpec, Tick
 
 
 _CHINA_TZ = ZoneInfo("Asia/Shanghai")
-_EXECUTION_PROXY = "close +/- one price tick; historical L1 unavailable"
+_EXECUTION_PROXY = (
+    "open +/- one price tick; prior-day volume/open_interest; historical L1 unavailable"
+)
 _ALL_MONTHS = tuple(range(1, 13))
 
 
@@ -134,7 +138,7 @@ def parse_sina_daily_jsonp(payload: str, symbol: str) -> list[DailyBar]:
             )
         except (TypeError, ValueError):
             continue
-        if row.close <= 0 or row.high <= 0 or row.low <= 0:
+        if row.open <= 0 or row.close <= 0 or row.high <= 0 or row.low <= 0:
             continue
         if row.volume < 0 or row.open_interest < 0:
             continue
@@ -231,36 +235,47 @@ def daily_bars_to_ticks(
     bars: Iterable[DailyBar],
     definition: ProductDefinition,
 ) -> DailyTickConversion:
-    """把真实日线转换为生产模型可消费的保守日频研究 Tick。
+    """把真实日线转换为无同-bar前视的保守日频研究 Tick。
 
-    close/volume/OI 仍是原始真实数据；bid/ask 和一档深度只是执行压力代理。
+    当日价格只使用开盘时可观察的 ``open``；活动度使用上一交易日已经确定的
+    volume/OI。当日 high/low/close/volume/OI 只保留在原始下载数据中用于审计，
+    不进入当日选标或成交。bid/ask 与一档深度仍只是执行压力代理。
     """
 
-    ticks: list[Tick] = []
+    grouped: dict[str, list[DailyBar]] = defaultdict(list)
     for row in bars:
-        if row.volume <= 0 or row.open_interest <= 0:
-            continue
-        bid = row.close - definition.price_tick
-        ask = row.close + definition.price_tick
-        if bid <= 0:
-            continue
-        depth = max(1.0, min(200.0, sqrt(max(row.volume, 1.0)) / 2.0))
-        timestamp = datetime.combine(row.day, time(14, 59), tzinfo=_CHINA_TZ)
-        tick = Tick(
-            symbol=row.symbol.upper(),
-            exchange=definition.exchange,
-            timestamp=timestamp,
-            bid_price=bid,
-            ask_price=ask,
-            last_price=row.close,
-            bid_volume=depth,
-            ask_volume=depth,
-            trading_day=row.day.strftime("%Y%m%d"),
-            volume=row.volume,
-            open_interest=row.open_interest,
-        )
-        tick.validate()
-        ticks.append(tick)
+        grouped[row.symbol.upper()].append(row)
+
+    ticks: list[Tick] = []
+    for symbol, rows in grouped.items():
+        rows.sort(key=lambda item: item.day)
+        for previous, current in zip(rows, rows[1:]):
+            if previous.volume <= 0 or previous.open_interest <= 0:
+                continue
+            if current.open <= 0:
+                continue
+            bid = current.open - definition.price_tick
+            ask = current.open + definition.price_tick
+            if bid <= 0:
+                continue
+            depth = max(1.0, min(200.0, sqrt(max(previous.volume, 1.0)) / 2.0))
+            timestamp = datetime.combine(current.day, time(9, 0), tzinfo=_CHINA_TZ)
+            tick = Tick(
+                symbol=symbol,
+                exchange=definition.exchange,
+                timestamp=timestamp,
+                bid_price=bid,
+                ask_price=ask,
+                last_price=current.open,
+                bid_volume=depth,
+                ask_volume=depth,
+                trading_day=current.day.strftime("%Y%m%d"),
+                volume=previous.volume,
+                open_interest=previous.open_interest,
+            )
+            tick.validate()
+            ticks.append(tick)
+    ticks.sort(key=lambda row: (row.timestamp, row.symbol))
     return DailyTickConversion(ticks=ticks)
 
 
