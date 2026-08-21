@@ -1,6 +1,7 @@
-"""实际执行质量证据。
+"""实际执行与候选质量证据。
 
-把模型预期与实际成交分开记录，避免只看账户收益而不知道手续费、滑点或裸腿修复是否吞掉 Edge。
+把模型预期、Auto 候选判断和实际成交分开记录，避免只看账户收益而不知道
+selector、手续费、滑点或裸腿修复中的哪一层吞掉 Edge。
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ from statistics import median
 
 
 class ExecutionQualityRecorder:
-    """以 JSONL 保存 round-trip 和 shadow 决策，并提供轻量汇总。"""
+    """以 JSONL 保存 candidate/decision/round-trip，并提供轻量汇总。"""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -53,21 +54,36 @@ class ExecutionQualityRecorder:
             payload["extra"] = dict(extra)
         self._append(payload)
 
+    def record_candidate(self, **fields) -> None:
+        self._append(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "event": "candidate",
+                **fields,
+            }
+        )
+
     def record_decision(self, **fields) -> None:
-        payload = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "event": "decision",
-            **fields,
-        }
-        self._append(payload)
+        self._append(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "event": "decision",
+                **fields,
+            }
+        )
 
     def summary(self) -> dict:
-        rows = [row for row in self._read() if row.get("event") == "round_trip"]
+        all_rows = self._read()
+        rows = [row for row in all_rows if row.get("event") == "round_trip"]
         slippage = sorted(float(row.get("slippage", 0.0)) for row in rows)
         realized = [float(row.get("realized_net_edge", 0.0)) for row in rows]
         commissions = [float(row.get("commission", 0.0)) for row in rows]
         latencies = [float(row.get("leg_latency_ms", 0.0)) for row in rows]
+        candidates = [row for row in all_rows if row.get("event") == "candidate"]
+        decisions = [row for row in all_rows if row.get("event") == "decision"]
         return {
+            "candidate_events": len(candidates),
+            "decision_events": len(decisions),
             "round_trips": len(rows),
             "median_slippage": median(slippage) if slippage else 0.0,
             "p95_slippage": self._percentile(slippage, 0.95),
