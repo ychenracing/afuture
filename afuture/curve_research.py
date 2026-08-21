@@ -1,0 +1,493 @@
+"""期限结构策略族的轻量、因果研究筛选。
+
+本模块只用于在完整生产回放之前快速淘汰没有经济信号的策略家族。它重建每日
+F1/F2 角色序列，所有信号只使用当前及历史已观察行情，并从下一持有区间开始记
+收益；换月日不跨合约拼接收益。筛选通过后仍必须进入 TradingEngine 完整回放。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date
+from math import log, sqrt
+from statistics import mean
+
+from .models import ContractInfo, ContractSpec, Tick
+
+
+@dataclass(frozen=True)
+class CurveFamilyConfig:
+    """少量预注册期限结构策略族参数。"""
+
+    family: str
+    fast_window: int = 5
+    slow_window: int = 60
+    mean_window: int = 30
+    entry_z: float = 1.5
+    exit_z: float = 0.5
+    change_severity: float = 1.5
+    min_volatility_percentile: float = 0.0
+    rebalance_samples: int = 5
+    slippage_ticks: int = 1
+
+
+@dataclass(frozen=True)
+class CurveObservation:
+    """某交易日真实可见的近月/次近月角色价格。"""
+
+    trading_day: str
+    near_symbol: str
+    far_symbol: str
+    near_price: float
+    far_price: float
+
+
+class CurveFamilyResearch:
+    """用动态 F1/F2 角色序列快速筛选期限结构 Alpha。"""
+
+    SUPPORTED_FAMILIES = {
+        "log_ratio_mean_reversion",
+        "basis_reversal",
+        "basis_momentum",
+        "slow_momentum_fast_reversion",
+    }
+
+    def __init__(
+        self,
+        ticks: list[Tick],
+        catalog: list[ContractInfo],
+        specs: dict[str, ContractSpec],
+        *,
+        min_days_to_expiry: int = 20,
+    ) -> None:
+        self.specs = specs
+        self.min_days_to_expiry = max(0, int(min_days_to_expiry))
+        self._catalog = list(catalog)
+        self._series = self._build_role_series(ticks)
+
+    @property
+    def products(self) -> tuple[str, ...]:
+        return tuple(sorted(self._series))
+
+    def run(
+        self,
+        config: CurveFamilyConfig,
+        allowed_days: set[str] | None = None,
+    ) -> dict:
+        """返回等权产品组合的成本后研究指标。"""
+        self._validate(config)
+        product_returns: dict[str, dict[str, float]] = {}
+        product_trades: dict[str, int] = {}
+        all_days: set[str] = set()
+        for product, observations in self._series.items():
+            returns, trades = self._run_product(
+                observations,
+                config,
+                allowed_days,
+            )
+            product_returns[product] = returns
+            product_trades[product] = trades
+            all_days.update(returns)
+
+        daily: list[float] = []
+        for trading_day in sorted(all_days):
+            rows = [
+                values[trading_day]
+                for values in product_returns.values()
+                if trading_day in values
+            ]
+            if rows:
+                daily.append(sum(rows) / len(rows))
+
+        metrics = self._metrics(daily)
+        metrics["trading_days"] = len(daily)
+        metrics["trade_count"] = sum(product_trades.values())
+        metrics["product_total_returns"] = {
+            product: self._compound(list(values.values()))
+            for product, values in product_returns.items()
+        }
+        product_totals = metrics["product_total_returns"]
+        metrics["positive_product_ratio"] = (
+            sum(value > 0 for value in product_totals.values())
+            / len(product_totals)
+            if product_totals
+            else 0.0
+        )
+        return metrics
+
+    def _run_product(
+        self,
+        observations: list[CurveObservation],
+        config: CurveFamilyConfig,
+        allowed_days: set[str] | None,
+    ) -> tuple[dict[str, float], int]:
+        """按日先结算旧仓，再用当前信息决定下一持有区间。"""
+        returns: dict[str, float] = {}
+        position = 0
+        trades = 0
+        last_rebalance = -config.rebalance_samples
+
+        for index in range(1, len(observations)):
+            previous = observations[index - 1]
+            current = observations[index]
+            if allowed_days is not None and current.trading_day not in allowed_days:
+                position = 0
+                continue
+
+            same_pair = (
+                previous.near_symbol == current.near_symbol
+                and previous.far_symbol == current.far_symbol
+            )
+            if not same_pair:
+                # F1/F2 角色切换时不把两个不同合约的价格跳变计入 Alpha。
+                position = 0
+                last_rebalance = index
+                continue
+
+            near_return = current.near_price / previous.near_price - 1.0
+            far_return = current.far_price / previous.far_price - 1.0
+            gross_return = position * (near_return - far_return)
+
+            desired = position
+            if index - last_rebalance >= max(1, config.rebalance_samples):
+                desired = self._desired_position(
+                    observations,
+                    index,
+                    position,
+                    config,
+                )
+                last_rebalance = index
+            turnover = abs(desired - position)
+            cost = self._transaction_cost(
+                current,
+                turnover,
+                config.slippage_ticks,
+            )
+            returns[current.trading_day] = gross_return - cost
+            if desired != position:
+                trades += turnover
+            position = desired
+        return returns, trades
+
+    def _desired_position(
+        self,
+        observations: list[CurveObservation],
+        index: int,
+        current_position: int,
+        config: CurveFamilyConfig,
+    ) -> int:
+        """只使用截至 index 的可见价格决定下一持有区间目标。"""
+        required = max(
+            config.mean_window,
+            config.slow_window,
+            config.fast_window,
+        ) + 1
+        start = max(0, index - required + 1)
+        window = observations[start : index + 1]
+        if not self._same_pair(window):
+            return 0
+
+        relative_changes = self._relative_daily_changes(window)
+        volatility_percentile = self._volatility_percentile(
+            relative_changes,
+            config.fast_window,
+        )
+        # pairs-trading-egarch 的关键方向是“波动太低不部署资本”，而不只是避开
+        # 极高波动。默认 0 保持关闭状态。
+        if volatility_percentile < config.min_volatility_percentile:
+            return 0
+
+        if config.family == "basis_reversal":
+            # Rossi 2025 的 spread 版本：最近 F1-F2 相对收益为正，则下一期反向。
+            relative = self._relative_return(window, config.fast_window)
+            return -self._sign(relative)
+
+        if config.family == "basis_momentum":
+            # Boons 2019 的 basis momentum 用 F1/F2 长期收益差；这里仅研究其
+            # spread-neutral 方向版本，不复制原论文的 outright 横截面仓位。
+            relative = self._relative_return(window, config.slow_window)
+            return self._sign(relative)
+
+        if config.family == "slow_momentum_fast_reversion":
+            # 对 Wood et al. 的轻量代理：正常时跟随慢相对趋势；近期出现与慢趋势
+            # 相反且足够大的局部断点时，暂时切换到快速方向，下一次再由慢趋势接管。
+            slow = self._relative_return(window, config.slow_window)
+            fast = self._relative_return(window, config.fast_window)
+            recent = relative_changes[-max(config.fast_window * 4, 10) :]
+            sigma = self._std(recent)
+            severity = abs(fast) / max(
+                sigma * sqrt(config.fast_window),
+                1e-9,
+            )
+            slow_sign = self._sign(slow)
+            fast_sign = self._sign(fast)
+            if (
+                severity >= config.change_severity
+                and fast_sign != 0
+                and slow_sign != 0
+                and fast_sign != slow_sign
+            ):
+                return fast_sign
+            return slow_sign
+
+        # 归一化 log(F1/F2) 均值回归；该信号消除绝对价格尺度差异。
+        ratios = [
+            log(row.near_price / row.far_price)
+            for row in window[-config.mean_window :]
+        ]
+        if len(ratios) < config.mean_window:
+            return 0
+        history = ratios[:-1]
+        reference_mean = mean(history)
+        reference_std = self._std(history)
+        zscore = (ratios[-1] - reference_mean) / max(reference_std, 1e-9)
+        if current_position == 0:
+            if zscore >= config.entry_z:
+                return -1
+            if zscore <= -config.entry_z:
+                return 1
+            return 0
+        if current_position > 0:
+            if zscore >= -config.exit_z or zscore <= -4.0:
+                return 0
+        elif zscore <= config.exit_z or zscore >= 4.0:
+            return 0
+        return current_position
+
+    def _build_role_series(
+        self,
+        ticks: list[Tick],
+    ) -> dict[str, list[CurveObservation]]:
+        """按历史 listing/expiry 和当日真实出现合约重建 F1/F2。"""
+        by_day: dict[str, dict[str, Tick]] = {}
+        for tick in ticks:
+            current = by_day.setdefault(tick.trading_day, {})
+            existing = current.get(tick.symbol)
+            # 两年日线代理每个合约每日只有一个 open tick；若将来输入多条，研究
+            # 使用最早可见样本，避免偷偷使用日内未来价格。
+            if existing is None or tick.timestamp < existing.timestamp:
+                current[tick.symbol] = tick
+
+        catalog_by_product: dict[str, list[ContractInfo]] = {}
+        for row in self._catalog:
+            catalog_by_product.setdefault(row.product.lower(), []).append(row)
+        result: dict[str, list[CurveObservation]] = {
+            product: [] for product in catalog_by_product
+        }
+
+        for trading_day in sorted(by_day):
+            day = date(
+                int(trading_day[:4]),
+                int(trading_day[4:6]),
+                int(trading_day[6:8]),
+            )
+            observed = by_day[trading_day]
+            for product, rows in catalog_by_product.items():
+                eligible: list[tuple[date, ContractInfo]] = []
+                for row in rows:
+                    if row.symbol not in observed:
+                        continue
+                    try:
+                        expiry = date.fromisoformat(row.expiry)
+                        listing = (
+                            date.fromisoformat(row.listing)
+                            if row.listing
+                            else None
+                        )
+                    except ValueError:
+                        continue
+                    if listing is not None and listing > day:
+                        continue
+                    if (expiry - day).days < self.min_days_to_expiry:
+                        continue
+                    eligible.append((expiry, row))
+                eligible.sort(key=lambda item: (item[0], item[1].symbol))
+                if len(eligible) < 2:
+                    continue
+                near = observed[eligible[0][1].symbol]
+                far = observed[eligible[1][1].symbol]
+                result[product].append(
+                    CurveObservation(
+                        trading_day=trading_day,
+                        near_symbol=near.symbol,
+                        far_symbol=far.symbol,
+                        near_price=near.mid_price,
+                        far_price=far.mid_price,
+                    )
+                )
+        return result
+
+    def _transaction_cost(
+        self,
+        current: CurveObservation,
+        turnover: int,
+        slippage_ticks: int,
+    ) -> float:
+        """用真实 tick/multiplier/fee 对每次两腿换仓做保守成本扣减。"""
+        if turnover <= 0 or not self.specs:
+            return 0.0
+        near_spec = self.specs[current.near_symbol]
+        far_spec = self.specs[current.far_symbol]
+        near_notional = current.near_price * near_spec.multiplier
+        far_notional = current.far_price * far_spec.multiplier
+        gross_notional = max(near_notional + far_notional, 1e-9)
+        slippage = slippage_ticks * (
+            near_spec.price_tick * near_spec.multiplier
+            + far_spec.price_tick * far_spec.multiplier
+        ) / gross_notional
+        # 单次 position unit 变化只发生一次双腿成交；开/平费率取平均，避免把
+        # 完整 round trip 同时扣在单边换仓上，同时保留 fixed fee 影响。
+        fee = 0.5 * (
+            self._round_trip_fee_ratio(near_spec, near_notional)
+            + self._round_trip_fee_ratio(far_spec, far_notional)
+        )
+        return turnover * (slippage + fee)
+
+    @staticmethod
+    def _round_trip_fee_ratio(
+        spec: ContractSpec,
+        notional: float,
+    ) -> float:
+        fee = spec.fee
+        cash = fee.open_fixed + fee.close_fixed
+        cash += notional * (fee.open_rate + fee.close_rate)
+        return cash / max(notional, 1e-9)
+
+    @staticmethod
+    def _same_pair(rows: list[CurveObservation]) -> bool:
+        if not rows:
+            return False
+        pair = (rows[-1].near_symbol, rows[-1].far_symbol)
+        return all(
+            (row.near_symbol, row.far_symbol) == pair
+            for row in rows
+        )
+
+    @staticmethod
+    def _relative_return(
+        rows: list[CurveObservation],
+        samples: int,
+    ) -> float:
+        if len(rows) <= samples:
+            return 0.0
+        start = rows[-samples - 1]
+        end = rows[-1]
+        near_return = end.near_price / start.near_price - 1.0
+        far_return = end.far_price / start.far_price - 1.0
+        return near_return - far_return
+
+    @staticmethod
+    def _relative_daily_changes(
+        rows: list[CurveObservation],
+    ) -> list[float]:
+        result: list[float] = []
+        for previous, current in zip(rows, rows[1:]):
+            near_return = current.near_price / previous.near_price - 1.0
+            far_return = current.far_price / previous.far_price - 1.0
+            result.append(near_return - far_return)
+        return result
+
+    @classmethod
+    def _volatility_percentile(
+        cls,
+        changes: list[float],
+        fast_window: int,
+    ) -> float:
+        if len(changes) < max(fast_window * 3, 10):
+            return 0.5
+        width = max(2, fast_window)
+        rolling: list[float] = []
+        for end in range(width, len(changes) + 1):
+            rolling.append(cls._std(changes[end - width : end]))
+        current = rolling[-1]
+        prior = rolling[:-1]
+        return (
+            sum(value <= current for value in prior) / len(prior)
+            if prior
+            else 0.5
+        )
+
+    @staticmethod
+    def _sign(value: float) -> int:
+        if value > 1e-12:
+            return 1
+        if value < -1e-12:
+            return -1
+        return 0
+
+    @staticmethod
+    def _std(values: list[float]) -> float:
+        if len(values) < 2:
+            return 0.0
+        reference_mean = sum(values) / len(values)
+        return sqrt(
+            sum(
+                (value - reference_mean) ** 2
+                for value in values
+            )
+            / len(values)
+        )
+
+    @staticmethod
+    def _compound(values: list[float]) -> float:
+        equity = 1.0
+        for value in values:
+            equity *= 1.0 + value
+        return equity - 1.0
+
+    @classmethod
+    def _metrics(cls, daily: list[float]) -> dict:
+        if not daily:
+            return {
+                "total_return": 0.0,
+                "annualized_return": 0.0,
+                "max_drawdown": 0.0,
+                "sharpe": 0.0,
+            }
+        total_return = cls._compound(daily)
+        annualized_return = (
+            (1.0 + total_return) ** (252.0 / len(daily)) - 1.0
+            if total_return > -1.0
+            else -1.0
+        )
+        daily_mean = sum(daily) / len(daily)
+        daily_std = cls._std(daily)
+        sharpe = (
+            daily_mean / daily_std * sqrt(252.0)
+            if daily_std > 1e-12
+            else 0.0
+        )
+        equity = 1.0
+        peak = 1.0
+        max_drawdown = 0.0
+        for value in daily:
+            equity *= 1.0 + value
+            peak = max(peak, equity)
+            max_drawdown = min(max_drawdown, equity / peak - 1.0)
+        return {
+            "total_return": total_return,
+            "annualized_return": annualized_return,
+            "max_drawdown": max_drawdown,
+            "sharpe": sharpe,
+        }
+
+    @classmethod
+    def _validate(cls, config: CurveFamilyConfig) -> None:
+        if config.family not in cls.SUPPORTED_FAMILIES:
+            raise ValueError(f"unsupported curve family: {config.family}")
+        if config.fast_window < 2:
+            raise ValueError("fast_window must be at least 2")
+        if config.slow_window < config.fast_window:
+            raise ValueError("slow_window must be >= fast_window")
+        if config.mean_window < 3:
+            raise ValueError("mean_window must be at least 3")
+        if config.rebalance_samples <= 0:
+            raise ValueError("rebalance_samples must be positive")
+        if not 0 <= config.min_volatility_percentile <= 1:
+            raise ValueError(
+                "min_volatility_percentile must be within [0, 1]"
+            )
+        if config.change_severity <= 0:
+            raise ValueError("change_severity must be positive")
+        if not 0 <= config.exit_z < config.entry_z:
+            raise ValueError("curve mean-reversion thresholds are invalid")
