@@ -38,6 +38,7 @@ class AutoPortfolioResearchConfig:
     data_gap_rates: tuple[float, ...] = (0.02, 0.05)
     quote_skew_seconds: tuple[float, ...] = (0.5, 1.0, 2.0)
     activity_missing_rates: tuple[float, ...] = (0.02, 0.05)
+    run_post_analysis: bool = True
 
 
 @dataclass(frozen=True)
@@ -187,14 +188,18 @@ class AutoPortfolioRunner:
             selected_rows.append(parameters)
 
         selected_parameters = selected_rows[-1] if selected_rows else self._parameter_row(self.base.auto)
-        final_config = self._config_with_parameters(selected_parameters)
-        stress_results = {
-            float(multiplier): self._run_portfolio(
-                self._cost_stress(final_config, float(multiplier)), ticks
-            )
-            for multiplier in research.cost_stress_multipliers
-        }
-        robustness = self._robustness(final_config, ticks, folds, research)
+        if research.run_post_analysis:
+            final_config = self._config_with_parameters(selected_parameters)
+            stress_results = {
+                float(multiplier): self._run_portfolio(
+                    self._cost_stress(final_config, float(multiplier)), ticks
+                )
+                for multiplier in research.cost_stress_multipliers
+            }
+            robustness = self._robustness(final_config, ticks, folds, research)
+        else:
+            stress_results = {}
+            robustness = {}
         return AutoPortfolioResearchResult(
             folds=folds,
             selected_parameters=selected_parameters,
