@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from datetime import date
 import json
 from math import prod
@@ -235,11 +235,42 @@ def signal_grid(base: AppConfig) -> tuple[dict, ...]:
     return tuple(rows)
 
 
+def quality_grid(signal_parameters: dict) -> tuple[dict, ...]:
+    """开发集第二阶段：固定 Z-score 结构，只搜索机会质量硬门。"""
+    fixed = {
+        key: signal_parameters[key]
+        for key in ("lookback", "entry_z", "exit_z")
+        if key in signal_parameters
+    }
+    rows = []
+    for min_net_edge in (0.0, 50.0, 100.0):
+        for stationarity in (0.0, 0.005, 0.01):
+            for half_life in (30.0, 60.0, 120.0):
+                rows.append(
+                    {
+                        **fixed,
+                        "min_net_edge": min_net_edge,
+                        "min_stationarity_score": stationarity,
+                        "max_half_life": half_life,
+                        "risk_budget_ratio": 0.004,
+                        "max_pair_volume": 20,
+                    }
+                )
+    return tuple(rows)
+
+
 def risk_grid(signal_parameters: dict) -> tuple[dict, ...]:
     rows = []
     fixed = {
         key: signal_parameters[key]
-        for key in ("lookback", "entry_z", "exit_z", "min_net_edge", "min_stationarity_score", "max_half_life")
+        for key in (
+            "lookback",
+            "entry_z",
+            "exit_z",
+            "min_net_edge",
+            "min_stationarity_score",
+            "max_half_life",
+        )
         if key in signal_parameters
     }
     for ratio in (0.002, 0.004, 0.006, 0.008, 0.010, 0.015, 0.020):
@@ -264,6 +295,17 @@ def oos_summary(folds) -> dict:
     }
 
 
+def _search_stage(runner, ticks, research_window: dict, grid: tuple[dict, ...]):
+    return runner.run(
+        ticks,
+        AutoPortfolioResearchConfig(
+            **research_window,
+            parameter_grid=grid,
+            run_post_analysis=False,
+        ),
+    )
+
+
 def run_research(rows_by_symbol, start: date, end: date) -> dict:
     ticks, specs, catalog, coverage = build_research_inputs(rows_by_symbol, start, end)
     days = sorted({row.trading_day for row in ticks})
@@ -279,44 +321,25 @@ def run_research(rows_by_symbol, start: date, end: date) -> dict:
     runner = AutoPortfolioRunner(config)
     research_window = dict(train_days=160, validation_days=60, oos_days=60, step_days=60)
 
-    # 搜索阶段不重复跑 leave-one/latency/impact 等后分析；它们不参与参数评分。
-    # 这样只减少重复计算，不改变 Train/Validation/OOS 候选或 holdout。
-    baseline_cfg = AutoPortfolioResearchConfig(
-        **research_window,
-        parameter_grid=(
-            {
-                "lookback": config.auto.lookback,
-                "entry_z": config.auto.entry_z,
-                "exit_z": config.auto.exit_z,
-                "min_net_edge": config.auto.min_net_edge,
-                "min_stationarity_score": config.auto.min_stationarity_score,
-                "max_half_life": config.auto.max_half_life,
-                "risk_budget_ratio": config.risk.risk_budget_ratio,
-                "max_pair_volume": config.auto.max_pair_volume,
-            },
-        ),
-        run_post_analysis=False,
+    baseline_grid = (
+        {
+            "lookback": config.auto.lookback,
+            "entry_z": config.auto.entry_z,
+            "exit_z": config.auto.exit_z,
+            "min_net_edge": config.auto.min_net_edge,
+            "min_stationarity_score": config.auto.min_stationarity_score,
+            "max_half_life": config.auto.max_half_life,
+            "risk_budget_ratio": config.risk.risk_budget_ratio,
+            "max_pair_volume": config.auto.max_pair_volume,
+        },
     )
-    baseline = runner.run(dev_ticks, baseline_cfg)
-
-    stage1 = runner.run(
-        dev_ticks,
-        AutoPortfolioResearchConfig(
-            **research_window,
-            parameter_grid=signal_grid(config),
-            run_post_analysis=False,
-        ),
-    )
-    stage2_grid = risk_grid(stage1.selected_parameters)
-    stage2 = runner.run(
-        dev_ticks,
-        AutoPortfolioResearchConfig(
-            **research_window,
-            parameter_grid=stage2_grid,
-            run_post_analysis=False,
-        ),
-    )
-    frozen = runner._config_with_parameters(stage2.selected_parameters)
+    baseline = _search_stage(runner, dev_ticks, research_window, baseline_grid)
+    stage_signal = _search_stage(runner, dev_ticks, research_window, signal_grid(config))
+    stage_quality_grid = quality_grid(stage_signal.selected_parameters)
+    stage_quality = _search_stage(runner, dev_ticks, research_window, stage_quality_grid)
+    stage_risk_grid = risk_grid(stage_quality.selected_parameters)
+    stage_risk = _search_stage(runner, dev_ticks, research_window, stage_risk_grid)
+    frozen = runner._config_with_parameters(stage_risk.selected_parameters)
 
     # 参数冻结后才读取最后的 holdout；以下结果不再反向改变搜索空间。
     baseline_holdout = runner._run_portfolio(config, holdout_ticks)
@@ -325,7 +348,10 @@ def run_research(rows_by_symbol, start: date, end: date) -> dict:
     stress_20 = runner._run_portfolio(runner._cost_stress(frozen, 2.0), holdout_ticks)
     leave_one = {
         product: runner._run_portfolio(
-            runner._with_products(frozen, tuple(item for item in frozen.auto.products if item.lower() != product.lower())),
+            runner._with_products(
+                frozen,
+                tuple(item for item in frozen.auto.products if item.lower() != product.lower()),
+            ),
             holdout_ticks,
         )
         for product in PRODUCTS
@@ -355,7 +381,7 @@ def run_research(rows_by_symbol, start: date, end: date) -> dict:
             "source": "Sina Finance contract daily bars",
             "real_fields": ["open", "high", "low", "close", "volume", "open_interest", "settle"],
             "historical_l1_available": False,
-            "decision_price": "same-day open",
+            "decision_price": "trading-day daily open",
             "activity_information": "previous trading day volume/open_interest",
             "execution_proxy": "bid=open-1 tick, ask=open+1 tick; SimBroker adds slippage; depth is prior-day-volume-derived proxy",
             "coverage": coverage,
@@ -364,7 +390,8 @@ def run_research(rows_by_symbol, start: date, end: date) -> dict:
         },
         "search": {
             "signal_candidates": len(signal_grid(config)),
-            "risk_candidates": len(stage2_grid),
+            "quality_candidates": len(stage_quality_grid),
+            "risk_candidates": len(stage_risk_grid),
             "risk_budget_upper_bound": AutoPortfolioRunner.MAX_RESEARCH_RISK_BUDGET,
             "pair_volume_upper_bound": AutoPortfolioRunner.MAX_RESEARCH_PAIR_VOLUME,
             "holdout_used_for_optimization": False,
@@ -372,8 +399,10 @@ def run_research(rows_by_symbol, start: date, end: date) -> dict:
             "search_exhausted": True,
         },
         "baseline_development_oos": oos_summary(baseline.folds),
-        "tuned_development_oos": oos_summary(stage2.folds),
-        "selected_parameters": stage2.selected_parameters,
+        "signal_development_oos": oos_summary(stage_signal.folds),
+        "quality_development_oos": oos_summary(stage_quality.folds),
+        "tuned_development_oos": oos_summary(stage_risk.folds),
+        "selected_parameters": stage_risk.selected_parameters,
         "baseline_holdout": baseline_holdout,
         "tuned_holdout": tuned_holdout,
         "holdout_cost_stress": {"1.5": stress_15, "2.0": stress_20},
