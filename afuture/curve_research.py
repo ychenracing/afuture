@@ -33,13 +33,15 @@ class CurveFamilyConfig:
 
 @dataclass(frozen=True)
 class CurveObservation:
-    """某交易日真实可见的近月/次近月角色价格。"""
+    """某交易日真实可见的近月/次近月角色价格与连续角色指数。"""
 
     trading_day: str
     near_symbol: str
     far_symbol: str
     near_price: float
     far_price: float
+    near_role_index: float | None = None
+    far_role_index: float | None = None
 
 
 class CurveFamilyResearch:
@@ -184,10 +186,23 @@ class CurveFamilyResearch:
         ) + 1
         start = max(0, index - required + 1)
         window = observations[start : index + 1]
-        if not self._same_pair(window):
+
+        # 长周期 momentum 研究的是连续 F1/F2 角色收益，允许跨实际合约换月；
+        # 均值回归和短期 reversal 仍要求同一实际 pair，避免把角色指数误当价差。
+        role_adjusted = (
+            config.family in {
+                "basis_momentum",
+                "slow_momentum_fast_reversion",
+            }
+            and self._has_role_indices(window)
+        )
+        if not role_adjusted and not self._same_pair(window):
             return 0
 
-        relative_changes = self._relative_daily_changes(window)
+        relative_changes = self._relative_daily_changes(
+            window,
+            role_adjusted=role_adjusted,
+        )
         volatility_percentile = self._volatility_percentile(
             relative_changes,
             config.fast_window,
@@ -203,16 +218,28 @@ class CurveFamilyResearch:
             return -self._sign(relative)
 
         if config.family == "basis_momentum":
-            # Boons 2019 的 basis momentum 用 F1/F2 长期收益差；这里仅研究其
-            # spread-neutral 方向版本，不复制原论文的 outright 横截面仓位。
-            relative = self._relative_return(window, config.slow_window)
+            # Boons 2019 的 basis momentum 用连续 F1/F2 角色指数的长期收益差；
+            # 这里只研究 spread-neutral 方向版本，不复制原论文的 outright 横截面仓位。
+            relative = self._relative_return(
+                window,
+                config.slow_window,
+                role_adjusted=role_adjusted,
+            )
             return self._sign(relative)
 
         if config.family == "slow_momentum_fast_reversion":
             # 对 Wood et al. 的轻量代理：正常时跟随慢相对趋势；近期出现与慢趋势
             # 相反且足够大的局部断点时，暂时切换到快速方向，下一次再由慢趋势接管。
-            slow = self._relative_return(window, config.slow_window)
-            fast = self._relative_return(window, config.fast_window)
+            slow = self._relative_return(
+                window,
+                config.slow_window,
+                role_adjusted=role_adjusted,
+            )
+            fast = self._relative_return(
+                window,
+                config.fast_window,
+                role_adjusted=role_adjusted,
+            )
             recent = relative_changes[-max(config.fast_window * 4, 10) :]
             sigma = self._std(recent)
             severity = abs(fast) / max(
@@ -258,7 +285,7 @@ class CurveFamilyResearch:
         self,
         ticks: list[Tick],
     ) -> dict[str, list[CurveObservation]]:
-        """按历史 listing/expiry 和当日真实出现合约重建 F1/F2。"""
+        """按历史 listing/expiry 和当日真实出现合约重建 F1/F2 及连续角色指数。"""
         by_day: dict[str, dict[str, Tick]] = {}
         for tick in ticks:
             current = by_day.setdefault(tick.trading_day, {})
@@ -274,6 +301,11 @@ class CurveFamilyResearch:
         result: dict[str, list[CurveObservation]] = {
             product: [] for product in catalog_by_product
         }
+        role_levels: dict[str, list[float]] = {
+            product: [1.0, 1.0] for product in catalog_by_product
+        }
+        previous_observed: dict[str, Tick] = {}
+        previous_trading_day: str | None = None
 
         for trading_day in sorted(by_day):
             day = date(
@@ -306,6 +338,22 @@ class CurveFamilyResearch:
                     continue
                 near = observed[eligible[0][1].symbol]
                 far = observed[eligible[1][1].symbol]
+
+                levels = role_levels[product]
+                previous_row = result[product][-1] if result[product] else None
+                contiguous = (
+                    previous_row is not None
+                    and previous_trading_day is not None
+                    and previous_row.trading_day == previous_trading_day
+                )
+                if contiguous:
+                    previous_near = previous_observed.get(near.symbol)
+                    previous_far = previous_observed.get(far.symbol)
+                    if previous_near is not None and previous_near.mid_price > 0:
+                        levels[0] *= near.mid_price / previous_near.mid_price
+                    if previous_far is not None and previous_far.mid_price > 0:
+                        levels[1] *= far.mid_price / previous_far.mid_price
+
                 result[product].append(
                     CurveObservation(
                         trading_day=trading_day,
@@ -313,8 +361,12 @@ class CurveFamilyResearch:
                         far_symbol=far.symbol,
                         near_price=near.mid_price,
                         far_price=far.mid_price,
+                        near_role_index=levels[0],
+                        far_role_index=levels[1],
                     )
                 )
+            previous_observed = observed
+            previous_trading_day = trading_day
         return result
 
     def _transaction_cost(
@@ -364,26 +416,66 @@ class CurveFamilyResearch:
         )
 
     @staticmethod
+    def _has_role_indices(rows: list[CurveObservation]) -> bool:
+        return bool(rows) and all(
+            row.near_role_index is not None
+            and row.far_role_index is not None
+            and row.near_role_index > 0
+            and row.far_role_index > 0
+            for row in rows
+        )
+
+    @staticmethod
+    def _prices(
+        row: CurveObservation,
+        *,
+        role_adjusted: bool,
+    ) -> tuple[float, float]:
+        if (
+            role_adjusted
+            and row.near_role_index is not None
+            and row.far_role_index is not None
+        ):
+            return float(row.near_role_index), float(row.far_role_index)
+        return float(row.near_price), float(row.far_price)
+
+    @classmethod
     def _relative_return(
+        cls,
         rows: list[CurveObservation],
         samples: int,
+        *,
+        role_adjusted: bool = False,
     ) -> float:
         if len(rows) <= samples:
             return 0.0
         start = rows[-samples - 1]
         end = rows[-1]
-        near_return = end.near_price / start.near_price - 1.0
-        far_return = end.far_price / start.far_price - 1.0
+        start_near, start_far = cls._prices(start, role_adjusted=role_adjusted)
+        end_near, end_far = cls._prices(end, role_adjusted=role_adjusted)
+        near_return = end_near / start_near - 1.0
+        far_return = end_far / start_far - 1.0
         return near_return - far_return
 
-    @staticmethod
+    @classmethod
     def _relative_daily_changes(
+        cls,
         rows: list[CurveObservation],
+        *,
+        role_adjusted: bool = False,
     ) -> list[float]:
         result: list[float] = []
         for previous, current in zip(rows, rows[1:]):
-            near_return = current.near_price / previous.near_price - 1.0
-            far_return = current.far_price / previous.far_price - 1.0
+            previous_near, previous_far = cls._prices(
+                previous,
+                role_adjusted=role_adjusted,
+            )
+            current_near, current_far = cls._prices(
+                current,
+                role_adjusted=role_adjusted,
+            )
+            near_return = current_near / previous_near - 1.0
+            far_return = current_far / previous_far - 1.0
             result.append(near_return - far_return)
         return result
 
