@@ -44,3 +44,23 @@ def test_market_session_uses_asia_shanghai_for_utc_ticks():
         specs,
     )
     assert decision.allowed, decision.reason
+
+
+def test_expiry_blackout_uses_asia_shanghai_calendar_date():
+    # 16:30 UTC on Aug 21 is already Aug 22 in Shanghai. With a zero-day
+    # blackout, a contract expiring Aug 22 must already reject new risk.
+    timestamp = datetime(2026, 8, 21, 16, 30, tzinfo=timezone.utc)
+    pair = PairConfig(
+        "p",
+        "N",
+        "F",
+        "DCE",
+        1,
+        expiry_near="2026-08-22",
+        expiry_far="2026-09-22",
+    )
+    decision = RiskManager(
+        RiskConfig(expiry_blackout_days=0)
+    ).check_pair_calendar(pair, timestamp, opening=True)
+    assert not decision.allowed
+    assert "expiry blackout" in decision.reason
