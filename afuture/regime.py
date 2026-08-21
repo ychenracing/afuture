@@ -15,6 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import log, sqrt
 
+from .models import SignalAction
+
 
 _MAX_Z = 12.0
 
@@ -37,6 +39,20 @@ class EntryRegimeMetrics:
     def supports_long(self) -> bool:
         """近月相对远月偏便宜时，归一化 carry 支持做多价差。"""
         return self.carry_z < 0
+
+
+def carry_direction_strength(
+    action: SignalAction,
+    metrics: EntryRegimeMetrics,
+) -> float:
+    """返回 [0, 1] 的方向一致 carry 强度；冲突方向绝不获得排名奖励。"""
+    if action is SignalAction.SHORT_SPREAD:
+        aligned = metrics.carry_z if metrics.supports_short else 0.0
+    elif action is SignalAction.LONG_SPREAD:
+        aligned = -metrics.carry_z if metrics.supports_long else 0.0
+    else:
+        return 0.0
+    return min(max(float(aligned), 0.0), 3.0) / 3.0
 
 
 def evaluate_entry_regime(
