@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from time import monotonic
 
 from .economics import estimate_net_edge
 from .models import (
@@ -99,10 +98,14 @@ class PairExecutor:
                 )
             volume = max(request.volume for request in requests)
 
-        # 两腿属于同一批交易意图，必须使用同一个限速时钟值。实盘默认用本地
-        # monotonic；历史回放由 Engine 显式传入事件时间，避免数月订单被 CPU
-        # 几秒内的回放错误压缩成“同一分钟报单”。
-        limiter_now = monotonic() if rate_limit_time is None else float(rate_limit_time)
+        # 两腿属于同一批交易意图，必须使用同一个限速时钟值。信号时间来自已经
+        # 通过行情时效/双腿同步校验的市场事件：历史回放因此不会把数月订单压缩
+        # 到 CPU 的几秒钟；实盘若行情时间戳陈旧或跳变，则上游健康门会先失败关闭。
+        limiter_now = (
+            signal.timestamp.timestamp()
+            if rate_limit_time is None
+            else float(rate_limit_time)
+        )
         requests = self._prioritize_requests(requests, near, far)
         order_ids: list[str] = []
         try:
