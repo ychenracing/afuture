@@ -14,7 +14,11 @@ from typing import Iterable
 
 from .auto_runtime import MetadataPrefetcher
 from .models import ContractInfo, ContractSpec, PairConfig, SignalAction, Tick
-from .regime import evaluate_entry_regime, normalized_curve_carry
+from .regime import (
+    carry_direction_strength,
+    evaluate_entry_regime,
+    normalized_curve_carry,
+)
 from .sample_store import MarketSampleStore
 from .scanner import SpreadScanner
 
@@ -398,7 +402,10 @@ class AutoPairManager:
                 self._record_candidate(pair, near, far, statistics, None, "half-life above maximum")
                 continue
 
-            spreads = [row_near.mid_price - row_far.mid_price for row_near, row_far in synchronized]
+            spreads = [
+                row_near.mid_price - row_far.mid_price
+                for row_near, row_far in synchronized
+            ]
             carries = normalized_curve_carry(
                 [row_near.mid_price for row_near, _row_far in synchronized],
                 [row_far.mid_price for _row_near, row_far in synchronized],
@@ -439,15 +446,21 @@ class AutoPairManager:
             if candidate.net_edge <= self.config.min_net_edge:
                 self._record_candidate(pair, near, far, statistics, candidate, "net edge below minimum")
                 continue
-            score = candidate.score
-            if self.config.carry_reversal_weight > 0:
-                carry_strength = min(abs(regime.carry_z), 3.0) / 3.0
-                score *= 1.0 + self.config.carry_reversal_weight * carry_strength
+            score = self._score_with_carry(candidate.score, action, regime)
             self.last_eligible_ids.add(pair.pair_id)
             scored.append((pair, score))
             self._record_candidate(pair, near, far, statistics, candidate, "")
 
         return self.rank_candidates(scored, protected_pair_ids=protected_pair_ids)
+
+    def _score_with_carry(self, base_score: float, action: SignalAction, regime) -> float:
+        """只奖励与实际可成交开仓方向一致的归一化曲线反转证据。"""
+        if self.config.carry_reversal_weight <= 0:
+            return float(base_score)
+        strength = carry_direction_strength(action, regime)
+        return float(base_score) * (
+            1.0 + self.config.carry_reversal_weight * strength
+        )
 
     def rank_candidates(
         self,
@@ -494,7 +507,10 @@ class AutoPairManager:
             history = history[-pair.lookback :]
         last_ts = ""
         if historical:
-            last_ts = max(historical[-1][0].timestamp, historical[-1][1].timestamp).isoformat()
+            last_ts = max(
+                historical[-1][0].timestamp,
+                historical[-1][1].timestamp,
+            ).isoformat()
         return {
             "history": history,
             "position": 0,
