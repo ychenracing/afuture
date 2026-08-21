@@ -12,7 +12,9 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Iterable
 
+from .auto_runtime import MetadataPrefetcher
 from .models import ContractInfo, ContractSpec, PairConfig, Tick
+from .sample_store import MarketSampleStore
 from .scanner import SpreadScanner
 
 
@@ -155,9 +157,15 @@ class AutoPairSelector:
 
 
 class AutoPairManager:
-    """维护自动候选的行情历史、评分缓存和激活集合。"""
+    """维护自动候选、有限 warm history 和非阻塞元数据缓存。"""
 
-    def __init__(self, config: AutoConfig) -> None:
+    def __init__(
+        self,
+        config: AutoConfig,
+        *,
+        sample_store: MarketSampleStore | None = None,
+        metadata_prefetcher: MetadataPrefetcher | None = None,
+    ) -> None:
         config.validate()
         self.config = config
         self.selector = AutoPairSelector(config)
@@ -174,10 +182,15 @@ class AutoPairManager:
         self._last_scan: datetime | None = None
         self._catalog_day: date | None = None
         self.last_eligible_ids: set[str] = set()
+        self.sample_store = sample_store
+        self.metadata = metadata_prefetcher or MetadataPrefetcher(config.metadata_timeout_seconds)
 
     @property
     def initialized(self) -> bool:
         return self._initialized
+
+    def close(self) -> None:
+        self.metadata.close()
 
     def prepare_catalog(
         self, catalog: Iterable[ContractInfo], today: date
@@ -188,7 +201,12 @@ class AutoPairManager:
         max_history = max(self.config.lookback * 4, self.config.lookback + 8)
         for pair in self.candidate_pairs:
             for symbol in (pair.near_symbol, pair.far_symbol):
-                self._history.setdefault(symbol, deque(maxlen=max_history))
+                if symbol not in self._history:
+                    history = deque(maxlen=max_history)
+                    if self.sample_store is not None:
+                        for row in self.sample_store.load(symbol)[-max_history:]:
+                            history.append(row)
+                    self._history[symbol] = history
         return list(self.candidate_pairs)
 
     def bootstrap(
@@ -240,11 +258,11 @@ class AutoPairManager:
         *,
         retained_pairs: Iterable[PairConfig] = (),
     ) -> bool:
-        """交易日变化时重新应用到期过滤并订阅新进入前排的合约。"""
+        """交易日变化时重新应用到期过滤并使前一日元数据缓存失效。"""
         if self._catalog_day == today:
             return False
-        # 保证金/手续费可能跨交易日调整，不能把前一交易日的 CTP 查询结果永久缓存。
         self._specs.clear()
+        self.metadata.invalidate()
         catalog = broker.get_contract_catalog()
         if not catalog:
             raise RuntimeError("auto discovery contract catalog is empty")
@@ -263,7 +281,12 @@ class AutoPairManager:
             for symbol in (pair.near_symbol, pair.far_symbol)
         }
         for symbol in symbols:
-            self._history.setdefault(symbol, deque(maxlen=max_history))
+            if symbol not in self._history:
+                history = deque(maxlen=max_history)
+                if self.sample_store is not None:
+                    for row in self.sample_store.load(symbol)[-max_history:]:
+                        history.append(row)
+                self._history[symbol] = history
             pair = next(
                 item
                 for item in self.candidate_pairs
@@ -275,24 +298,27 @@ class AutoPairManager:
         return True
 
     def observe(self, tick: Tick) -> None:
-        """按策略采样周期保留行情，避免高频原始 Tick 挤掉统计时间窗口。"""
+        """按策略采样周期保留行情，并仅持久化有限 warm history。"""
         history = self._history.get(tick.symbol)
         if history is None:
             return
         sample_seconds = self.config.sample_seconds
+        persisted = False
         if sample_seconds <= 0 or not history:
             history.append(tick)
-            return
-
-        current_bucket = int(tick.timestamp.timestamp() // sample_seconds)
-        last_bucket = int(history[-1].timestamp.timestamp() // sample_seconds)
-        if current_bucket < last_bucket:
-            # CTP 偶发乱序回报不应倒退统计窗口。
-            return
-        if current_bucket == last_bucket:
-            history[-1] = tick
-            return
-        history.append(tick)
+            persisted = True
+        else:
+            current_bucket = int(tick.timestamp.timestamp() // sample_seconds)
+            last_bucket = int(history[-1].timestamp.timestamp() // sample_seconds)
+            if current_bucket < last_bucket:
+                return
+            if current_bucket == last_bucket:
+                history[-1] = tick
+            else:
+                history.append(tick)
+                persisted = True
+        if persisted and self.sample_store is not None:
+            self.sample_store.save(tick.symbol, list(history))
 
     def should_scan(self, now: datetime) -> bool:
         if self._last_scan is None:
@@ -306,7 +332,7 @@ class AutoPairManager:
         now: datetime,
         protected_pair_ids: set[str],
     ) -> list[PairConfig] | None:
-        """按硬门筛选并排序；已有持仓组合优先占用名额，避免为轮换强平。"""
+        """按硬门筛选并排序；已有持仓仅保留管理权，不自动获得新开仓资格。"""
         if not self._initialized or not self.should_scan(now):
             return None
         self._last_scan = now
@@ -336,8 +362,10 @@ class AutoPairManager:
             if statistics.half_life > self.config.max_half_life:
                 continue
 
-            # 只有纯行情统计和可成交阈值都接近开仓时才查询 CTP 保证金/手续费，减少流控和阻塞。
-            pair_specs = self._ensure_specs(broker, pair)
+            pair_specs = self._prefetched_specs(broker, pair)
+            if pair_specs is None:
+                # 首次接近开仓只安排后台查询；当前 Tick 绝不等待 CTP 元数据。
+                continue
             candidate = self.scanner.scan_pair(pair, ticks, pair_specs)
             if candidate is None:
                 continue
@@ -359,6 +387,7 @@ class AutoPairManager:
         selected: list[PairConfig] = []
         product_counts: dict[str, int] = defaultdict(int)
 
+        # 已持仓组合优先保留“管理权”；是否还能新开仓由 last_eligible_ids 单独决定。
         for pair_id in sorted(protected_pair_ids):
             pair = self._pairs.get(pair_id)
             if pair is None or len(selected) >= self.config.max_active_pairs:
@@ -389,8 +418,6 @@ class AutoPairManager:
             self._history.get(pair.far_symbol, ())
         )
         synchronized = self.scanner.synchronized_ticks(pair, ticks)
-        # 最后一组是触发本轮候选评分的当前行情，不能提前写进历史均值，
-        # 否则会把当前极端偏离“稀释”掉，导致激活后策略与 Scanner 判断不一致。
         historical = synchronized[:-1]
         history = [near.mid_price - far.mid_price for near, far in historical]
         if len(history) > pair.lookback:
@@ -406,9 +433,25 @@ class AutoPairManager:
             "last_sample_ts": last_ts,
         }
 
+    def _prefetched_specs(
+        self, broker, pair: PairConfig
+    ) -> dict[str, ContractSpec] | None:
+        symbols = (pair.near_symbol, pair.far_symbol)
+        if all(symbol in self._specs for symbol in symbols):
+            return self.pair_specs(pair)
+        rows = self.metadata.get(symbols)
+        if rows is None:
+            ready = self.metadata.request(broker, symbols)
+            rows = self.metadata.get(symbols) if ready else None
+        if rows is None:
+            return None
+        self._specs.update(rows)
+        return self.pair_specs(pair)
+
     def _ensure_specs(
         self, broker, pair: PairConfig
     ) -> dict[str, ContractSpec]:
+        """启动恢复路径允许等待；Tick 关键路径使用 _prefetched_specs。"""
         missing = [
             symbol
             for symbol in (pair.near_symbol, pair.far_symbol)
