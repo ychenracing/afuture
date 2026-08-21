@@ -1,7 +1,7 @@
 """命令行入口。
 
 实盘相关命令默认采用 fail-closed：柜台、完整账户/持仓快照、元数据和持仓对账
-任一安全门未通过，都不会进入正常交易循环。
+任一安全门未通过，都不会进入正常交易循环。Shadow 连接真实 CTP，但订单永远只进入本地模拟柜台。
 """
 
 from __future__ import annotations
@@ -84,6 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
     quality = sub.add_parser("quality-report", help="汇总真实/Shadow 执行质量证据")
     quality.add_argument("--config", required=True)
     quality.add_argument("--output", default="")
+    quality.add_argument("--shadow", action="store_true", help="汇总 Shadow 而非真实交易证据")
 
     live = sub.add_parser("live", help="连接 CTP 柜台并真实交易")
     live.add_argument("--config", required=True)
@@ -376,21 +377,24 @@ def _runtime_path(config, name: str) -> Path:
     return Path(config.state_path).parent / name
 
 
-def _quality_recorder(config) -> ExecutionQualityRecorder:
-    return ExecutionQualityRecorder(_runtime_path(config, "execution_quality.jsonl"))
+def _quality_recorder(config, *, shadow: bool = False) -> ExecutionQualityRecorder:
+    name = "shadow_execution_quality.jsonl" if shadow else "execution_quality.jsonl"
+    return ExecutionQualityRecorder(_runtime_path(config, name))
 
 
-def _auto_manager(config):
+def _auto_manager(config, *, evidence=None, shadow: bool = False):
     from .auto import AutoPairManager
 
     if not config.auto.enabled:
         return None
     max_samples = max(config.auto.lookback * 4, config.auto.lookback + 8)
+    sample_dir = "shadow_market_samples" if shadow else "market_samples"
     return AutoPairManager(
         config.auto,
         sample_store=MarketSampleStore(
-            _runtime_path(config, "market_samples"), max_samples=max_samples
+            _runtime_path(config, sample_dir), max_samples=max_samples
         ),
+        evidence_recorder=evidence,
     )
 
 
@@ -403,6 +407,7 @@ def _run_live(config, args, logger) -> int:
     from .risk import RiskManager
 
     broker = CtpBroker(config.ctp)
+    quality = _quality_recorder(config)
     engine = TradingEngine(
         broker,
         config.pairs,
@@ -415,8 +420,8 @@ def _run_live(config, args, logger) -> int:
         legging_timeout_seconds=config.legging_timeout_seconds,
         journal=AuditJournal(config.journal_path),
         alert_manager=_build_alert_manager(config),
-        auto_manager=_auto_manager(config),
-        quality_recorder=_quality_recorder(config),
+        auto_manager=_auto_manager(config, evidence=quality),
+        quality_recorder=quality,
         require_live_metadata=config.require_live_metadata,
         metadata_timeout_seconds=config.metadata_timeout_seconds,
     )
@@ -505,20 +510,25 @@ def _run_shadow(config, args, logger) -> int:
         market_impact_ticks=max(1, config.market_impact_ticks),
     )
     broker.update_specs(config.contracts)
+    quality = _quality_recorder(config, shadow=True)
+    shadow_state = _runtime_path(config, "shadow_state.json")
+    # Shadow 的 SimBroker 不代表真实持仓；每次观察会话都从空虚拟账户开始。
+    if shadow_state.exists():
+        shadow_state.unlink()
     engine = TradingEngine(
         broker,
         config.pairs,
         config.contracts,
         RiskManager(config.risk),
-        StateStore(_runtime_path(config, "shadow_state.json")),
+        StateStore(shadow_state),
         auto_flatten_imbalance=config.auto_flatten_imbalance,
         aggressive_ticks=config.aggressive_ticks,
         slippage_ticks=config.slippage_ticks,
         legging_timeout_seconds=config.legging_timeout_seconds,
         journal=AuditJournal(_runtime_path(config, "shadow_audit.jsonl")),
         alert_manager=_build_alert_manager(config),
-        auto_manager=_auto_manager(config),
-        quality_recorder=_quality_recorder(config),
+        auto_manager=_auto_manager(config, evidence=quality, shadow=True),
+        quality_recorder=quality,
         require_live_metadata=config.require_live_metadata,
         metadata_timeout_seconds=config.metadata_timeout_seconds,
     )
@@ -716,7 +726,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "data-check":
         from .data_quality import DataQualityAnalyzer
 
-        ticks = read_ticks(args.data)
+        # 保留源文件顺序，才能发现数据供应链中的真实乱序；研究/回放仍按时间排序。
+        ticks = read_ticks(args.data, sort_rows=False)
         result = DataQualityAnalyzer(args.max_gap_seconds).analyze(
             ticks, config.contract_catalog, config.auto
         )
@@ -725,9 +736,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result.passed else 2
 
     if args.command == "quality-report":
-        recorder = _quality_recorder(config)
+        recorder = _quality_recorder(config, shadow=args.shadow)
         payload = recorder.summary()
-        output = args.output or _runtime_path(config, "execution_quality_report.json")
+        default_name = "shadow_execution_quality_report.json" if args.shadow else "execution_quality_report.json"
+        output = args.output or _runtime_path(config, default_name)
         _write_json(payload, output)
         return 0
 
