@@ -60,7 +60,7 @@ def test_daily_bar_conversion_marks_execution_proxy():
     assert result.ticks[0].ask_price == pytest.approx(3011)
 
 
-def test_research_parameter_application_supports_bounded_risk_scaling():
+def _research_runner():
     from dataclasses import replace
     from afuture.auto import AutoConfig
     from afuture.auto_research import AutoPortfolioRunner
@@ -77,10 +77,29 @@ def test_research_parameter_application_supports_bounded_risk_scaling():
         auto=replace(AutoConfig(), enabled=True, products=("m",)),
         contract_catalog=[],
     )
-    runner = AutoPortfolioRunner(base)
+    return AutoPortfolioRunner(base)
+
+
+def test_research_parameter_application_supports_bounded_risk_scaling():
+    runner = _research_runner()
     tuned = runner._config_with_parameters({"risk_budget_ratio": 0.01, "max_pair_volume": 8})
     assert tuned.risk.risk_budget_ratio == pytest.approx(0.01)
     assert tuned.risk.max_total_drawdown_ratio == pytest.approx(0.08)
     assert tuned.auto.max_pair_volume == 8
     with pytest.raises(ValueError):
         runner._config_with_parameters({"risk_budget_ratio": 0.09})
+
+
+def test_research_candidate_rejects_halt_open_positions_and_drawdown_limit():
+    runner = _research_runner()
+    safe = {
+        "total_return": 0.10,
+        "max_drawdown": -0.04,
+        "sharpe": 1.2,
+        "final_position_count": 0,
+        "halted": False,
+    }
+    assert runner._metrics_acceptable(safe)
+    assert not runner._metrics_acceptable({**safe, "halted": True})
+    assert not runner._metrics_acceptable({**safe, "final_position_count": 1})
+    assert not runner._metrics_acceptable({**safe, "max_drawdown": -0.08})
