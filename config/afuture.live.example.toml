@@ -21,7 +21,7 @@ min_days_to_expiry = 20
 scan_interval_seconds = 30
 max_sync_seconds = 2.0
 
-# 动态组合统一使用的策略模板。
+# 动态组合统一使用的策略模板；实时原始 Tick 会先按 sample_seconds 桶化再进入统计窗口。
 lookback = 60
 entry_z = 2.0
 exit_z = 0.5
@@ -33,7 +33,7 @@ structural_mean_shift_z = 3.0
 structural_vol_ratio = 2.5
 legging_buffer = 50
 
-# 自动候选硬门。必须同时满足活动度、流动性、均值回归和 Net Edge。
+# 自动候选硬门。必须同时满足活动度、流动性、均值回归、可成交阈值和 Net Edge。
 min_volume = 5000
 min_open_interest = 10000
 min_liquidity_score = 0.5
@@ -53,6 +53,8 @@ max_total_drawdown_ratio = 0.08
 max_open_pairs = 2
 max_contract_volume = 5
 max_quote_age_seconds = 10
+# 两腿行情即使各自未过期，彼此时间戳差距过大也拒绝交易，避免伪价差信号。
+max_leg_skew_seconds = 2.0
 expiry_blackout_days = 5
 min_available_ratio = 0.55
 margin_estimate_buffer = 1.25
@@ -70,6 +72,7 @@ slippage_ticks = 1
 aggressive_ticks = 1
 auto_flatten_imbalance = true
 legging_timeout_seconds = 2.0
+# 正常双腿报单会先提交当前可成交深度更薄的一腿，把更深的一腿留作第二腿对冲。
 # 实盘不使用以下模拟撮合参数；保留显式值便于同一份配置复制到研究环境。
 conservative_simulation = true
 latency_ticks = 1
