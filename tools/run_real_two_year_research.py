@@ -304,6 +304,7 @@ def _search_stage(runner, ticks, research_window: dict, grid: tuple[dict, ...]):
         AutoPortfolioResearchConfig(
             **research_window,
             parameter_grid=grid,
+            min_selection_trades=1,
             run_post_analysis=False,
         ),
     )
@@ -342,6 +343,7 @@ def run_research(rows_by_symbol, start: date, end: date) -> dict:
     stage_quality = _search_stage(runner, dev_ticks, research_window, stage_quality_grid)
     stage_risk_grid = risk_grid(stage_quality.selected_parameters)
     stage_risk = _search_stage(runner, dev_ticks, research_window, stage_risk_grid)
+    selection_valid = bool(stage_signal.folds and stage_quality.folds and stage_risk.folds)
     frozen = runner._config_with_parameters(stage_risk.selected_parameters)
 
     # 参数冻结后才读取最后的 holdout；以下结果不再反向改变搜索空间。
@@ -363,11 +365,16 @@ def run_research(rows_by_symbol, start: date, end: date) -> dict:
     annualized = float(tuned_holdout.get("annualized_return", 0.0))
     drawdown = abs(float(tuned_holdout.get("max_drawdown", 0.0)))
     target_met = bool(
-        annualized >= 1.0
+        selection_valid
+        and annualized >= 1.0
         and drawdown <= 0.08
         and not bool(tuned_holdout.get("halted", False))
-        and float(stress_20.get("total_return", 0.0)) >= -0.02
+        and bool(tuned_holdout.get("terminal_liquidation_success", False))
         and int(tuned_holdout.get("final_position_count", 0)) == 0
+        and float(stress_20.get("total_return", 0.0)) >= -0.02
+        and not bool(stress_20.get("halted", False))
+        and bool(stress_20.get("terminal_liquidation_success", False))
+        and int(stress_20.get("final_position_count", 0)) == 0
     )
 
     return {
@@ -395,11 +402,13 @@ def run_research(rows_by_symbol, start: date, end: date) -> dict:
             "signal_candidates": len(signal_grid(config)),
             "quality_candidates": len(stage_quality_grid),
             "risk_candidates": len(stage_risk_grid),
+            "min_selection_trades": 1,
             "risk_budget_upper_bound": AutoPortfolioRunner.MAX_RESEARCH_RISK_BUDGET,
             "pair_volume_upper_bound": AutoPortfolioRunner.MAX_RESEARCH_PAIR_VOLUME,
             "holdout_used_for_optimization": False,
             "same_bar_close_lookahead": False,
             "historical_listing_filter": True,
+            "selection_valid": selection_valid,
             "search_exhausted": True,
         },
         "baseline_development_oos": oos_summary(baseline.folds),
