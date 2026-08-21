@@ -98,6 +98,7 @@ class PairConfig:
     """同品种跨期套利组合配置。
 
     ``volume`` 是允许的最大手数；实际开仓手数由风险预算、波动和流动性共同决定。
+    相对价值扩展默认关闭，因此旧配置继续使用绝对价差和原有入场逻辑。
     """
     pair_id: str
     near_symbol: str
@@ -118,6 +119,15 @@ class PairConfig:
     legging_buffer: float = 0.0
     risk_group: str = ""
     session_windows: tuple[str, ...] = ()
+    signal_transform: str = "spread"
+    confirm_entry: bool = False
+    confirmation_retrace_z: float = 0.0
+    min_confirmed_entry_z: float = 0.0
+    entry_trend_window: int = 6
+    max_entry_z_slope: float = 999.0
+    min_stationarity_score: float = 0.0
+    max_half_life: float = 999.0
+    daily_sample_window: str = ""
 
 
 @dataclass(frozen=True)
