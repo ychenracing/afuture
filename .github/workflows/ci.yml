@@ -20,6 +20,7 @@ jobs:
       - run: python -m pytest -q
       - run: python -m compileall -q afuture
       - run: afuture validate --config config/afuture.example.toml
+
       - run: afuture replay --config config/afuture.example.toml --data examples/sample_ticks.csv
       - name: 验证样例回放闭环
         run: |
@@ -30,6 +31,7 @@ jobs:
           assert report["positions"] == []
           assert report["account"]["margin"] == 0
           PY
+
       - run: afuture validate --config config/afuture.auto-replay.example.toml
       - run: afuture replay --config config/afuture.auto-replay.example.toml --data examples/auto_sample_ticks.csv
       - name: 验证自动发现回放闭环
@@ -41,6 +43,7 @@ jobs:
           assert report["positions"] == []
           assert report["account"]["margin"] == 0
           PY
+
       - run: afuture scan --config config/afuture.example.toml --data examples/research_ticks.csv
       - run: >-
           afuture accept
@@ -52,3 +55,63 @@ jobs:
           --oos-days 2
           --step-days 2
           --stress-multipliers 1.0,1.5,2.0
+
+      - name: 验证 Auto 研究数据质量
+        run: >-
+          afuture data-check
+          --config config/afuture.auto-replay.example.toml
+          --data examples/research_ticks.csv
+          --output runtime/data_quality.json
+
+      - name: 执行最终 Auto Portfolio Walk-forward/OOS/Stress
+        shell: bash
+        run: |
+          set +e
+          afuture accept-auto \
+            --config config/afuture.auto-replay.example.toml \
+            --data examples/research_ticks.csv \
+            --train-days 4 \
+            --validation-days 2 \
+            --oos-days 2 \
+            --step-days 2 \
+            --stress-multipliers 1.0,1.5,2.0 \
+            --output runtime/auto_acceptance.json
+          code=$?
+          set -e
+          # 示例数据只验证研究器本身；0=晋级，2=被预注册经济门拒绝，两者都不是工程失败。
+          if [ "$code" -ne 0 ] && [ "$code" -ne 2 ]; then
+            exit "$code"
+          fi
+          python - <<'PY'
+          import json
+          report = json.load(open("runtime/auto_acceptance.json", encoding="utf-8"))
+          assert report["folds"]
+          assert set(report["stress_results"]) == {"1.0", "1.5", "2.0"}
+          for key in (
+              "leave_one_product_out",
+              "single_product",
+              "remove_best_period",
+              "depth_haircut",
+              "latency",
+              "market_impact",
+              "data_gap",
+              "quote_skew",
+              "activity_missing",
+          ):
+              assert key in report["robustness"]
+          assert "aggregate_oos_return" in report["gate_metrics"]
+          PY
+
+      - name: 验证执行质量报告入口
+        run: |
+          afuture quality-report \
+            --config config/afuture.auto-replay.example.toml \
+            --output runtime/execution_quality_report.json
+          python - <<'PY'
+          import json
+          report = json.load(open("runtime/execution_quality_report.json", encoding="utf-8"))
+          assert "round_trips" in report
+          assert "p95_slippage" in report
+          PY
+
+      - run: python -m afuture --help
