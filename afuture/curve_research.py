@@ -123,7 +123,11 @@ class CurveFamilyResearch:
         config: CurveFamilyConfig,
         allowed_days: set[str] | None,
     ) -> tuple[dict[str, float], int]:
-        """按日先结算旧仓，再用当前信息决定下一持有区间。"""
+        """按日先结算旧仓，再用当前信息决定下一持有区间。
+
+        研究边界、F1/F2 换月和样本结束都必须显式关闭已有仓位并扣成本；不能用
+        ``position = 0`` 免费丢弃真实交易中必须发生的退出。
+        """
         returns: dict[str, float] = {}
         position = 0
         trades = 0
@@ -132,16 +136,42 @@ class CurveFamilyResearch:
         for index in range(1, len(observations)):
             previous = observations[index - 1]
             current = observations[index]
-            if allowed_days is not None and current.trading_day not in allowed_days:
+            previous_allowed = (
+                allowed_days is None or previous.trading_day in allowed_days
+            )
+            current_allowed = (
+                allowed_days is None or current.trading_day in allowed_days
+            )
+
+            if not current_allowed:
+                if position != 0 and previous_allowed:
+                    trades += self._charge_exit(
+                        returns,
+                        previous,
+                        position,
+                        config.slippage_ticks,
+                    )
                 position = 0
                 continue
+            if not previous_allowed:
+                # 不把研究窗口外的持仓/PnL 带进当前窗口；从当前日重新开始决策。
+                position = 0
+                last_rebalance = index - config.rebalance_samples
 
             same_pair = (
                 previous.near_symbol == current.near_symbol
                 and previous.far_symbol == current.far_symbol
             )
             if not same_pair:
-                # F1/F2 角色切换时不把两个不同合约的价格跳变计入 Alpha。
+                # F1/F2 角色切换时不计不同合约的价格跳变，但已有旧 pair 必须按
+                # 换月前最后可见价付出一次退出成本。
+                if position != 0 and previous_allowed:
+                    trades += self._charge_exit(
+                        returns,
+                        previous,
+                        position,
+                        config.slippage_ticks,
+                    )
                 position = 0
                 last_rebalance = index
                 continue
@@ -167,7 +197,39 @@ class CurveFamilyResearch:
             if desired != position:
                 trades += turnover
             position = desired
+
+        if position != 0 and observations:
+            final = observations[-1]
+            if allowed_days is None or final.trading_day in allowed_days:
+                trades += self._charge_exit(
+                    returns,
+                    final,
+                    position,
+                    config.slippage_ticks,
+                )
         return returns, trades
+
+    def _charge_exit(
+        self,
+        returns: dict[str, float],
+        observation: CurveObservation,
+        position: int,
+        slippage_ticks: int,
+    ) -> int:
+        """在最后可成交观察点扣除关闭现有 spread 的单边交易成本。"""
+        turnover = abs(int(position))
+        if turnover <= 0:
+            return 0
+        cost = self._transaction_cost(
+            observation,
+            turnover,
+            slippage_ticks,
+        )
+        if cost:
+            returns[observation.trading_day] = (
+                returns.get(observation.trading_day, 0.0) - cost
+            )
+        return turnover
 
     def _equal_lot_return(
         self,
