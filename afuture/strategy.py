@@ -74,6 +74,27 @@ class CalendarSpreadStrategy:
         else:
             self._last_sample_ts = None
 
+    def restore_after_rejected_signal(self, previous_state: dict) -> None:
+        """执行未接受信号时恢复真实持仓语义，同时保留本次市场观测。
+
+        ``on_quotes`` 为避免同一 Tick 重复发单会乐观更新内部目标仓位。若随后被
+        风控或执行层拒绝，不能简单 ``set_position``，否则已有持仓的入场均值和
+        波动锚点会按当前市场重建。这里恢复信号前的持仓/锚点，但保留已经追加的
+        最新价差样本和采样时间；已有仓位的持有样本数继续前进一格。
+        """
+        current_history = list(self._history)
+        current_last_sample_ts = self._last_sample_ts
+        previous_position = int(previous_state.get("position", 0))
+        previous_holding = int(previous_state.get("holding_samples", 0))
+
+        self.restore_state(previous_state)
+        self._history.clear()
+        for value in current_history[-self.pair.lookback:]:
+            self._history.append(float(value))
+        self._last_sample_ts = current_last_sample_ts
+        if previous_position != 0:
+            self._holding_samples = previous_holding + 1
+
     def on_quotes(self, near: Tick, far: Tick) -> SpreadSignal:
         """历史中心用中间价维护，入场和持仓退出使用方向性可成交价差判断。"""
         near.validate()
