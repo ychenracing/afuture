@@ -46,7 +46,7 @@ def _specs():
     }
 
 
-def test_pair_executor_can_rate_limit_by_historical_event_time():
+def test_pair_executor_rate_limit_uses_signal_event_time_by_default():
     specs = _specs()
     broker = SimBroker(500000, specs)
     broker.start()
@@ -73,7 +73,6 @@ def test_pair_executor_can_rate_limit_by_historical_event_time():
             far1,
             open_pair_count=0,
             spread_std=1,
-            rate_limit_time=day1.timestamp(),
         )
         assert opened.accepted, opened.reason
         assert broker.get_positions()
@@ -91,7 +90,6 @@ def test_pair_executor_can_rate_limit_by_historical_event_time():
             far2,
             open_pair_count=1,
             spread_std=1,
-            rate_limit_time=day2.timestamp(),
         )
         assert closed.accepted, closed.reason
         assert broker.get_positions() == []
