@@ -728,7 +728,10 @@ class TradingEngine:
         assert self.auto_manager is not None
         today = self._trading_date()
         restored = self.auto_manager.bootstrap(
-            self.broker, today, self.state.auto_pairs
+            self.broker,
+            today,
+            self.state.auto_pairs,
+            self.state.auto_history,
         )
         for pair, pair_specs in restored:
             self._register_auto_pair(
@@ -863,6 +866,7 @@ class TradingEngine:
                 for pair_id in sorted(self._auto_pair_ids)
                 if pair_id in self.pairs
             }
+            self.state.auto_history = self.auto_manager.snapshot_history()
         try:
             account = self.broker.get_account()
             self._advance_trading_day(account)
