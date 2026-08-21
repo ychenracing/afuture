@@ -1,3 +1,5 @@
+import pytest
+
 from afuture.curve_research import (
     CurveFamilyConfig,
     CurveFamilyResearch,
@@ -21,6 +23,10 @@ def _rows(near, far):
 
 def _research():
     return CurveFamilyResearch.__new__(CurveFamilyResearch)
+
+
+def _spec(symbol: str) -> ContractSpec:
+    return ContractSpec(symbol, "DCE", 10, 1, 0.1, 0.1)
 
 
 def test_basis_reversal_trades_against_recent_relative_move():
@@ -136,4 +142,57 @@ def test_curve_pnl_uses_equal_lot_cash_return_not_equal_notional_percent_return(
     )
     returns, _ = research._run_product(rows, config, None)
     expected = (103 - 102) * 10 / (102 * 10 + 50 * 10)
-    assert returns["20260104"] == expected
+    assert returns["20260104"] == pytest.approx(expected)
+
+
+def test_pair_roll_charges_exit_cost_without_counting_roll_jump():
+    research = _research()
+    research.specs = {symbol: _spec(symbol) for symbol in ("N1", "F1", "N2", "F2")}
+    rows = [
+        CurveObservation("20260101", "N1", "F1", 100, 100, 1.00, 1.00),
+        CurveObservation("20260102", "N1", "F1", 101, 100, 1.01, 1.00),
+        CurveObservation("20260103", "N1", "F1", 102, 100, 1.02, 1.00),
+        CurveObservation("20260104", "N1", "F1", 103, 100, 1.03, 1.00),
+        CurveObservation("20260105", "N1", "F1", 104, 100, 1.04, 1.00),
+        CurveObservation("20260106", "N2", "F2", 500, 400, 1.05, 1.00),
+    ]
+    config = CurveFamilyConfig(
+        "basis_momentum",
+        fast_window=2,
+        slow_window=3,
+        mean_window=3,
+        rebalance_samples=1,
+        slippage_ticks=1,
+    )
+    returns, trades = research._run_product(rows, config, None)
+    close_cost = research._transaction_cost(rows[4], 1, 1)
+    gross = (104 - 103) * 10 / (103 * 10 + 100 * 10)
+    assert returns["20260105"] == pytest.approx(gross - close_cost)
+    assert "20260106" not in returns
+    assert trades >= 2
+
+
+def test_terminal_position_is_closed_with_cost():
+    research = _research()
+    research.specs = {symbol: _spec(symbol) for symbol in ("N", "F")}
+    rows = [
+        CurveObservation("20260101", "N", "F", 100, 100, 1.00, 1.00),
+        CurveObservation("20260102", "N", "F", 101, 100, 1.01, 1.00),
+        CurveObservation("20260103", "N", "F", 102, 100, 1.02, 1.00),
+        CurveObservation("20260104", "N", "F", 103, 100, 1.03, 1.00),
+        CurveObservation("20260105", "N", "F", 104, 100, 1.04, 1.00),
+        CurveObservation("20260106", "N", "F", 105, 100, 1.05, 1.00),
+    ]
+    config = CurveFamilyConfig(
+        "basis_momentum",
+        fast_window=2,
+        slow_window=3,
+        mean_window=3,
+        rebalance_samples=1,
+        slippage_ticks=1,
+    )
+    returns, trades = research._run_product(rows, config, None)
+    close_cost = research._transaction_cost(rows[-1], 1, 1)
+    gross = (105 - 104) * 10 / (104 * 10 + 100 * 10)
+    assert returns["20260106"] == pytest.approx(gross - close_cost)
+    assert trades >= 2
