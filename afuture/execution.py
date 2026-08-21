@@ -57,6 +57,7 @@ class PairExecutor:
         *,
         open_pair_count: int,
         spread_std: float = 0.0,
+        rate_limit_time: float | None = None,
     ) -> ExecutionResult:
         if signal.action is SignalAction.HOLD:
             return ExecutionResult(False, reason="hold signal")
@@ -98,13 +99,15 @@ class PairExecutor:
                 )
             volume = max(request.volume for request in requests)
 
-        # 先提交当前可成交深度较薄的一腿，把更深的一腿留作第二腿对冲，
-        # 降低第一腿成交后第二腿因流动性不足而留下裸腿的概率。
+        # 两腿属于同一批交易意图，必须使用同一个限速时钟值。实盘默认用本地
+        # monotonic；历史回放由 Engine 显式传入事件时间，避免数月订单被 CPU
+        # 几秒内的回放错误压缩成“同一分钟报单”。
+        limiter_now = monotonic() if rate_limit_time is None else float(rate_limit_time)
         requests = self._prioritize_requests(requests, near, far)
         order_ids: list[str] = []
         try:
             for request in requests:
-                if not self.rate_limiter.allow(monotonic()):
+                if not self.rate_limiter.allow(limiter_now):
                     raise RuntimeError("order rate limit reached")
                 order_ids.append(self.broker.send_order(request))
         except Exception as exc:
