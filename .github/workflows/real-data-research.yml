@@ -1,0 +1,59 @@
+name: real-data-research
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "afuture/real_data.py"
+      - "afuture/auto_research.py"
+      - "tools/run_real_two_year_research.py"
+      - "tests/test_real_data_research.py"
+      - ".github/workflows/real-data-research.yml"
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - name: 运行两年真实数据研究
+        run: >-
+          python tools/run_real_two_year_research.py
+          --start 2024-08-21
+          --end 2026-08-20
+          --cache runtime/real_2y_cache
+          --output runtime/real_2y_research.json
+      - name: 校验研究边界和数据覆盖
+        run: |
+          python - <<'PY'
+          import json
+          report = json.load(open("runtime/real_2y_research.json", encoding="utf-8"))
+          assert report["window"]["start"] == "2024-08-21"
+          assert report["window"]["end"] == "2026-08-20"
+          assert report["window"]["trading_days"] >= 360
+          assert report["window"]["holdout_days"] >= 80
+          assert report["data"]["historical_l1_available"] is False
+          assert report["search"]["holdout_used_for_optimization"] is False
+          assert report["search"]["search_exhausted"] is True
+          assert report["data"]["contracts"] >= 10
+          coverage = report["data"]["coverage"]
+          for product in ("m", "rb", "TA", "c", "p"):
+              assert coverage[product]["contracts"] >= 1, (product, coverage[product])
+          print(json.dumps({
+              "target": report["target"],
+              "selected_parameters": report["selected_parameters"],
+              "baseline_holdout": report["baseline_holdout"],
+              "tuned_holdout": report["tuned_holdout"],
+          }, ensure_ascii=False, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: real-two-year-research
+          path: runtime/real_2y_research.json
+          if-no-files-found: error
+          retention-days: 14
