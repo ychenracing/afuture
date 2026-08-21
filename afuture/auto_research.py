@@ -60,9 +60,9 @@ class AutoPortfolioResearchResult:
 class AutoPortfolioRunner:
     """严格按时间顺序选择全局参数，并用完整 Auto 交易链执行 OOS。"""
 
-    # 这是研究搜索上限，不是生产默认值。它防止“为了命中收益目标”无边界放大杠杆。
     MAX_RESEARCH_RISK_BUDGET = 0.02
     MAX_RESEARCH_PAIR_VOLUME = 20
+    _INVALID_SCORE = -1.0e12
 
     def __init__(self, base_config) -> None:
         if not base_config.auto.enabled:
@@ -138,10 +138,16 @@ class AutoPortfolioRunner:
                 candidate = self._config_with_parameters(parameters)
                 train_metrics = self._run_portfolio(candidate, train_ticks)
                 validation_metrics = self._run_portfolio(candidate, validation_ticks)
+                safe = self._metrics_acceptable(train_metrics) and self._metrics_acceptable(validation_metrics)
+                score = (
+                    0.35 * self._score(train_metrics) + 0.65 * self._score(validation_metrics)
+                    if safe
+                    else self._INVALID_SCORE
+                )
                 candidates.append(
                     {
                         **parameters,
-                        "score": 0.35 * self._score(train_metrics) + 0.65 * self._score(validation_metrics),
+                        "score": score,
                         "max_drawdown": max(
                             abs(float(train_metrics.get("max_drawdown", 0.0))),
                             abs(float(validation_metrics.get("max_drawdown", 0.0))),
@@ -152,7 +158,7 @@ class AutoPortfolioRunner:
                 )
 
             selected = ParameterCalibrator().select_best(candidates)
-            if selected is None:
+            if selected is None or float(selected.get("score", self._INVALID_SCORE)) <= self._INVALID_SCORE / 2:
                 continue
             parameters = {
                 key: selected[key]
@@ -301,9 +307,19 @@ class AutoPortfolioRunner:
                 )
                 metrics["commission_total"] = sum(float(row.commission) for row in trades)
                 metrics["final_position_count"] = len(broker.get_positions())
+                metrics["halted"] = bool(engine.halted or engine.state.kill_switch)
                 return metrics
             finally:
                 engine.stop()
+
+    def _metrics_acceptable(self, metrics: dict) -> bool:
+        """搜索阶段的硬门：停机、残仓或触及最大回撤都不得靠历史高收益晋级。"""
+        if bool(metrics.get("halted", False)):
+            return False
+        if int(metrics.get("final_position_count", 0)) != 0:
+            return False
+        drawdown = abs(float(metrics.get("max_drawdown", 0.0)))
+        return drawdown < float(self.base.risk.max_total_drawdown_ratio)
 
     def _config_with_parameters(self, parameters: dict):
         """应用离线研究参数；风险缩放有硬上限，不能通过无边界杠杆追收益。"""
@@ -460,6 +476,7 @@ class AutoPortfolioRunner:
             "trade_count": 0,
             "commission_total": 0.0,
             "final_position_count": 0,
+            "halted": False,
         }
 
     @staticmethod
