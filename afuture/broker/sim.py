@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from itertools import count
 
 from .base import Broker
@@ -84,7 +84,26 @@ class SimBroker(Broker):
         return {symbol: self.specs[symbol] for symbol in symbols}
 
     def get_contract_catalog(self) -> list[ContractInfo]:
-        return list(self._contract_catalog)
+        """历史回放只暴露当日已经挂牌的合约，实盘空 listing 语义保持不变。"""
+        if not self._trading_day:
+            return list(self._contract_catalog)
+        try:
+            today = datetime.strptime(self._trading_day, "%Y%m%d").date()
+        except ValueError:
+            return list(self._contract_catalog)
+
+        visible: list[ContractInfo] = []
+        for item in self._contract_catalog:
+            if item.listing:
+                try:
+                    listing = date.fromisoformat(item.listing)
+                except ValueError:
+                    # 历史可见性元数据损坏时 fail-closed，避免未来合约泄漏进 Universe。
+                    continue
+                if listing > today:
+                    continue
+            visible.append(item)
+        return visible
 
     def publish_tick(self, tick: Tick) -> None:
         tick.validate()
@@ -98,8 +117,11 @@ class SimBroker(Broker):
             int(tick.bid_volume),
             int(tick.ask_volume),
         ]
-        self._events.append(BrokerEvent("tick", tick))
+        # 当前行情可能使上一轮延迟 FAK/FOK 首次具备成交资格。先产生这些成交/撤单
+        # 回报，再把同一行情交给策略生成新决策，避免 broker 内部仓位已经变化而
+        # TradingEngine 的期望状态尚未推进的时间倒置。
         self._match_symbol(tick.symbol)
+        self._events.append(BrokerEvent("tick", tick))
 
     def send_order(self, request: OrderRequest) -> str:
         if not self._started:
