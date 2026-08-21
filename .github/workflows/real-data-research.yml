@@ -10,6 +10,11 @@ on:
       - "tests/test_real_data_research.py"
       - ".github/workflows/real-data-research.yml"
 
+# 同一个 PR 只保留最新 HEAD 的联网研究，旧方法版本不再占用 Runner。
+concurrency:
+  group: real-data-research-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   research:
     runs-on: ubuntu-latest
