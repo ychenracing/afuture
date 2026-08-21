@@ -14,6 +14,9 @@ from afuture.scanner import SpreadScanner
 from afuture.state import StateStore
 
 
+_CHINA_TZ = timezone(timedelta(hours=8))
+
+
 def contract(symbol: str, expiry: str, *, product: str = "m", exchange: str = "DCE") -> ContractInfo:
     return ContractInfo(symbol=symbol, exchange=exchange, product=product, expiry=expiry)
 
@@ -132,7 +135,7 @@ def test_engine_auto_discovers_pair_and_persists_it(tmp_path: Path):
         historical_mode=True,
     )
     engine.start()
-    base = datetime(2026, 8, 21, 9, 0, tzinfo=timezone.utc)
+    base = datetime(2026, 8, 21, 9, 0, tzinfo=_CHINA_TZ)
     for i, spread in enumerate([10, 11, 10, 25]):
         broker.publish_tick(tick("m2609", base + timedelta(minutes=i), 3000 + spread - 0.5, 3000 + spread + 0.5))
         engine.run_once()
@@ -250,7 +253,7 @@ def test_auto_pair_retires_after_position_is_flat_and_signal_edge_disappears(tmp
         historical_mode=True,
     )
     engine.start()
-    base = datetime(2026, 8, 21, 9, 0, tzinfo=timezone.utc)
+    base = datetime(2026, 8, 21, 9, 0, tzinfo=_CHINA_TZ)
     for i, spread in enumerate([10, 11, 10, 25, 10, 10]):
         broker.publish_tick(tick("m2609", base + timedelta(minutes=i), 3000 + spread - 0.5, 3000 + spread + 0.5))
         engine.run_once()
@@ -335,7 +338,7 @@ def test_replay_uses_same_auto_selection_lifecycle(tmp_path: Path):
         contract_catalog=catalog,
     )
     data = tmp_path / "ticks.csv"
-    base = datetime(2026, 8, 21, 9, 0, tzinfo=timezone.utc)
+    base = datetime(2026, 8, 21, 9, 0, tzinfo=_CHINA_TZ)
     rows = [
         "timestamp,symbol,exchange,bid_price,ask_price,last_price,bid_volume,ask_volume,trading_day,volume,open_interest"
     ]
