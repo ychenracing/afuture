@@ -1,0 +1,163 @@
+from datetime import date, datetime, timezone
+
+from afuture.auto import AutoConfig, AutoPairManager, AutoPairSelector
+from afuture.models import ContractInfo, PairConfig, SignalAction, Tick
+from afuture.strategy import CalendarSpreadStrategy
+
+
+def tick(symbol: str, when: datetime, mid: float, trading_day: str = "20260821") -> Tick:
+    return Tick(
+        symbol=symbol,
+        exchange="DCE",
+        timestamp=when,
+        bid_price=mid - 0.5,
+        ask_price=mid + 0.5,
+        last_price=mid,
+        bid_volume=100,
+        ask_volume=100,
+        trading_day=trading_day,
+        volume=20000,
+        open_interest=80000,
+    )
+
+
+def relative_pair(**overrides) -> PairConfig:
+    values = dict(
+        pair_id="m_daily",
+        near_symbol="m2609",
+        far_symbol="m2701",
+        exchange="DCE",
+        volume=5,
+        lookback=4,
+        entry_z=2.5,
+        exit_z=0.75,
+        stop_z=4.0,
+        signal_transform="log_ratio",
+        confirm_entry=True,
+        confirmation_retrace_z=0.3,
+        min_confirmed_entry_z=1.75,
+        entry_trend_window=3,
+        max_entry_z_slope=0.75,
+        min_stationarity_score=0.0,
+        max_half_life=999.0,
+        daily_sample_window="14:55-15:00",
+    )
+    values.update(overrides)
+    return PairConfig(**values)
+
+
+def test_daily_sample_window_records_only_one_observation_per_trading_day():
+    strategy = CalendarSpreadStrategy(relative_pair())
+
+    before = datetime(2026, 8, 21, 6, 30, tzinfo=timezone.utc)  # 14:30 China
+    strategy.on_quotes(tick("m2609", before, 3100), tick("m2701", before, 3000))
+    assert strategy.snapshot_state()["history"] == []
+
+    close = datetime(2026, 8, 21, 6, 56, tzinfo=timezone.utc)  # 14:56 China
+    strategy.on_quotes(tick("m2609", close, 3100), tick("m2701", close, 3000))
+    first = strategy.snapshot_state()
+    assert len(first["history"]) == 1
+    assert first["last_sample_trading_day"] == "20260821"
+
+    later = datetime(2026, 8, 21, 6, 59, tzinfo=timezone.utc)
+    strategy.on_quotes(tick("m2609", later, 3110), tick("m2701", later, 3000))
+    assert strategy.snapshot_state()["history"] == first["history"]
+
+
+def test_log_ratio_history_is_scale_invariant():
+    left = CalendarSpreadStrategy(relative_pair(daily_sample_window=""))
+    right = CalendarSpreadStrategy(relative_pair(daily_sample_window=""))
+    base = datetime(2026, 8, 21, 1, 0, tzinfo=timezone.utc)
+
+    for index, (near, far) in enumerate([(101, 100), (102, 100), (101, 100), (103, 100)]):
+        when = base.replace(hour=1 + index)
+        left.on_quotes(tick("m2609", when, near), tick("m2701", when, far))
+        right.on_quotes(tick("m2609", when, near * 10), tick("m2701", when, far * 10))
+
+    assert left.snapshot_state()["history"] == right.snapshot_state()["history"]
+    assert left.spread_std != right.spread_std  # sizing remains in raw spread currency units
+
+
+def test_confirmation_waits_for_retrace_before_opening():
+    strategy = CalendarSpreadStrategy(relative_pair(daily_sample_window=""))
+    base = datetime(2026, 8, 21, 1, 0, tzinfo=timezone.utc)
+
+    # Warm up a stable relative-value window around 1.00.
+    for index, ratio in enumerate([1.000, 1.002, 0.998, 1.001]):
+        when = base.replace(hour=1 + index)
+        strategy.on_quotes(
+            tick("m2609", when, 3000 * ratio),
+            tick("m2701", when, 3000),
+        )
+
+    extreme_time = base.replace(hour=6)
+    extreme = strategy.on_quotes(
+        tick("m2609", extreme_time, 3060),
+        tick("m2701", extreme_time, 3000),
+    )
+    assert extreme.action is SignalAction.HOLD
+
+    confirm_time = base.replace(hour=7)
+    confirmed = strategy.on_quotes(
+        tick("m2609", confirm_time, 3048),
+        tick("m2701", confirm_time, 3000),
+    )
+    assert confirmed.action is SignalAction.SHORT_SPREAD
+    assert "confirmed" in confirmed.reason
+
+
+def test_auto_profile_copies_relative_daily_quality_parameters():
+    config = AutoConfig(
+        enabled=True,
+        products=("m", "OI"),
+        exchanges=("DCE", "CZCE"),
+        lookback=25,
+        entry_z=2.5,
+        exit_z=0.75,
+        stop_z=4.0,
+        signal_transform="log_ratio",
+        confirm_entry=True,
+        confirmation_retrace_z=0.3,
+        min_confirmed_entry_z=1.75,
+        entry_trend_window=6,
+        max_entry_z_slope=0.75,
+        min_stationarity_score=0.01,
+        max_half_life=60.0,
+        daily_sample_window="14:55-15:00",
+    )
+    catalog = [
+        ContractInfo("m2609", "DCE", "m", "2026-09-15"),
+        ContractInfo("m2701", "DCE", "m", "2027-01-15"),
+    ]
+    pair = AutoPairSelector(config).build_pairs(catalog, date(2026, 8, 21))[0]
+    assert pair.signal_transform == "log_ratio"
+    assert pair.confirm_entry
+    assert pair.confirmation_retrace_z == 0.3
+    assert pair.min_confirmed_entry_z == 1.75
+    assert pair.max_entry_z_slope == 0.75
+    assert pair.daily_sample_window == "14:55-15:00"
+
+
+def test_auto_history_round_trips_for_daily_restart_warmup():
+    manager = AutoPairManager(
+        AutoConfig(
+            enabled=True,
+            products=("m",),
+            exchanges=("DCE",),
+            lookback=4,
+            daily_sample_window="14:55-15:00",
+        )
+    )
+    catalog = [
+        ContractInfo("m2609", "DCE", "m", "2026-09-15"),
+        ContractInfo("m2701", "DCE", "m", "2027-01-15"),
+    ]
+    manager.prepare_catalog(catalog, date(2026, 8, 21))
+    close = datetime(2026, 8, 21, 6, 56, tzinfo=timezone.utc)
+    manager.observe(tick("m2609", close, 3100))
+    snapshot = manager.snapshot_history()
+
+    restored = AutoPairManager(manager.config)
+    restored.prepare_catalog(catalog, date(2026, 8, 21))
+    restored.restore_history(snapshot)
+    assert restored.snapshot_history() == snapshot
