@@ -146,9 +146,7 @@ class CurveFamilyResearch:
                 last_rebalance = index
                 continue
 
-            near_return = current.near_price / previous.near_price - 1.0
-            far_return = current.far_price / previous.far_price - 1.0
-            gross_return = position * (near_return - far_return)
+            gross_return = position * self._equal_lot_return(previous, current)
 
             desired = position
             if index - last_rebalance >= max(1, config.rebalance_samples):
@@ -170,6 +168,36 @@ class CurveFamilyResearch:
                 trades += turnover
             position = desired
         return returns, trades
+
+    def _equal_lot_return(
+        self,
+        previous: CurveObservation,
+        current: CurveObservation,
+    ) -> float:
+        """按生产等手数口径计算一手多近空远的组合收益率。
+
+        信号可以使用角色收益差，但真实 PnL 必须按合约乘数和价格变动计算；再用
+        上一观察点两腿总名义金额归一化，避免把等手数执行误写成等名义百分比仓位。
+        无 specs 的纯信号单测保留旧的收益差近似。
+        """
+        near_spec = self.specs.get(previous.near_symbol) if self.specs else None
+        far_spec = self.specs.get(previous.far_symbol) if self.specs else None
+        if near_spec is None or far_spec is None:
+            near_return = current.near_price / previous.near_price - 1.0
+            far_return = current.far_price / previous.far_price - 1.0
+            return near_return - far_return
+
+        near_pnl = (
+            current.near_price - previous.near_price
+        ) * near_spec.multiplier
+        far_pnl = (
+            current.far_price - previous.far_price
+        ) * far_spec.multiplier
+        gross_notional = (
+            previous.near_price * near_spec.multiplier
+            + previous.far_price * far_spec.multiplier
+        )
+        return (near_pnl - far_pnl) / max(gross_notional, 1e-9)
 
     def _desired_position(
         self,
