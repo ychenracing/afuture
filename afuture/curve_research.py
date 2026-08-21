@@ -160,7 +160,6 @@ class CurveFamilyResearch:
                 position = 0
                 continue
             if not previous_allowed:
-                # 不把研究窗口外的持仓/PnL 带进当前窗口；从当前日重新开始决策。
                 position = 0
                 last_rebalance = index - config.rebalance_samples
 
@@ -169,8 +168,6 @@ class CurveFamilyResearch:
                 and previous.far_symbol == current.far_symbol
             )
             if not same_pair:
-                # F1/F2 角色切换时不计不同合约的价格跳变，但已有旧 pair 必须按
-                # 换月前最后可见价付出一次退出成本。
                 if position != 0 and previous_allowed:
                     trades += self._charge_exit(
                         returns,
@@ -283,8 +280,6 @@ class CurveFamilyResearch:
         start = max(0, index - required + 1)
         window = observations[start : index + 1]
 
-        # 长周期 momentum 研究的是连续 F1/F2 角色收益，允许跨实际合约换月；
-        # 均值回归和短期 reversal 仍要求同一实际 pair，避免把角色指数误当价差。
         role_adjusted = (
             config.family in {
                 "basis_momentum",
@@ -303,19 +298,14 @@ class CurveFamilyResearch:
             relative_changes,
             config.fast_window,
         )
-        # pairs-trading-egarch 的关键方向是“波动太低不部署资本”，而不只是避开
-        # 极高波动。默认 0 保持关闭状态。
         if volatility_percentile < config.min_volatility_percentile:
             return 0
 
         if config.family == "basis_reversal":
-            # Rossi 2025 的 spread 版本：最近 F1-F2 相对收益为正，则下一期反向。
             relative = self._relative_return(window, config.fast_window)
             return -self._sign(relative)
 
         if config.family == "basis_momentum":
-            # Boons 2019 的 basis momentum 用连续 F1/F2 角色指数的长期收益差；
-            # 这里只研究 spread-neutral 方向版本，不复制原论文的 outright 横截面仓位。
             relative = self._relative_return(
                 window,
                 config.slow_window,
@@ -324,8 +314,6 @@ class CurveFamilyResearch:
             return self._sign(relative)
 
         if config.family == "slow_momentum_fast_reversion":
-            # 对 Wood et al. 的轻量代理：正常时跟随慢相对趋势；近期出现与慢趋势
-            # 相反且足够大的局部断点时，暂时切换到快速方向，下一次再由慢趋势接管。
             slow = self._relative_return(
                 window,
                 config.slow_window,
@@ -353,7 +341,6 @@ class CurveFamilyResearch:
                 return fast_sign
             return slow_sign
 
-        # 归一化 log(F1/F2) 均值回归；该信号消除绝对价格尺度差异。
         ratios = [
             log(row.near_price / row.far_price)
             for row in window[-config.mean_window :]
@@ -386,8 +373,6 @@ class CurveFamilyResearch:
         for tick in ticks:
             current = by_day.setdefault(tick.trading_day, {})
             existing = current.get(tick.symbol)
-            # 两年日线代理每个合约每日只有一个 open tick；若将来输入多条，研究
-            # 使用最早可见样本，避免偷偷使用日内未来价格。
             if existing is None or tick.timestamp < existing.timestamp:
                 current[tick.symbol] = tick
 
@@ -471,7 +456,7 @@ class CurveFamilyResearch:
         turnover: int,
         slippage_ticks: int,
     ) -> float:
-        """用真实 tick/multiplier/fee 对每次两腿换仓做保守成本扣减。"""
+        """按双腿现金成本 / 双腿总名义本金计算一次等手数组合换仓成本。"""
         if turnover <= 0 or not self.specs:
             return 0.0
         near_spec = self.specs[current.near_symbol]
@@ -479,27 +464,25 @@ class CurveFamilyResearch:
         near_notional = current.near_price * near_spec.multiplier
         far_notional = current.far_price * far_spec.multiplier
         gross_notional = max(near_notional + far_notional, 1e-9)
-        slippage = slippage_ticks * (
+        slippage_cash = slippage_ticks * (
             near_spec.price_tick * near_spec.multiplier
             + far_spec.price_tick * far_spec.multiplier
-        ) / gross_notional
-        # 单次 position unit 变化只发生一次双腿成交；开/平费率取平均，避免把
-        # 完整 round trip 同时扣在单边换仓上，同时保留 fixed fee 影响。
-        fee = 0.5 * (
-            self._round_trip_fee_ratio(near_spec, near_notional)
-            + self._round_trip_fee_ratio(far_spec, far_notional)
         )
-        return turnover * (slippage + fee)
+        fee_cash = 0.5 * (
+            self._round_trip_fee_cash(near_spec, near_notional)
+            + self._round_trip_fee_cash(far_spec, far_notional)
+        )
+        return turnover * (slippage_cash + fee_cash) / gross_notional
 
     @staticmethod
-    def _round_trip_fee_ratio(
+    def _round_trip_fee_cash(
         spec: ContractSpec,
         notional: float,
     ) -> float:
         fee = spec.fee
         cash = fee.open_fixed + fee.close_fixed
         cash += notional * (fee.open_rate + fee.close_rate)
-        return cash / max(notional, 1e-9)
+        return cash
 
     @staticmethod
     def _same_pair(rows: list[CurveObservation]) -> bool:
