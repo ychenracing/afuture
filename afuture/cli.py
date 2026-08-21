@@ -1,15 +1,17 @@
 """命令行入口。
 
 实盘相关命令默认采用 fail-closed：柜台、完整账户/持仓快照、元数据和持仓对账
-任一安全门未通过，都不会进入正常交易循环。
+任一安全门未通过，都不会进入正常交易循环。Shadow 连接真实 CTP，但订单永远只进入本地模拟柜台。
 """
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+from datetime import datetime
 import json
 import os
+from pathlib import Path
 import time
 
 from .alerts import AlertManager, FileAlertSink, WebhookAlertSink
@@ -18,7 +20,9 @@ from .data import read_ticks
 from .logging_utils import configure_logging
 from .metadata import validate_contract_metadata
 from .models import AccountSnapshot, ContractPosition, PairConfig, RuntimeMode
+from .quality import ExecutionQualityRecorder
 from .research import AcceptanceGate, ResearchConfig, WalkForwardRunner
+from .sample_store import MarketSampleStore
 from .scanner import SpreadScanner
 from .state import StateStore
 
@@ -28,7 +32,7 @@ _RECOVERY_ACK = "I_VERIFIED_CTP_POSITIONS"
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """创建 CLI，并把研究与实盘入口明确分离。"""
+    """创建 CLI，并把研究、观察和真实交易入口明确分离。"""
     parser = argparse.ArgumentParser(
         prog="afuture", description="国内期货跨期套利交易系统"
     )
@@ -45,7 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--config", required=True)
     scan.add_argument("--data", required=True)
 
-    accept = sub.add_parser("accept", help="执行 Walk-forward/OOS/Stress 晋级验收")
+    accept = sub.add_parser("accept", help="执行单 pair Walk-forward/OOS/Stress 晋级验收")
     accept.add_argument("--config", required=True)
     accept.add_argument("--data", required=True)
     accept.add_argument("--pair", required=True)
@@ -59,12 +63,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="用逗号分隔的交易成本压力倍数",
     )
 
-    live = sub.add_parser("live", help="连接 CTP 柜台")
+    accept_auto = sub.add_parser(
+        "accept-auto", help="对最终 Auto Portfolio 执行 Walk-forward/OOS/鲁棒性验收"
+    )
+    accept_auto.add_argument("--config", required=True)
+    accept_auto.add_argument("--data", required=True)
+    accept_auto.add_argument("--train-days", type=int, default=120)
+    accept_auto.add_argument("--validation-days", type=int, default=40)
+    accept_auto.add_argument("--oos-days", type=int, default=40)
+    accept_auto.add_argument("--step-days", type=int, default=40)
+    accept_auto.add_argument("--stress-multipliers", default="1.0,1.5,2.0")
+    accept_auto.add_argument("--output", default="")
+
+    data_check = sub.add_parser("data-check", help="检查 Auto 研究数据覆盖、断档和合约生命周期")
+    data_check.add_argument("--config", required=True)
+    data_check.add_argument("--data", required=True)
+    data_check.add_argument("--max-gap-seconds", type=float, default=300.0)
+    data_check.add_argument("--output", default="")
+
+    quality = sub.add_parser("quality-report", help="汇总真实/Shadow 执行质量证据")
+    quality.add_argument("--config", required=True)
+    quality.add_argument("--output", default="")
+    quality.add_argument("--shadow", action="store_true", help="汇总 Shadow 而非真实交易证据")
+
+    live = sub.add_parser("live", help="连接 CTP 柜台并真实交易")
     live.add_argument("--config", required=True)
     live.add_argument("--confirm-live", action="store_true")
     live.add_argument("--startup-timeout", type=float, default=60.0)
     live.add_argument("--snapshot-wait", type=float, default=12.0)
     live.add_argument("--halt-drain", type=float, default=3.0)
+
+    shadow = sub.add_parser("shadow", help="连接真实 CTP 行情但所有订单只做本地模拟")
+    shadow.add_argument("--config", required=True)
+    shadow.add_argument("--confirm-live", action="store_true")
+    shadow.add_argument("--startup-timeout", type=float, default=60.0)
+    shadow.add_argument("--snapshot-wait", type=float, default=12.0)
+    shadow.add_argument("--duration-seconds", type=float, default=0.0)
+
+    doctor = sub.add_parser("doctor", help="无报单检查 CTP 登录、快照、合约目录和元数据")
+    doctor.add_argument("--config", required=True)
+    doctor.add_argument("--confirm-live", action="store_true")
+    doctor.add_argument("--startup-timeout", type=float, default=60.0)
+    doctor.add_argument("--snapshot-wait", type=float, default=12.0)
+    doctor.add_argument("--metadata-limit", type=int, default=4)
 
     recover = sub.add_parser("recover-state", help="人工核验后重建本地期望持仓")
     recover.add_argument("--config", required=True)
@@ -203,7 +244,7 @@ def _require_production_confirmation(config, args) -> None:
         return
     if not args.confirm_live or os.getenv("AFUTURE_LIVE_ACK") != _LIVE_ACK:
         raise RuntimeError(
-            "production live trading requires --confirm-live and "
+            "production CTP access requires --confirm-live and "
             "AFUTURE_LIVE_ACK=I_UNDERSTAND_FUTURES_RISK"
         )
 
@@ -332,9 +373,33 @@ def _build_alert_manager(config) -> AlertManager:
     return AlertManager(sinks)
 
 
+def _runtime_path(config, name: str) -> Path:
+    return Path(config.state_path).parent / name
+
+
+def _quality_recorder(config, *, shadow: bool = False) -> ExecutionQualityRecorder:
+    name = "shadow_execution_quality.jsonl" if shadow else "execution_quality.jsonl"
+    return ExecutionQualityRecorder(_runtime_path(config, name))
+
+
+def _auto_manager(config, *, evidence=None, shadow: bool = False):
+    from .auto import AutoPairManager
+
+    if not config.auto.enabled:
+        return None
+    max_samples = max(config.auto.lookback * 4, config.auto.lookback + 8)
+    sample_dir = "shadow_market_samples" if shadow else "market_samples"
+    return AutoPairManager(
+        config.auto,
+        sample_store=MarketSampleStore(
+            _runtime_path(config, sample_dir), max_samples=max_samples
+        ),
+        evidence_recorder=evidence,
+    )
+
+
 def _run_live(config, args, logger) -> int:
     """完成柜台、快照、元数据、活动订单和持仓安全门后才进入实时循环。"""
-    from .auto import AutoPairManager
     from .broker.ctp import CtpBroker
     from .engine import TradingEngine
     from .journal import AuditJournal
@@ -342,6 +407,7 @@ def _run_live(config, args, logger) -> int:
     from .risk import RiskManager
 
     broker = CtpBroker(config.ctp)
+    quality = _quality_recorder(config)
     engine = TradingEngine(
         broker,
         config.pairs,
@@ -354,9 +420,8 @@ def _run_live(config, args, logger) -> int:
         legging_timeout_seconds=config.legging_timeout_seconds,
         journal=AuditJournal(config.journal_path),
         alert_manager=_build_alert_manager(config),
-        auto_manager=(
-            AutoPairManager(config.auto) if config.auto.enabled else None
-        ),
+        auto_manager=_auto_manager(config, evidence=quality),
+        quality_recorder=quality,
         require_live_metadata=config.require_live_metadata,
         metadata_timeout_seconds=config.metadata_timeout_seconds,
     )
@@ -425,11 +490,117 @@ def _run_live(config, args, logger) -> int:
     return 0
 
 
+def _run_shadow(config, args, logger) -> int:
+    """使用真实 CTP 行情/元数据，但所有订单只进入本地保守 SimBroker。"""
+    from .broker.ctp import CtpBroker
+    from .broker.shadow import ShadowBroker
+    from .engine import TradingEngine
+    from .journal import AuditJournal
+    from .risk import RiskManager
+
+    if config.mode != "live" or config.ctp is None:
+        raise ValueError("shadow requires system.mode=live")
+    _require_production_confirmation(config, args)
+    live = CtpBroker(config.ctp)
+    broker = ShadowBroker(
+        live,
+        config.initial_capital,
+        slippage_ticks=config.slippage_ticks,
+        latency_ticks=max(1, config.latency_ticks),
+        market_impact_ticks=max(1, config.market_impact_ticks),
+    )
+    broker.update_specs(config.contracts)
+    quality = _quality_recorder(config, shadow=True)
+    shadow_state = _runtime_path(config, "shadow_state.json")
+    # Shadow 的 SimBroker 不代表真实持仓；每次观察会话都从空虚拟账户开始。
+    if shadow_state.exists():
+        shadow_state.unlink()
+    engine = TradingEngine(
+        broker,
+        config.pairs,
+        config.contracts,
+        RiskManager(config.risk),
+        StateStore(shadow_state),
+        auto_flatten_imbalance=config.auto_flatten_imbalance,
+        aggressive_ticks=config.aggressive_ticks,
+        slippage_ticks=config.slippage_ticks,
+        legging_timeout_seconds=config.legging_timeout_seconds,
+        journal=AuditJournal(_runtime_path(config, "shadow_audit.jsonl")),
+        alert_manager=_build_alert_manager(config),
+        auto_manager=_auto_manager(config, evidence=quality, shadow=True),
+        quality_recorder=quality,
+        require_live_metadata=config.require_live_metadata,
+        metadata_timeout_seconds=config.metadata_timeout_seconds,
+    )
+    engine.start()
+    deadline = time.monotonic() + args.duration_seconds if args.duration_seconds > 0 else None
+    try:
+        _wait_until_ready(broker, args.startup_timeout)
+        wait_for_fresh_snapshot(broker, args.snapshot_wait)
+        engine.initialize_after_ready()
+        if engine.halted:
+            if not engine.clear_kill_switch_after_reconcile():
+                raise RuntimeError("shadow startup reconciliation did not pass")
+        elif not engine.reconcile_startup():
+            raise RuntimeError("shadow startup reconciliation failed")
+        logger.info("Shadow 已启动：真实 CTP 行情/元数据，本地模拟订单，绝不调用真实 send_order")
+        while deadline is None or time.monotonic() < deadline:
+            engine.run_once()
+            if engine.halted:
+                raise RuntimeError(f"shadow halted: {engine.state.kill_reason}")
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        logger.info("收到 Shadow 人工停止请求")
+    finally:
+        engine.stop()
+    return 0
+
+
+def _run_doctor(config, args) -> int:
+    """无订单检查 CTP 会话、fresh snapshot、目录和少量元数据。"""
+    from .auto import AutoPairSelector
+    from .broker.ctp import CtpBroker
+
+    if config.mode != "live" or config.ctp is None:
+        raise ValueError("doctor requires system.mode=live")
+    _require_production_confirmation(config, args)
+    broker = CtpBroker(config.ctp)
+    broker.start()
+    try:
+        _wait_until_ready(broker, args.startup_timeout)
+        wait_for_fresh_snapshot(broker, args.snapshot_wait)
+        account = broker.get_account()
+        catalog = broker.get_contract_catalog()
+        symbols = list(config.contracts)
+        if config.auto.enabled and catalog:
+            raw_day = broker.get_trading_day()
+            today = datetime.strptime(raw_day, "%Y%m%d").date()
+            auto_pairs = AutoPairSelector(config.auto).build_pairs(catalog, today)
+            for pair in auto_pairs:
+                symbols.extend([pair.near_symbol, pair.far_symbol])
+                if len(set(symbols)) >= args.metadata_limit:
+                    break
+        symbols = sorted(set(symbols))[: max(0, args.metadata_limit)]
+        metadata = broker.get_live_contract_specs(symbols, config.metadata_timeout_seconds) if symbols else {}
+        payload = {
+            "ready": broker.is_ready(),
+            "trading_day": broker.get_trading_day(),
+            "account_equity": account.equity,
+            "position_count": len(broker.get_positions()),
+            "contract_catalog_count": len(catalog),
+            "metadata_symbols": sorted(metadata),
+            "orders_sent": 0,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    finally:
+        broker.stop()
+
+
 def _research_pairs(config, ticks) -> list[PairConfig]:
     """研究命令在 auto 模式下使用与实盘相同的相邻月份生成规则。"""
     if not config.auto.enabled:
         return list(config.pairs)
-    from datetime import datetime
     from .auto import AutoPairSelector
 
     trading_days = [str(tick.trading_day) for tick in ticks if tick.trading_day]
@@ -446,6 +617,15 @@ def _parse_stress_multipliers(raw: str) -> tuple[float, ...]:
     if not values or any(value <= 0 for value in values):
         raise ValueError("stress multipliers must be positive")
     return values
+
+
+def _write_json(payload: dict, output: str | Path | None = None) -> None:
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    print(text)
+    if output:
+        path = Path(output)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text + "\n", encoding="utf-8")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -515,6 +695,59 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0 if decision.accepted else 2
+
+    if args.command == "accept-auto":
+        from .auto_acceptance import AutoPortfolioAcceptanceGate
+        from .auto_research import AutoPortfolioResearchConfig, AutoPortfolioRunner
+
+        ticks = read_ticks(args.data)
+        research = AutoPortfolioResearchConfig(
+            train_days=args.train_days,
+            validation_days=args.validation_days,
+            oos_days=args.oos_days,
+            step_days=args.step_days,
+            cost_stress_multipliers=_parse_stress_multipliers(args.stress_multipliers),
+        )
+        result = AutoPortfolioRunner(config).run(ticks, research)
+        decision = AutoPortfolioAcceptanceGate().evaluate(result)
+        payload = {
+            "accepted": decision.accepted,
+            "reasons": decision.reasons,
+            "gate_metrics": decision.metrics,
+            "selected_parameters": result.selected_parameters,
+            "folds": [asdict(fold) for fold in result.folds],
+            "stress_results": result.stress_results,
+            "robustness": result.robustness,
+        }
+        output = args.output or _runtime_path(config, "auto_acceptance.json")
+        _write_json(payload, output)
+        return 0 if decision.accepted else 2
+
+    if args.command == "data-check":
+        from .data_quality import DataQualityAnalyzer
+
+        # 保留源文件顺序，才能发现数据供应链中的真实乱序；研究/回放仍按时间排序。
+        ticks = read_ticks(args.data, sort_rows=False)
+        result = DataQualityAnalyzer(args.max_gap_seconds).analyze(
+            ticks, config.contract_catalog, config.auto
+        )
+        output = args.output or _runtime_path(config, "data_quality.json")
+        _write_json(result.to_dict(), output)
+        return 0 if result.passed else 2
+
+    if args.command == "quality-report":
+        recorder = _quality_recorder(config, shadow=args.shadow)
+        payload = recorder.summary()
+        default_name = "shadow_execution_quality_report.json" if args.shadow else "execution_quality_report.json"
+        output = args.output or _runtime_path(config, default_name)
+        _write_json(payload, output)
+        return 0
+
+    if args.command == "doctor":
+        return _run_doctor(config, args)
+
+    if args.command == "shadow":
+        return _run_shadow(config, args, logger)
 
     if args.command == "recover-state":
         return _recover_state(config, args, logger)

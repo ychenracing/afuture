@@ -20,8 +20,15 @@ _REQUIRED_COLUMNS = {
 }
 
 
-def read_ticks(path: str | Path) -> list[Tick]:
-    """读取标准化 Tick CSV，并按时间排序。"""
+def read_ticks(
+    path: str | Path,
+    *,
+    sort_rows: bool = True,
+) -> list[Tick]:
+    """读取标准化 Tick CSV。
+
+    回放默认按时间排序；``data-check`` 可关闭排序以检查源文件本身是否乱序。
+    """
     ticks: list[Tick] = []
     with Path(path).open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
@@ -47,4 +54,4 @@ def read_ticks(path: str | Path) -> list[Tick]:
             )
             tick.validate()
             ticks.append(tick)
-    return sorted(ticks, key=lambda item: item.timestamp)
+    return sorted(ticks, key=lambda item: item.timestamp) if sort_rows else ticks

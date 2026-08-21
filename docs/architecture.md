@@ -1,109 +1,174 @@
 # 架构与数据流
 
-## 设计目标
+## 目标
 
-`afuture` 的核心不是“能发 CTP 订单”，而是让策略、风险、执行和真实账户状态之间只有一条明确的数据链。任何模块失败时优先停止新增风险，而不是猜测状态。
-
-## 模块边界
+`afuture` 只保留一套正式交易链。Auto、研究、Shadow 和实盘都复用相同的策略、风险和执行对象；旁路模块只负责证据，不获得第二套下单权限。
 
 ```text
-CTP Contract Catalog      Market Data / Replay CSV
-        │                         │
-        ▼                         ▼
-   AutoPairManager ─────────→ TradingEngine
-          │
-   ┌──────┼──────────┐
-   ▼      ▼          ▼
-Strategy  Health   PortfolioRisk
-   │                  │
-   └──────┬───────────┘
-          ▼
-     RiskManager
-          │
-          ▼
-     PairExecutor
-          │
-    ┌─────┴─────┐
-    ▼           ▼
- SimBroker    CtpBroker
+                 Contract Catalog / Tick
+                         │
+                         ▼
+                  AutoPairManager
+       ┌─────────────┬───┴─────────────┐
+       │             │                 │
+       ▼             ▼                 ▼
+ warm samples   candidate evidence   metadata prefetch
+       │             │                 │
+       └─────────────┴──────┬──────────┘
+                            ▼
+                    TradingEngine
+                            │
+                  CalendarSpreadStrategy
+                            │
+          PortfolioRisk + RiskManager
+                            │
+                       PairExecutor
+                            │
+             ┌──────────────┼──────────────┐
+             ▼              ▼              ▼
+          SimBroker     ShadowBroker     CtpBroker
+                                       (真实订单)
+
+旁路研究：DataQuality → AutoPortfolioRunner → AutoPortfolioAcceptanceGate
+旁路证据：candidate / decision / round_trip → ExecutionQualityRecorder
 ```
 
-- `AutoPairManager`：只负责合约发现、实时候选排名和动态组合生命周期；不产生第二套交易逻辑。
-- `CalendarSpreadStrategy`：只产生交易意图，不访问账户。
-- `RiskManager`：决定是否允许开仓以及最大动态手数。
-- `PortfolioRiskAnalyzer`：从价差变化序列计算相关性，并约束风险组集中度。
-- `PairExecutor`：把意图转成双腿订单，负责 Net Edge、盘口、保证金预检、回滚和减仓修复。
-- `TradingEngine`：负责事件顺序、状态机、对账、健康门和持久化。 实盘健康门以墙钟检测行情整体冻结；回放健康门以历史事件时间计算跨腿陈旧度。
-- `Broker`：隔离模拟撮合与 CTP SDK。
+## Auto 的职责边界
 
+`AutoPairManager` 只回答“哪个同品种相邻月组合可以获得开仓资格”：
 
-## 自动组合生命周期
+1. CTP/历史合约目录；
+2. 品种/交易所白名单；
+3. 到期过滤；
+4. 每品种前几个有效月份；
+5. 相邻月组合；
+6. sampled bid/ask、volume、Open Interest、depth；
+7. executable Z-score、半衰期、平稳性；
+8. 后台预取真实 CTP 保证金/手续费；
+9. Net Edge；
+10. 少量排名入选组合。
 
-自动模式从 CTP 合约目录中按品种/交易所白名单筛选，只保留未进入到期黑名单的前几个交割月份，并仅生成**相邻月份**。这样个人程序无需维护庞大的组合图。
+它不直接发订单，也不复制策略和风控。
 
-候选必须同时通过：
+## 管理权与开仓权
 
-- 当前成交量和 Open Interest；
-- 一档盘口深度；
-- 异步两腿行情的时间同步容忍；
-- Z-score、半衰期和平稳性代理；
-- 扣除手续费、滑点和裸腿缓冲后的 Net Edge。
+动态组合存在两个不同概念：
 
-引擎只激活少量最高分组合。自动层如果认为某个已有持仓组合不再优秀，会把它视为“等待退役”，但**不会为了轮换强平**；组合仍由原策略正常退出，平仓后再从引擎移除。动态组合配置写入状态文件，重启时先恢复，保证已有仓位不会因为自动发现重新排序而失去管理者。
+- **managed**：系统必须继续拥有并管理已有仓位；
+- **open-eligible**：当前 Auto hard gates 仍允许该组合增加新风险。
 
-交易日变化后重新应用到期过滤并订阅新进入前排的合约。CTP 合约目录本身来自登录后的合约查询，不使用网页或静态代码表。
+已有仓位失去 Auto 资格时：
+
+```text
+managed = true
+open_eligible = false
+```
+
+因此组合可以继续正常/紧急退出，但不能在下一次扫描前重新开仓。平仓且无活动订单后立即 unregister。
+
+## 元数据不阻塞 Tick 主循环
+
+CTP 保证金/手续费查询可能需要等待响应。生产 Auto 扫描采用：
+
+```text
+统计/可成交阈值预筛
+        ↓
+metadata request queued
+        ↓
+当前 Tick 跳过该候选
+        ↓
+后台单线程完成 CTP query
+        ↓
+下一次 scan 使用缓存
+```
+
+恢复已有动态仓位属于启动安全门，可以同步等待元数据；正常 Tick 关键路径不等待。
+
+交易日变化会使缓存失效并重新获取。
+
+## Warm History
+
+Auto 原始 Tick 先按 `sample_seconds` 桶化。只把有限的 `lookback + buffer` 样本写入：
+
+```text
+runtime/market_samples/
+```
+
+重启后先 warm-load，再继续收实时样本。不会将高频原始 Tick 或长期历史塞入主状态 JSON。
 
 ## 可成交价差
 
-策略历史中心仍可使用中间价构造稳定的统计序列，但开仓条件使用方向性可成交价差：
+历史统计中心可以使用 mid spread，但交易动作必须使用方向性可成交价差：
 
 ```text
-LONG_SPREAD  = near.ask - far.bid
-SHORT_SPREAD = near.bid - far.ask
+LONG entry  = near.ask - far.bid
+SHORT entry = near.bid - far.ask
+LONG exit   = near.bid - far.ask
+SHORT exit  = near.ask - far.bid
 ```
 
-执行器再次计算 Net Edge，因此策略信号本身不能绕过交易成本门。
+`PairExecutor` 再次计算 Net Edge，防止研究信号绕过真实成本门。
 
-## 状态真相
+## 风险与状态真相
 
-系统维护两个不同概念：
+`RiskManager` 控制账户、动态手数、市场微观结构和保证金；`PortfolioRiskAnalyzer` 控制 risk group 和滚动相关性。
 
-1. **本地期望持仓**：只由本进程已经确认的成交推进。
-2. **柜台完整持仓快照**：只用于对账，不会在异常时直接覆盖本地期望状态。
+本地期望持仓只由本进程确认的成交推进，柜台完整持仓快照只用于对账。未知成交、未知活动订单或持仓漂移不会被自动接纳。
 
-这样可以避免外部人工成交被系统“自动接纳”为正常状态。运行中如果完整快照和本地期望持仓不一致，会持久化停机。
-
-## 交易日切换
-
-CTP 交易日变化时，本地期望今仓先滚为昨仓，然后再和柜台完整快照对账。这样夜盘跨自然日和第二天重启不会因为今昨仓标签变化产生假漂移。
-
-## 异常状态机
-
-- `RUNNING`：允许经过全部安全门的新开仓和平仓。
-- `REDUCE_ONLY`：只允许撤单和减仓；典型触发条件是双腿失衡或紧急退出未完整成交。
-- `HALTED`：停止自动交易，要求人工复核。
-
-Kill Switch 持久化在状态文件中；重启不能自动绕过。
-
-## 状态完整性
-
-状态 JSON 使用 envelope：
+异常状态：
 
 ```text
-schema_version
-sequence
-state
-checksum
+RUNNING
+  ├─ 普通严重异常 → HALTED
+  └─ 裸腿/紧急退出失败 → REDUCE_ONLY → HALTED → 人工复核
 ```
 
-`checksum` 是 canonical JSON 的 SHA-256。程序还保存最后订单 ID 和成交 ID，用于人工审计和未来重复事件保护扩展。旧版裸状态文件可以迁移；高于当前 schema 的未来状态会被拒绝读取。
+Kill Switch、高水位、动态 pair 和策略状态都持久化；state envelope 带 schema / sequence / SHA-256 checksum。
 
-## CTP 元数据
+## Shadow 的安全边界
 
-实盘启动时从 VeighNa 合约缓存读取乘数和最小变动价位，并通过 CTP 查询账户保证金率和手续费。比较规则：
+`ShadowBroker` 组合：
 
-- 交易所、乘数、price tick 必须一致；
-- 本地保证金率不得小于实时查询值；
-- 本地任一手续费项不得小于实时查询值。
+```text
+真实 CTP：catalog / tick / trading_day / metadata / health
+本地 SimBroker：account / position / order / trade
+```
 
-查询失败或无法可靠表达的固定金额保证金结构会 fail-closed。
+`ShadowBroker.send_order()` 只调用 `SimBroker.send_order()`，从实现边界上禁止真实报单。每次 Shadow 会话使用独立虚拟账户和独立状态文件。
+
+## 证据链
+
+### Data Quality
+
+`data-check` 在研究前验证原始 CSV 顺序、断档、活动度、合约覆盖和每日 Auto 候选。
+
+### Final Auto Research
+
+`accept-auto` 直接运行最终 Auto 生产链，而不是固定 pair 的替代研究器。参数只由 Train+Validation 的小型全局邻域选择，OOS 只用于验收。
+
+### Robustness
+
+除成本压力外还执行：
+
+- leave-one-product-out；
+- single-product attribution；
+- remove-best-OOS-period；
+- depth haircut；
+- latency / market impact；
+- data gap；
+- cross-leg quote skew；
+- volume/OI missing。
+
+### Execution Quality
+
+统一 JSONL 区分：
+
+- `candidate`：Auto 选择证据；
+- `decision`：风险与执行决定；
+- `round_trip`：预期与实际成交质量。
+
+这样 first divergence 可以定位到 selector / risk / execution，而不是只看到最终账户收益变化。
+
+## 不增加的系统层
+
+个人系统当前不需要数据库、消息队列、Web 服务、微服务或第二交易框架。外部多年份数据可以标准化成 CSV；真实观察使用 Shadow；生产状态仍使用本地 JSON/JSONL。
