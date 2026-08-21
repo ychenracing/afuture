@@ -175,17 +175,20 @@ def _load_contracts(rows: list[dict]) -> dict[str, ContractSpec]:
 
 
 def _load_contract_catalog(rows: list[dict]) -> list[ContractInfo]:
-    """从研究配置提取自动回放所需的品种和到期日。
+    """从研究配置提取自动回放所需的品种、挂牌边界和到期日。
 
-    实盘不依赖这些字段，真实目录始终来自 CTP。
+    实盘不依赖这些字段，真实目录始终来自 CTP；历史 replay 若提供 ``listing``，
+    则必须保留它供 point-in-time Universe 过滤，防止未来合约提前进入候选池。
     """
     result: list[ContractInfo] = []
     for raw in rows:
         expiry = str(raw.get("expiry", "")).strip()
         if not expiry:
             continue
-        # 复用 ISO 日期解析，防止回放用错误到期日绕过自动过滤。
         date.fromisoformat(expiry)
+        listing = str(raw.get("listing", "")).strip()
+        if listing:
+            date.fromisoformat(listing)
         symbol = str(raw["symbol"])
         product = str(raw.get("product", "")).strip()
         if not product:
@@ -196,6 +199,7 @@ def _load_contract_catalog(rows: list[dict]) -> list[ContractInfo]:
                 exchange=str(raw["exchange"]).upper(),
                 product=product,
                 expiry=expiry,
+                listing=listing,
             )
         )
     return result
