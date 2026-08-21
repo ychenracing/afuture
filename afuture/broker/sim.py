@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from itertools import count
 
 from .base import Broker
@@ -84,7 +84,26 @@ class SimBroker(Broker):
         return {symbol: self.specs[symbol] for symbol in symbols}
 
     def get_contract_catalog(self) -> list[ContractInfo]:
-        return list(self._contract_catalog)
+        """历史回放只暴露当日已经挂牌的合约，实盘空 listing 语义保持不变。"""
+        if not self._trading_day:
+            return list(self._contract_catalog)
+        try:
+            today = datetime.strptime(self._trading_day, "%Y%m%d").date()
+        except ValueError:
+            return list(self._contract_catalog)
+
+        visible: list[ContractInfo] = []
+        for item in self._contract_catalog:
+            if item.listing:
+                try:
+                    listing = date.fromisoformat(item.listing)
+                except ValueError:
+                    # 历史可见性元数据损坏时 fail-closed，避免未来合约泄漏进 Universe。
+                    continue
+                if listing > today:
+                    continue
+            visible.append(item)
+        return visible
 
     def publish_tick(self, tick: Tick) -> None:
         tick.validate()
