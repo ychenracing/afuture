@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - codex/afuture-2y-realdata-optimization-20260821
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
