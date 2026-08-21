@@ -138,6 +138,33 @@ def test_confirmation_waits_for_retrace_before_opening():
     assert "confirmed" in confirmed.reason
 
 
+def test_confirmation_seed_consumes_historical_confirmation():
+    pair = relative_pair(
+        daily_sample_window="",
+        lookback=20,
+        entry_trend_window=6,
+        max_entry_z_slope=999.0,
+    )
+    scanner = SpreadScanner()
+    base = datetime(2026, 8, 1, 1, 0, tzinfo=timezone.utc)
+    synchronized: list[tuple[Tick, Tick]] = []
+    for index, ratio in enumerate([1.000, 1.002, 0.998, 1.001] * 5):
+        when = base + timedelta(hours=index)
+        synchronized.append(
+            (tick("m2609", when, 3000 * ratio), tick("m2701", when, 3000))
+        )
+    synchronized.append(
+        (tick("m2609", base + timedelta(hours=21), 3060), tick("m2701", base + timedelta(hours=21), 3000))
+    )
+    synchronized.append(
+        (tick("m2609", base + timedelta(hours=22), 3054), tick("m2701", base + timedelta(hours=22), 3000))
+    )
+
+    _z_history, armed, extreme = scanner.confirmation_seed(pair, synchronized)
+    assert armed == 0
+    assert extreme == 0.0
+
+
 def test_log_ratio_position_waits_for_executable_liquidation_reversion():
     strategy = CalendarSpreadStrategy(
         relative_pair(
