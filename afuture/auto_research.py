@@ -347,16 +347,24 @@ class AutoPortfolioRunner:
     def _terminal_liquidate(engine, broker, final_trading_day: str) -> tuple[bool, str]:
         """研究窗口末只用当日最后可见报价结清仓位，避免跨窗口免费丢弃持仓。
 
-        该路径只调用现有只减仓执行器，不改变生产 TradingEngine 的停机语义。
-        如果某条持仓腿没有窗口末当日报价，则拒绝用陈旧价格假装可以成交。
+        终端先撤销所有未完成委托；随后只调用现有只减仓执行器，不改变生产
+        TradingEngine 的停机语义。没有窗口末真实报价、存在未来报价依赖或无法
+        完整结清时均失败关闭，禁止复制最后一条行情来制造未来流动性。
         """
+        for order in broker.get_active_orders():
+            broker.cancel_order(order.order_id)
+        broker.poll_events()
+        if broker.get_active_orders():
+            return False, "terminal liquidation could not cancel active orders"
+
         positions = [position for position in broker.get_positions() if not position.empty]
         if not positions:
             return True, ""
+        if int(getattr(broker, "latency_ticks", 0)) > 0:
+            return False, "terminal liquidation requires a future quote under latency model"
 
         position_symbols = {position.symbol for position in positions}
         covered_symbols: set[str] = set()
-        liquidation_pairs: list[tuple[object, Tick, Tick]] = []
         for pair in engine.pairs.values():
             pair_symbols = {pair.near_symbol, pair.far_symbol}
             if not (pair_symbols & position_symbols):
@@ -371,23 +379,13 @@ class AutoPortfolioRunner:
                 engine.executor.flatten_imbalance(pair, near, far)
             except Exception as exc:
                 return False, f"terminal liquidation submission failed for {pair.pair_id}: {exc}"
-            liquidation_pairs.append((pair, near, far))
             covered_symbols.update(pair_symbols)
 
         uncovered = position_symbols - covered_symbols
         if uncovered:
             return False, f"terminal positions are not mapped to managed pairs: {sorted(uncovered)}"
 
-        # conservative simulation 可能要求若干 Tick 才使 FAK 达到撮合时点。
-        max_cycles = max(1, int(getattr(broker, "latency_ticks", 0)) + 1)
-        for _ in range(max_cycles):
-            if not broker.get_active_orders():
-                break
-            for _pair, near, far in liquidation_pairs:
-                broker.publish_tick(near)
-                broker.publish_tick(far)
         broker.poll_events()
-
         if broker.get_active_orders():
             for order in broker.get_active_orders():
                 broker.cancel_order(order.order_id)
