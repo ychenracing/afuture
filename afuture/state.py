@@ -10,7 +10,7 @@ from tempfile import NamedTemporaryFile
 
 from .models import ContractPosition, RuntimeMode
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @dataclass
@@ -24,6 +24,7 @@ class RuntimeState:
     positions: list[dict] = field(default_factory=list)
     strategy_states: dict[str, dict] = field(default_factory=dict)
     auto_pairs: dict[str, dict] = field(default_factory=dict)
+    auto_history: dict[str, list[dict]] = field(default_factory=dict)
     runtime_mode: str = RuntimeMode.RUNNING.value
     reduce_reason: str = ""
     metadata_verified: bool = False
@@ -41,7 +42,6 @@ class StateStore:
             return RuntimeState()
         raw = json.loads(self.path.read_text(encoding="utf-8"))
         if "schema_version" not in raw:
-            # 兼容旧版裸 RuntimeState JSON。
             allowed = RuntimeState.__dataclass_fields__
             return RuntimeState(**{k: v for k, v in raw.items() if k in allowed})
         if int(raw.get("schema_version", 0)) > SCHEMA_VERSION:
