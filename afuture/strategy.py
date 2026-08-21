@@ -75,7 +75,7 @@ class CalendarSpreadStrategy:
             self._last_sample_ts = None
 
     def on_quotes(self, near: Tick, far: Tick) -> SpreadSignal:
-        """历史中心用中间价维护，开仓阈值使用方向性可成交价差判断。"""
+        """历史中心用中间价维护，入场和持仓退出使用方向性可成交价差判断。"""
         near.validate()
         far.validate()
         timestamp = max(near.timestamp, far.timestamp)
@@ -132,29 +132,42 @@ class CalendarSpreadStrategy:
                 self._holding_samples = 0
         else:
             self._holding_samples += 1
-            anchored_z = (mid_spread - self._entry_mean) / max(
-                self._entry_std, 1e-9
-            )
+            # 平多价差时卖近买远，可实现价差是 short_exec；平空价差反之。
+            liquidation_spread = short_exec if self._position > 0 else long_exec
+            liquidation_z = (
+                liquidation_spread - self._entry_mean
+            ) / max(self._entry_std, 1e-9)
+            chosen_spread, chosen_z = liquidation_spread, liquidation_z
             current_std = max(std, 1e-9)
             mean_shift_z = max(
                 abs(mean - self._entry_mean),
                 abs(mid_spread - self._entry_mean),
             ) / max(self._entry_std, 1e-9)
             vol_ratio = current_std / max(self._entry_std, 1e-9)
-            # 已经回到入场锚点时直接正常退出；此时即便滚动波动率因入场异常点暂时放大，
-            # 也不应把“成功回归”误判成结构失效。
-            if abs(anchored_z) <= self.pair.exit_z:
+            reverted = (
+                self._position > 0 and liquidation_z >= -self.pair.exit_z
+            ) or (
+                self._position < 0 and liquidation_z <= self.pair.exit_z
+            )
+            stop_reached = (
+                self._position > 0 and liquidation_z <= -self.pair.stop_z
+            ) or (
+                self._position < 0 and liquidation_z >= self.pair.stop_z
+            )
+            # 只有真实可平仓价差回到入场锚点附近才正常退出，避免 mid 已回归但
+            # bid/ask 成本仍吞噬退出边际时过早平仓。
+            if reverted:
                 action = SignalAction.EXIT
-                reason = "spread reverted to entry anchor"
+                reason = "executable spread reverted to entry anchor"
             elif (
                 mean_shift_z >= self.pair.structural_mean_shift_z
                 or vol_ratio >= self.pair.structural_vol_ratio
             ):
                 action = SignalAction.EMERGENCY_EXIT
                 reason = "structural break detected"
-            elif abs(anchored_z) >= self.pair.stop_z:
+            elif stop_reached:
                 action = SignalAction.EMERGENCY_EXIT
-                reason = "entry anchored stop reached"
+                reason = "entry anchored executable stop reached"
             elif (
                 self.pair.max_holding_samples > 0
                 and self._holding_samples >= self.pair.max_holding_samples
