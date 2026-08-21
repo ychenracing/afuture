@@ -784,6 +784,9 @@ class TradingEngine:
                 self.broker, now=now, protected_pair_ids=protected
             )
         except Exception as exc:
+            # 当日目录或扫描不可确认时，旧的无持仓 Auto pair 不再拥有开仓权。
+            # 已有持仓 pair 仍保留管理/退出权限，等待下一次成功刷新恢复候选资格。
+            self._retiring_auto_pairs.update(self._auto_pair_ids - protected)
             self._record("auto_scan_error", {"reason": str(exc)})
             return
         if selected is None:
