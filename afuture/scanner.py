@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import exp, log, sqrt
+from math import exp, inf, log, sqrt
 
-from .economics import estimate_net_edge
+from .economics import estimate_net_edge, executable_spreads
 from .models import ContractSpec, PairConfig, SignalAction, Tick
 
 
@@ -30,6 +30,7 @@ class SpreadStatistics:
 
     zscore: float
     reference_mean: float
+    reference_std: float
     half_life: float
     stationarity_score: float
 
@@ -60,6 +61,31 @@ class SpreadScanner:
             and candidate.net_edge > 0
         ]
 
+    def entry_signal(
+        self,
+        pair: PairConfig,
+        near: Tick,
+        far: Tick,
+        statistics: SpreadStatistics,
+    ) -> tuple[SignalAction, float] | None:
+        """用与生产策略一致的方向性可成交价差判断是否真正越过开仓阈值。"""
+        long_spread, short_spread = executable_spreads(near, far)
+        short_z = self._z(
+            short_spread,
+            statistics.reference_mean,
+            statistics.reference_std,
+        )
+        long_z = self._z(
+            long_spread,
+            statistics.reference_mean,
+            statistics.reference_std,
+        )
+        if short_z >= pair.entry_z:
+            return SignalAction.SHORT_SPREAD, short_z
+        if long_z <= -pair.entry_z:
+            return SignalAction.LONG_SPREAD, long_z
+        return None
+
     def scan_pair(
         self,
         pair: PairConfig,
@@ -71,18 +97,14 @@ class SpreadScanner:
         statistics = self.statistics(pair, ticks, synchronized=synchronized)
         if statistics is None:
             return None
-        spreads = [near.mid_price - far.mid_price for near, far in synchronized]
-        zscore = statistics.zscore
-        mean = statistics.reference_mean
         near, far = synchronized[-1]
-        action = (
-            SignalAction.SHORT_SPREAD
-            if zscore > 0
-            else SignalAction.LONG_SPREAD
-        )
+        entry = self.entry_signal(pair, near, far, statistics)
+        if entry is None:
+            return None
+        action, zscore = entry
         edge = estimate_net_edge(
             action,
-            reference_mean=mean,
+            reference_mean=statistics.reference_mean,
             near=near,
             far=far,
             specs=specs,
@@ -161,11 +183,12 @@ class SpreadScanner:
         mean = sum(history) / len(history)
         variance = sum((value - mean) ** 2 for value in history) / len(history)
         std = sqrt(variance)
-        zscore = 0.0 if std <= 1e-12 else (spreads[-1] - mean) / std
+        zscore = self._z(spreads[-1], mean, std)
         half_life, stationarity_score = self._mean_reversion_stats(spreads)
         return SpreadStatistics(
             zscore=zscore,
             reference_mean=mean,
+            reference_std=std,
             half_life=half_life,
             stationarity_score=stationarity_score,
         )
@@ -217,6 +240,17 @@ class SpreadScanner:
             result.append((near, far))
             last_sample = timestamp
         return result
+
+    @staticmethod
+    def _z(value: float, mean: float, std: float) -> float:
+        delta = value - mean
+        if std <= 1e-12:
+            if delta > 0:
+                return inf
+            if delta < 0:
+                return -inf
+            return 0.0
+        return delta / std
 
     @staticmethod
     def _mean_reversion_stats(values: list[float]) -> tuple[float, float]:

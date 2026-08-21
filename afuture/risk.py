@@ -30,6 +30,7 @@ class RiskConfig:
     max_open_pairs: int = 3
     max_contract_volume: int = 10
     max_quote_age_seconds: float = 10.0
+    max_leg_skew_seconds: float = 2.0
     expiry_blackout_days: int = 5
     min_available_ratio: float = 0.50
     margin_estimate_buffer: float = 1.20
@@ -130,7 +131,7 @@ class RiskManager:
         ticks: list[Tick],
         now: datetime | None = None,
     ) -> RiskDecision:
-        """检查行情合法性、交易日一致性和跨腿时间差。"""
+        """检查行情合法性、交易日一致性、时效性和跨腿时间差。"""
         if not ticks:
             return RiskDecision(False, "missing quotes")
         now = now or datetime.now(timezone.utc)
@@ -138,18 +139,25 @@ class RiskManager:
             return RiskDecision(
                 False, "quotes belong to different trading days"
             )
+        timestamps: list[datetime] = []
         for tick in ticks:
             try:
                 tick.validate()
             except ValueError as exc:
                 return RiskDecision(False, f"invalid quote: {exc}")
+            timestamp = tick.timestamp.astimezone(timezone.utc)
+            timestamps.append(timestamp)
             age = (
-                now - tick.timestamp.astimezone(timezone.utc)
+                now.astimezone(timezone.utc) - timestamp
             ).total_seconds()
             if age < -2:
                 return RiskDecision(False, "quote timestamp is in the future")
             if age > self.config.max_quote_age_seconds:
                 return RiskDecision(False, "stale quote")
+        if len(timestamps) > 1:
+            skew = (max(timestamps) - min(timestamps)).total_seconds()
+            if skew > self.config.max_leg_skew_seconds:
+                return RiskDecision(False, "cross-leg quote skew limit exceeded")
         return RiskDecision(True)
 
     def check_pair_calendar(
@@ -415,6 +423,8 @@ class RiskManager:
             raise ValueError("position limits must be positive")
         if self.config.max_quote_age_seconds <= 0:
             raise ValueError("max_quote_age_seconds must be positive")
+        if self.config.max_leg_skew_seconds <= 0:
+            raise ValueError("max_leg_skew_seconds must be positive")
         if self.config.max_orders_per_minute <= 0:
             raise ValueError("max_orders_per_minute must be positive")
         if self.config.expiry_blackout_days < 0:

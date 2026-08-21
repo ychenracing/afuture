@@ -98,6 +98,9 @@ class PairExecutor:
                 )
             volume = max(request.volume for request in requests)
 
+        # 先提交当前可成交深度较薄的一腿，把更深的一腿留作第二腿对冲，
+        # 降低第一腿成交后第二腿因流动性不足而留下裸腿的概率。
+        requests = self._prioritize_requests(requests, near, far)
         order_ids: list[str] = []
         try:
             for request in requests:
@@ -316,6 +319,29 @@ class PairExecutor:
                 for child in children
             )
         return requests
+
+    @staticmethod
+    def _request_depth(request: OrderRequest, tick: Tick) -> float:
+        return (
+            tick.ask_volume
+            if request.side is OrderSide.BUY
+            else tick.bid_volume
+        )
+
+    def _prioritize_requests(
+        self,
+        requests: list[OrderRequest],
+        near: Tick,
+        far: Tick,
+    ) -> list[OrderRequest]:
+        tick_map = {near.symbol: near, far.symbol: far}
+        # Python 排序稳定；深度相同则保留策略构造的原始腿顺序。
+        return sorted(
+            requests,
+            key=lambda request: self._request_depth(
+                request, tick_map[request.symbol]
+            ),
+        )
 
     def _aggressive_price(self, tick: Tick, side: OrderSide) -> float:
         spec = self.specs[tick.symbol]

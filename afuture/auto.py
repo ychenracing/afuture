@@ -275,9 +275,24 @@ class AutoPairManager:
         return True
 
     def observe(self, tick: Tick) -> None:
+        """按策略采样周期保留行情，避免高频原始 Tick 挤掉统计时间窗口。"""
         history = self._history.get(tick.symbol)
-        if history is not None:
+        if history is None:
+            return
+        sample_seconds = self.config.sample_seconds
+        if sample_seconds <= 0 or not history:
             history.append(tick)
+            return
+
+        current_bucket = int(tick.timestamp.timestamp() // sample_seconds)
+        last_bucket = int(history[-1].timestamp.timestamp() // sample_seconds)
+        if current_bucket < last_bucket:
+            # CTP 偶发乱序回报不应倒退统计窗口。
+            return
+        if current_bucket == last_bucket:
+            history[-1] = tick
+            return
+        history.append(tick)
 
     def should_scan(self, now: datetime) -> bool:
         if self._last_scan is None:
@@ -299,8 +314,6 @@ class AutoPairManager:
         scored: list[tuple[PairConfig, float]] = []
         self.last_eligible_ids = set()
         for pair in self.candidate_pairs:
-            if pair.pair_id in protected_pair_ids:
-                continue
             near_history = self._history.get(pair.near_symbol, ())
             far_history = self._history.get(pair.far_symbol, ())
             if len(near_history) < pair.lookback or len(far_history) < pair.lookback:
@@ -316,14 +329,14 @@ class AutoPairManager:
             statistics = self.scanner.statistics(pair, ticks)
             if statistics is None:
                 continue
-            if abs(statistics.zscore) < pair.entry_z:
+            if self.scanner.entry_signal(pair, near, far, statistics) is None:
                 continue
             if statistics.stationarity_score < self.config.min_stationarity_score:
                 continue
             if statistics.half_life > self.config.max_half_life:
                 continue
 
-            # 只有纯行情统计已经接近开仓时才查询 CTP 保证金/手续费，减少流控和阻塞。
+            # 只有纯行情统计和可成交阈值都接近开仓时才查询 CTP 保证金/手续费，减少流控和阻塞。
             pair_specs = self._ensure_specs(broker, pair)
             candidate = self.scanner.scan_pair(pair, ticks, pair_specs)
             if candidate is None:
