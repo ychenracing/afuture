@@ -1,264 +1,229 @@
 # afuture
 
-`afuture` 是一个面向个人使用的国内商品期货**同品种跨期套利自动交易程序**。目标不是建设庞大交易平台，而是保持一条小而完整、可审计、可停机恢复的生产闭环：
+`afuture` 是一个面向个人使用的国内商品期货**同品种跨期套利自动交易程序**。目标不是建设交易平台，而是保持一条小而完整、可以自己发现机会、自己筛选、自己下单、出现异常能够只减仓并恢复的闭环。
 
 ```text
-真实数据资格门 → CTP 合约发现 → 自动选相邻月份 → 统计/流动性/Net Edge 筛选
-             → 风险预算 → 双腿执行 → 异常只减仓 → Shadow/实盘证据复验
+CTP 合约目录 / 历史 point-in-time Universe
+        ↓
+AutoPairManager：到期过滤 → front-3 → 相邻月份
+        ↓
+活动度 / 均值回归 / 可成交价差 / Net Edge
+        ↓
+少量 open-eligible pairs
+        ↓
+CalendarSpreadStrategy
+        ↓
+PortfolioRisk + RiskManager
+        ↓
+PairExecutor → CTP
+        ↓
+状态、审计、告警、Execution Quality
 ```
 
-系统基于 VeighNa `vnpy_ctp` 接入期货公司 CTP。正式策略只做同一品种不同交割月份的跨期套利，不引入方向性期货、跨品种、期现、期权、高频做市、在线自动调参或机器学习选标。
+系统基于 VeighNa `vnpy_ctp` 接入 CTP。策略范围刻意保持小：只做同品种跨期，不增加跨品种、期现、期权、高频做市、在线自动调参、GUI、数据库或微服务。
 
-> 历史回测不能保证未来高收益或低回撤。当前代码已经完成工程闭环和真实历史证据门，但生产晋级仍必须依赖 Shadow、测试柜台和极小真实仓位的实际手续费/滑点/稳定性证据。
+## 当前结论：工程闭环完成，Alpha **未晋级**
 
-## 当前生产策略
+2026-08-21 对历史证据做了完整 Code Review，并修正了多个会高估回测可交易性的口径：
 
-截至 2026-08-21 的固定生产候选白名单：
+- 夜盘按**中国期货交易日**而不是自然日归属；
+- 两腿必须在 `22:55-23:00` 内有**完全相同的 60 分钟时间戳**，不能用日盘或错位 bar 补腿；
+- 历史 Universe 每个交易日先做 20 天交割黑窗，再只保留 **front 3** 合约并生成相邻月份；
+- 历史 volume 使用该期货交易日截至采样时刻的累计值，并与生产 `min_volume=1000` 对齐；
+- 历史 listing 可进入 `ContractInfo`，防止未来合约提前进入回放 Universe；
+- 历史报单限速、裸腿超时、行情健康都使用**事件时间**，不再把几年的回放压缩成几秒 CPU 时间；
+- 组合相关性按时间桶交集对齐；
+- SimBroker 延迟成交回报先于同一 Tick 的新策略决策；
+- 风险/执行拒单后恢复真实策略状态，不再破坏入场锚点。
 
-- `M`：豆粕；
-- `OI`：菜籽油。
+在这些修正以后，冻结的日频 log-ratio 相对价值规则得到的 corrected diagnostic 是：
 
-运行时不会写死具体交割合约，而是从 CTP 合约目录中自动选择上述品种当前可交易的相邻月份组合。中心信号参数：
-
-| 参数 | 值 |
+| 项目 | 结果 |
 |---|---:|
-| `signal_transform` | `log_ratio` |
-| `lookback` | 25 个日样本 |
-| `entry_z` | 2.50 |
-| `confirmation_retrace_z` | 0.30 |
-| `min_confirmed_entry_z` | 1.75 |
-| `exit_z` | 0.75 |
-| `stop_z` | 4.00 |
-| `entry_trend_window` | 6 |
-| `max_entry_z_slope` | 0.75 |
-| `min_stationarity_score` | 0.01 |
-| `max_half_life` | 60 |
-| `max_holding_samples` | 20 天 |
-| `daily_sample_window` | 22:55-23:00 |
+| 前置两年资格品种 | `MA` |
+| 前置资格 → 后续 Train | **4 笔，-1.958R** |
+| 当前 Train+Validation 资格品种 | `M` |
+| Final OOS | **2 笔，+0.296R** |
+| Final OOS 最大回撤 | **-0.042R** |
+| 2024-08-21~2026-08-20 | **5 笔，+1.028R** |
+| 最近两年最大回撤 | **-0.042R** |
+| 16 个局部邻域稳定门 | **0 / 16 通过** |
+| 2% 单笔风险代理两年总收益 | **约 +2.07%** |
+| 2% 风险代理年化 | **约 +1.07%** |
+| 目标年化 | **100%** |
+| 目标达到 | **否** |
 
-入场不是看到 `±2.5σ` 就立即逆势交易，而是先武装极端偏离，再等待至少 `0.30σ` 的回归确认，同时仍保留至少 `1.75σ` 的有效偏离。随后还必须继续通过趋势斜率、平稳性、半衰期、成交量、Open Interest、盘口深度、双腿同步和 Net Edge 硬门。
+因此，旧的 `M/OI` “已验证生产 Alpha”结论已经作废。`config/afuture.live.example.toml` 现在只作为 **test/Shadow 研究模板**，风险预算已降到测试级；不能通过提高杠杆或风险预算把 1% 左右的证据“放大”为 100% 年化。
 
-## 两年真实数据证据
+> **事实边界：** 真实历史数据是 AKShare/Sina specific-contract 60 分钟 OHLC、成交量和持仓量。公开源没有过去两年的完整 L1 bid/ask/depth，因此历史执行成本只能使用保守代理；历史结果不能冒充真实盘口成交证据。
 
-主验收来自 AKShare 新浪**具体交割合约** 60 分钟历史，不使用连续合约或随机合成数据。
+## 对三个参考项目的迁移结果
 
-```text
-最近窗口：2024-08-21 ~ 2026-08-20，484 个交易日
-独立前置窗口：2022-08-22 ~ 2024-08-20，485 个交易日
-研究品种：A C EG FG I M MA OI P PP RB RM SA TA Y
-最近两年约 9.9 万根具体合约 60 分钟 K 线
-```
+收益不足后，项目按要求研究了：
 
-最近两年严格切分：
+- `rolling-panda-san/notebooks`：期限结构、basis/carry momentum 与 reversal；
+- `pairs-trading-egarch`：关系持久性、波动率 regime；
+- `slow-momentum-fast-reversion`：慢趋势 + 快速反转 / change-point 思想。
+
+没有直接复制第三方代码，也没有引入 TensorFlow/EGARCH 等重依赖，而是实现轻量、可消融的同类统计思想。预注册的 11 个 curve-family 配置覆盖：
 
 ```text
-Train       2024-08-21 ~ 2025-08-20
-Validation  2025-08-21 ~ 2026-02-20
-Final OOS   2026-02-21 ~ 2026-08-20
+log-ratio mean reversion
+basis reversal
+basis momentum
+slow-momentum-fast-reversion
 ```
 
-品种和参数资格先由 Train + Validation 固定，Final OOS 只负责否决。在 **2x 保守往返成本** 下，中心方案证据：
-
-| 验收 | 合格品种 | 交易数 | 累计 R | 最大回撤 R | 胜率 |
-|---|---|---:|---:|---:|---:|
-| 2022-2024 资格 → 下一年 Forward | A | 4 | +0.193 | -0.062 | 50% |
-| Train + Validation → Final OOS | M、OI | 4 | +1.208 | -0.042 | 75% |
-| 最近两年 M、OI 全窗口（描述性） | M、OI | 15 | +7.588 | -0.182 | 86.7% |
-
-16 组单变量参数邻域中 9 组同时通过前置 Forward 与当前 Final OOS，邻域通过率 `56.25%`。这说明中心点不是单一历史尖峰，但样本数量仍然偏少，因此不继续为了抬高回测收益扩大参数自由度。
-
-风险比例历史代理（不是实盘收益预测）：
-
-| 每笔风险比例 | 两年复合收益代理 | 历史最大回撤代理 |
-|---:|---:|---:|
-| 1.0% | +7.8% | -0.18% |
-| 1.5% | +11.9% | -0.27% |
-| 2.0% | +16.1% | -0.36% |
-
-生产示例把 `2%` 作为候选风险预算上限，同时保留 `35%` 保证金上限、`1%` 日亏损熔断和 `8%` 权益高水位回撤熔断；真实手数还会被盘口深度、保证金、单合约上限和 CTP 实时参数进一步压缩。
-
-完整证据见 [`docs/two_year_real_data_validation.md`](docs/two_year_real_data_validation.md)。
-
-## 生产链路
+在 Train + Validation + 2x 成本 + 邻域稳定门下：
 
 ```text
-CTP Contract Catalog / Historical Catalog
-                  ↓
-            AutoPairManager
-  M/OI 白名单 + 到期过滤 + 相邻月份
-                  ↓
- daily log-ratio / confirmation / stationarity
- volume / OI / depth / executable Net Edge
-                  ↓
-       少量 open-eligible pairs
-                  ↓
-       CalendarSpreadStrategy
-                  ↓
- PortfolioRiskAnalyzer + RiskManager
-                  ↓
-           PairExecutor
-                  ↓
-       CtpBroker / SimBroker
+family_support = {}
+stable_family_found = false
 ```
 
-关键约束：
+所以这些实验能力**没有晋级生产默认**。这是有价值的负结果：继续扩大相同历史数据上的参数自由度只会增加过拟合风险。
 
-- **可成交价差**：开仓、退出和止损都按真实可成交 bid/ask 方向计算，不用 mid-price 冒充成交；
-- **管理权与开仓权分离**：已有持仓即使失去 Auto 资格仍继续管理退出，但不能重新开仓；
-- **非阻塞元数据**：保证金/手续费查询在后台预取，Tick 关键路径不等待慢速 CTP 查询；
-- **有限 warm history**：只持久化 `lookback + buffer` 级别采样行情，日常重启不从零重新预热；
-- **组合风险**：限制同风险组暴露和高相关价差组合；
-- **异常状态机**：`RUNNING → REDUCE_ONLY → HALTED`，裸腿先减风险，状态不确定时 fail-closed；
-- **状态真相**：本地期望持仓与柜台完整快照分离，未知成交/订单/持仓漂移都会阻止继续开仓。
+## 核心生产能力
+
+### 自动发现和筛选
+
+- 从 CTP 合约目录读取品种、交易所、到期日；
+- 到期过滤、front-3、相邻月份组合；
+- volume / Open Interest / 一档深度；
+- 异步双腿行情同步；
+- Z-score、半衰期、平稳性；
+- 可成交方向 bid/ask spread；
+- 手续费、滑点、legging buffer 后的 Net Edge；
+- 只激活少量候选；已有仓位失去资格后仍管理退出，但立即失去新开仓权。
+
+### 策略
+
+正式链路支持 absolute spread 和 log-ratio 相对价值；当前冻结研究参数保留在示例配置中仅用于复现，不代表已晋级盈利策略。持仓退出使用真实可平仓方向的 executable spread，包含：
+
+- entry-anchored stop；
+- 最长持仓；
+- 结构均值漂移；
+- 波动率突变；
+- 回归确认；
+- stationarity / half-life 门。
+
+### 风控和执行
+
+- 动态风险预算手数；
+- 保证金、可用资金、日亏损、总回撤；
+- bid/ask 宽度、深度、涨跌停距离、交易时段；
+- risk-group 和时间对齐的组合相关性；
+- FAK 双腿、薄腿优先、撤单和回滚；
+- 平今/平昨；
+- `RUNNING → REDUCE_ONLY → HALTED`；
+- 裸腿异常只减仓；
+- 未知订单/成交/持仓漂移 fail-closed。
+
+### 生产证据
+
+- schema/sequence/SHA-256 状态文件；
+- 动态 pair 重启恢复；
+- CTP 实时乘数、tick、保证金、手续费元数据门；
+- Health Monitor；
+- JSONL 审计；
+- 文件/Webhook 告警；
+- Shadow 模式；
+- candidate / decision / round-trip Execution Quality；
+- `doctor` 无报单柜台检查。
 
 ## 安装
 
-研究、回放和测试：
+研究/测试：
 
 ```bash
 python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# Linux/macOS
-# source .venv/bin/activate
+# Windows: .venv\Scripts\activate
+# Linux/macOS: source .venv/bin/activate
 python -m pip install -e ".[dev]"
 ```
 
-需要 CTP：
+CTP：
 
 ```bash
 python -m pip install -e ".[live,dev]"
 ```
 
-当前实盘适配器针对 `vnpy 4.4.x` 与 `vnpy_ctp 6.7.11.4` 接口行为实现。升级 CTP/VeighNa 后必须重新做测试柜台验收。
-
-## 研究与验收
-
-先检查数据：
+## 常用命令
 
 ```bash
-afuture data-check \
-  --config config/afuture.auto-replay.example.toml \
-  --data path/to/multi_contract_ticks.csv
+# 配置校验
+afuture validate --config config/afuture.auto-replay.example.toml
+
+# 历史回放
+afuture replay --config config/afuture.auto-replay.example.toml --data path/to/ticks.csv
+
+# 数据质量
+afuture data-check --config config/afuture.auto-replay.example.toml --data path/to/ticks.csv
+
+# 最终 Auto Portfolio Walk-forward/OOS/Stress
+afuture accept-auto --config config/afuture.auto-replay.example.toml --data path/to/ticks.csv
+
+# 真实 CTP 行情 + 本地模拟订单
+afuture shadow --config config/afuture.live.example.toml
+
+# 无报单检查 CTP 登录/快照/目录/元数据
+afuture doctor --config config/afuture.live.example.toml
+
+# 执行质量汇总
+afuture quality-report --config config/afuture.live.example.toml --shadow
 ```
 
-单 pair 诊断：
+真实生产仍有双重显式门：生产环境配置 + `AFUTURE_LIVE_ACK=I_UNDERSTAND_FUTURES_RISK` + `--confirm-live`。
 
-```bash
-afuture accept \
-  --config config/afuture.example.toml \
-  --data examples/research_ticks.csv \
-  --pair m_calendar \
-  --train-days 4 \
-  --validation-days 2 \
-  --oos-days 2 \
-  --step-days 2 \
-  --stress-multipliers 1.0,1.5,2.0
-```
+## 两年真实数据研究
 
-最终 Auto Portfolio 研究入口：
+高成本 L4 workflow：`.github/workflows/research-2y.yml`。
 
-```bash
-afuture accept-auto \
-  --config config/afuture.auto-replay.example.toml \
-  --data path/to/multi_year_multi_contract_ticks.csv \
-  --train-days 120 \
-  --validation-days 40 \
-  --oos-days 40 \
-  --step-days 40 \
-  --stress-multipliers 1.0,1.5,2.0
-```
-
-`accept-auto` 复用最终生产链，覆盖 Train/Validation/OOS、全局小型参数邻域、成本压力、leave-one-product-out、single-product attribution、remove-best-period、深度 haircut、延迟、market impact、数据缺失、双腿异步和 activity 缺失。
-
-两年真实数据重新抓取属于昂贵的 L4 证据门，`.github/workflows/research-2y.yml` 只保留手动触发；普通小改动不重复抓取和回测相同历史状态。
-
-## Shadow：真实行情，不发真实单
-
-```bash
-afuture shadow --config config/live.toml
-```
-
-Shadow 使用真实 CTP 行情、合约目录、保证金和手续费元数据，但订单只进入本地保守 `SimBroker`，不会调用真实 CTP `send_order()`。
-
-证据输出：
+它固定：
 
 ```text
-runtime/shadow_execution_quality.jsonl
-runtime/shadow_market_samples/
-runtime/shadow_audit.jsonl
+2022-08-22~2023-08-20 prior1
+2023-08-21~2024-08-20 prior2
+2024-08-21~2025-08-20 train
+2025-08-21~2026-02-20 validation
+2026-02-21~2026-08-20 final OOS
 ```
 
-汇总：
+品种身份是选择规则的**输出**，不硬编码成验收条件。经济门固定检查：prior-forward、final OOS、两年样本、回撤、2x 成本和 16 个邻域稳定性。脚本正常运行但经济门失败时返回 code `2`，workflow 仍保存完整证据并标记 `accepted=false`；这与工程测试失败严格区分。
 
-```bash
-afuture quality-report --config config/live.toml --shadow
-```
+当前 final OOS 已在多轮研究中被观察，因此对未来新特征**不再是 pristine holdout**。新策略若继续开发，应使用新的未来数据/Shadow 作为真正增量证据，而不是继续在同一 OOS 上优化。
 
-Execution Quality 会记录 candidate、decision、round-trip 三层证据，包括预期/实际价差、手续费、滑点、双腿成交时间差、部分成交、rollback、REDUCE_ONLY 和 realized Net Edge。
+## 下一步：不继续堆功能
 
-## CTP Doctor
+当前最合理的路线不是再增加指标或杠杆，而是：
 
-```bash
-afuture doctor --config config/live.toml
-```
+1. 保持当前工程闭环和低风险 test/Shadow 配置；
+2. 连续采集真实 CTP L1、真实手续费和执行质量；
+3. 用未来新增数据形成新的未见样本；
+4. 只有新 OOS + Shadow + test-cabinet 同时证明 Net Edge 后，才晋级某个品种/参数；
+5. 先 1 手、1 个 pair、小风险运行，再决定是否扩大；
+6. 没有新证据时保持 Feature Freeze。
 
-`doctor` 只检查登录、fresh account/position snapshot、合约目录、少量元数据和交易日，**永远不下单**。FAK/FOK、部分成交、拒单、断线、平今/平昨仍必须在期货公司测试柜台验证。
+不建议：
 
-## 实盘
-
-复制配置：
-
-```bash
-cp config/afuture.live.example.toml config/live.toml
-```
-
-密钥只从环境变量读取：
-
-```text
-AFUTURE_CTP_USER
-AFUTURE_CTP_PASSWORD
-AFUTURE_CTP_BROKER
-AFUTURE_CTP_APP_ID
-AFUTURE_CTP_AUTH_CODE
-```
-
-测试柜台：
-
-```bash
-afuture live --config config/live.toml
-```
-
-生产柜台还要求：
-
-```text
-AFUTURE_LIVE_ACK=I_UNDERSTAND_FUTURES_RISK
-```
-
-并显式执行：
-
-```bash
-afuture live --config config/live.toml --confirm-live
-```
-
-启动顺序：CTP 就绪 → Auto 合约目录/历史恢复 → fresh 账户/完整持仓快照 → 元数据门 → 遗留订单门 → 本地/柜台持仓对账 → `RUNNING`。
-
-## 现在不继续增加什么
-
-当前最大不确定性是 **Alpha 在真实执行后的持续性**，不是功能数量。除非后续 OOS/Shadow/实盘证据明确指出缺口，否则不继续增加：
-
+- 为达到 100% 年化提高杠杆；
+- 在已看过的 OOS 上继续大规模调参；
+- 每个品种单独拟合参数；
 - 全市场 `products=["*"]`；
-- 每商品独立参数；
-- 在线自动调参；
-- 新套利品类或方向性策略；
-- 为提高回测收益扩大风险预算；
-- GUI、Web 后台、数据库、Redis、Kafka、微服务。
+- ML/AI 选标；
+- 新增跨品种/期现/期权策略；
+- GUI、数据库、微服务。
 
-达到以下条件后应保持 Feature Freeze：多年份 OOS/成本压力不崩塌、Shadow 仍有真实 Net Edge、CTP 测试柜台通过异常场景、极小真实仓位连续运行无状态/对账事故、实际手续费和滑点没有吞掉主要 Edge、实际回撤符合预注册门。此后主要工作是观察、维护和定期 OOS 复验，而不是继续堆特征。
-
-详细说明：
+## 文档
 
 - [架构与数据流](docs/architecture.md)
 - [数据、回放与研究](docs/data-and-backtest.md)
+- [两年真实数据证据](docs/two_year_real_data_validation.md)
 - [实盘、Shadow 与恢复](docs/live-trading.md)
 - [生产上线检查表](docs/production-checklist.md)
+
+## 结论
+
+`afuture` 当前是一个**工程上完整、可以自动发现/筛选/下单、但经济 Alpha 尚未通过 corrected 两年证据门的实盘候选框架**。
+
+软件能力可以继续进入 Shadow 和测试柜台；高收益/低回撤目标仍是目标，不是已经实现的事实。只有新的独立证据真正通过，才允许把策略标记为生产晋级。
