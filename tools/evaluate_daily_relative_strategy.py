@@ -41,6 +41,9 @@ EXPECTED_PRIOR_PRODUCTS = ("A",)
 EXPECTED_CURRENT_PRODUCTS = ("M","OI")
 SAMPLE_START_MINUTE = 22 * 60 + 55
 SAMPLE_END_MINUTE = 23 * 60
+DAY_SESSION_START_MINUTE = 8 * 60
+DAY_SESSION_END_MINUTE = 20 * 60
+NIGHT_SESSION_START_MINUTE = 20 * 60
 
 
 def _contract_key(symbol: str) -> int:
@@ -49,57 +52,87 @@ def _contract_key(symbol: str) -> int:
 
 
 def _prepare_intraday(raw: pd.DataFrame) -> pd.DataFrame:
-    """Normalize raw 60-minute rows without collapsing the two legs separately."""
+    """Normalize 60-minute rows and map calendar timestamps to futures trading days.
+
+    China-futures night bars (>=20:00) belong to the next *observed* day-session
+    date. Using the next observed session rather than calendar +1 naturally maps
+    Friday night to Monday and avoids guessing the exchange holiday calendar.
+    If the next day session is unavailable in the downloaded evidence, the night
+    row is dropped fail-closed instead of assigning a speculative trading day.
+    """
     frame=raw.copy()
     frame["datetime"]=pd.to_datetime(frame["datetime"], errors="coerce")
     for column in ("close","volume","hold"):
         frame[column]=pd.to_numeric(frame[column],errors="coerce")
     frame=frame.dropna(subset=["datetime","close","volume","hold","symbol","product"])
     frame=frame.drop_duplicates(["symbol","datetime"],keep="last")
-    frame["date"]=frame["datetime"].dt.normalize()
-    return frame.sort_values(["datetime","symbol"]).reset_index(drop=True)
+    frame=frame.sort_values(["datetime","symbol"]).reset_index(drop=True)
+    if frame.empty:
+        frame["calendar_date"]=pd.Series(dtype="datetime64[ns]")
+        frame["trading_day"]=pd.Series(dtype="datetime64[ns]")
+        frame["visible_volume"]=pd.Series(dtype=float)
+        return frame
+
+    frame["calendar_date"]=frame["datetime"].dt.normalize()
+    minute=frame["datetime"].dt.hour*60+frame["datetime"].dt.minute
+    day_mask=(minute>=DAY_SESSION_START_MINUTE)&(minute<DAY_SESSION_END_MINUTE)
+    day_session_dates=pd.DatetimeIndex(
+        sorted(pd.to_datetime(frame.loc[day_mask,"calendar_date"].dropna().unique()))
+    )
+
+    trading_days=[]
+    for timestamp,natural_day in zip(frame["datetime"],frame["calendar_date"]):
+        current_minute=timestamp.hour*60+timestamp.minute
+        if current_minute>=NIGHT_SESSION_START_MINUTE:
+            index=day_session_dates.searchsorted(natural_day,side="right")
+            trading_days.append(
+                day_session_dates[index] if index<len(day_session_dates) else pd.NaT
+            )
+        else:
+            trading_days.append(natural_day)
+    frame["trading_day"]=pd.to_datetime(trading_days)
+    frame=frame.dropna(subset=["trading_day"]).sort_values(["datetime","symbol"]).reset_index(drop=True)
+    frame["visible_volume"]=(
+        frame.groupby(["product","symbol","trading_day"],sort=False)["volume"]
+        .cumsum()
+    )
+    return frame
 
 
 def build_pair_frames(prior: pd.DataFrame, current: pd.DataFrame) -> dict[tuple[str,str,str],pd.DataFrame]:
-    """Build one daily observation only from a synchronized production-window bar.
+    """Build one daily observation from the synchronized production-window bar.
 
-    Prices and OI come from the last *exact common* 60-minute timestamp inside
-    22:55-23:00. Daily volume remains the full-day sum, approximating the
-    cumulative activity visible to live CTP at the sampling time. If either leg
-    has no quote in the production window, that date is absent rather than
-    falling back to an earlier day-session price.
+    Price and OI come from the last *exact common* 60-minute timestamp inside
+    22:55-23:00. Volume is cumulative only through that sample timestamp within
+    the mapped futures trading day. If either leg has no quote in the production
+    window, the trading day is absent rather than falling back to day-session data.
     """
     combined=_prepare_intraday(pd.concat([prior,current],ignore_index=True))
     if combined.empty:
         return {}
-    daily_volume=(
-        combined.groupby(["product","symbol","date"],as_index=False)
-        .agg(day_volume=("volume","sum"))
-    )
     minute=combined["datetime"].dt.hour*60+combined["datetime"].dt.minute
     sample=combined[(minute>=SAMPLE_START_MINUTE)&(minute<=SAMPLE_END_MINUTE)].copy()
     if sample.empty:
         return {}
     sample=(
         sample.sort_values("datetime")
-        .groupby(["product","symbol","date"],as_index=False)
+        .groupby(["product","symbol","trading_day"],as_index=False)
         .tail(1)
-        .merge(daily_volume,on=["product","symbol","date"],how="left")
     )
 
     result={}
     for product, group in sample.groupby("product"):
         symbols=sorted(group["symbol"].astype(str).unique(), key=_contract_key)
         for near_symbol, far_symbol in zip(symbols, symbols[1:]):
-            near=group[group.symbol==near_symbol][["date","datetime","close","day_volume","hold"]].rename(
-                columns={"datetime":"sample_timestamp","close":"near","day_volume":"near_vol","hold":"near_hold"})
-            far=group[group.symbol==far_symbol][["date","datetime","close","day_volume","hold"]].rename(
-                columns={"datetime":"sample_timestamp","close":"far","day_volume":"far_vol","hold":"far_hold"})
-            pair=near.merge(far,on=["date","sample_timestamp"])
+            near=group[group.symbol==near_symbol][["trading_day","datetime","close","visible_volume","hold"]].rename(
+                columns={"datetime":"sample_timestamp","close":"near","visible_volume":"near_vol","hold":"near_hold"})
+            far=group[group.symbol==far_symbol][["trading_day","datetime","close","visible_volume","hold"]].rename(
+                columns={"datetime":"sample_timestamp","close":"far","visible_volume":"far_vol","hold":"far_hold"})
+            pair=near.merge(far,on=["trading_day","sample_timestamp"])
             if pair.empty:
                 continue
             pair=pair.sort_values("sample_timestamp").reset_index(drop=True)
-            pair["datetime"]=pair["date"]
+            pair["datetime"]=pair["trading_day"]
             pair["raw"]=pair["near"]-pair["far"]
             pair["logratio"]=np.log(pair["near"]/pair["far"])
             result[(str(product),near_symbol,far_symbol)]=pair
@@ -296,10 +329,10 @@ def main():
 
     coverage={}
     for label,frame in (("prior",prior),("current",current)):
-        frame=frame.copy();frame["datetime"]=pd.to_datetime(frame["datetime"])
+        prepared=_prepare_intraday(frame)
         coverage[label]={
-            str(product):int(group.datetime.dt.normalize().nunique())
-            for product,group in frame.groupby("product")
+            str(product):int(group.trading_day.nunique())
+            for product,group in prepared.groupby("product")
         }
 
     qualified_prior=qualify(frames,PROFILE,"prior1","prior2")
@@ -328,7 +361,8 @@ def main():
     report={
         "source":"AKShare Sina specific-contract 60-minute bars",
         "sample_reference":"last exact common 60-minute timestamp within 22:55-23:00 China-time production window; no day-session fallback",
-        "pair_alignment":"near/far price and open interest must share the same 60-minute timestamp; daily volume is full-day accumulated volume",
+        "trading_day_mapping":"night bars >=20:00 map to the next observed day-session date; unmatched tail nights are dropped fail-closed",
+        "pair_alignment":"near/far price and open interest share the same 60-minute timestamp; volume is cumulative only through that sample within the mapped futures trading day",
         "windows":WINDOWS,
         "profile":PROFILE,
         "cost_stress":"2x conservative round-trip ticks",
