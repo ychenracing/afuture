@@ -36,6 +36,10 @@ class AutoPortfolioAcceptanceGate:
     def evaluate(self, result) -> AutoPortfolioAcceptanceDecision:
         reasons: list[str] = []
         folds = list(result.folds)
+        aggregate_oos_return = sum(
+            float(fold.oos_metrics.get("total_return", 0.0))
+            for fold in folds
+        )
         if not folds:
             reasons.append("no auto portfolio walk-forward folds")
             positive_ratio = 0.0
@@ -51,6 +55,8 @@ class AutoPortfolioAcceptanceGate:
                 for fold in folds
             )
             trade_legs = sum(int(fold.oos_metrics.get("trade_count", 0)) for fold in folds)
+            if aggregate_oos_return <= 0:
+                reasons.append("aggregate OOS return is not positive")
             if positive_ratio < self.min_positive_oos_ratio:
                 reasons.append("positive OOS fold ratio is too low")
             if worst_drawdown > self.max_oos_drawdown:
@@ -80,6 +86,7 @@ class AutoPortfolioAcceptanceGate:
             reasons.append("single-product attribution is too concentrated")
 
         metrics = {
+            "aggregate_oos_return": aggregate_oos_return,
             "positive_oos_ratio": positive_ratio,
             "worst_oos_drawdown": worst_drawdown,
             "oos_trade_legs": trade_legs,
