@@ -776,7 +776,7 @@ class TradingEngine:
                 self._trading_date(),
                 retained_pairs=[
                     self.pairs[pair_id]
-                    for pair_id in self._auto_pair_ids
+                    for pair_id in sorted(protected)
                     if pair_id in self.pairs
                 ],
             )
