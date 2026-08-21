@@ -59,6 +59,7 @@ class DataQualityAnalyzer:
         seen: set[tuple[str, object]] = set()
         last_seen: dict[str, object] = {}
         rows_by_symbol: dict[str, list[Tick]] = defaultdict(list)
+        symbols_by_day: dict[str, set[str]] = defaultdict(set)
 
         for row in ticks:
             key = (row.symbol, row.timestamp)
@@ -76,6 +77,7 @@ class DataQualityAnalyzer:
             if row.volume <= 0 or row.open_interest <= 0:
                 activity_missing += 1
             rows_by_symbol[row.symbol].append(row)
+            symbols_by_day[row.trading_day].add(row.symbol)
 
         gaps = 0
         for rows in rows_by_symbol.values():
@@ -107,12 +109,14 @@ class DataQualityAnalyzer:
         daily_candidates: dict[str, int] = {}
         if catalog and auto_config is not None and auto_config.enabled:
             selector = AutoPairSelector(auto_config)
-            for trading_day in sorted({row.trading_day for row in ticks}):
+            for trading_day in sorted(symbols_by_day):
                 try:
                     day = date(int(trading_day[:4]), int(trading_day[4:6]), int(trading_day[6:8]))
                 except Exception:
                     continue
-                daily_candidates[trading_day] = len(selector.build_pairs(catalog, day))
+                observed = symbols_by_day[trading_day]
+                daily_catalog = [item for item in catalog if item.symbol in observed]
+                daily_candidates[trading_day] = len(selector.build_pairs(daily_catalog, day))
 
         failures: list[str] = []
         warnings: list[str] = []
@@ -128,13 +132,17 @@ class DataQualityAnalyzer:
             warnings.append(f"rows missing volume/open_interest: {activity_missing}")
         if gaps:
             warnings.append(f"long intra-day gaps: {gaps}")
-        if daily_candidates and not any(daily_candidates.values()):
-            failures.append("auto universe has no candidate pairs in dataset")
+        zero_candidate_days = [day for day, count in daily_candidates.items() if count <= 0]
+        if zero_candidate_days:
+            failures.append(
+                "auto universe has no observed two-leg candidate on trading days: "
+                + ",".join(zero_candidate_days[:10])
+            )
 
         return DataQualityResult(
             tick_count=len(ticks),
             contract_count=len(rows_by_symbol),
-            trading_days=len({row.trading_day for row in ticks}),
+            trading_days=len(symbols_by_day),
             duplicate_count=duplicates,
             out_of_order_count=out_of_order,
             invalid_quote_count=invalid,
