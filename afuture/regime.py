@@ -13,7 +13,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import inf, log, sqrt
+from math import log, sqrt
+
+
+_MAX_Z = 12.0
 
 
 @dataclass(frozen=True)
@@ -151,9 +154,10 @@ def _trend_shift_z(history: list[float], current: float) -> float:
     variance = sum((value - ref_mean) ** 2 for value in reference) / len(reference)
     std = sqrt(variance)
     recent_mean = sum(recent) / len(recent)
+    delta = abs(recent_mean - ref_mean)
     if std <= 1e-12:
-        return inf if abs(recent_mean - ref_mean) > 1e-12 else 0.0
-    return abs(recent_mean - ref_mean) / std
+        return _MAX_Z if delta > 1e-12 else 0.0
+    return min(_MAX_Z, delta / std)
 
 
 def _latest_z(values: list[float]) -> float:
@@ -166,8 +170,8 @@ def _latest_z(values: list[float]) -> float:
     delta = values[-1] - mean
     if std <= 1e-12:
         if delta > 0:
-            return inf
+            return _MAX_Z
         if delta < 0:
-            return -inf
+            return -_MAX_Z
         return 0.0
-    return delta / std
+    return max(-_MAX_Z, min(_MAX_Z, delta / std))
