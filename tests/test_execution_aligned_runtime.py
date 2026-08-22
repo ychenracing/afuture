@@ -1,8 +1,10 @@
 from datetime import datetime, timezone
 
 import pandas as pd
+import pytest
 
 from afuture.directional import DirectionalConfig
+from afuture.execution_aligned_policy import FROZEN_PRODUCTS
 from afuture.execution_aligned_runtime import (
     ExecutionAlignedDirectionalPortfolioManager,
     ExecutionAlignedSignalHistory,
@@ -80,3 +82,18 @@ def test_execution_aligned_runtime_passes_open_and_close_history_to_policy():
     weights = manager._next_target_weights(history)
     assert weights == {"A": 1.0}
     assert policy.calls == 1
+
+
+def test_default_execution_aligned_runtime_requires_the_frozen_50_product_universe():
+    assert len(FROZEN_PRODUCTS) == 50
+    with pytest.raises(ValueError, match="frozen 50-product universe"):
+        ExecutionAlignedDirectionalPortfolioManager(
+            DirectionalConfig(
+                enabled=True,
+                products=("A", "M"),
+                exchanges=("DCE",),
+            ),
+            _Broker(),
+            RiskManager(RiskConfig()),
+            signal_provider=_Provider(),
+        )
