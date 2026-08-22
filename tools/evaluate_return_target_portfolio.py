@@ -214,7 +214,11 @@ def _metrics(series: pd.Series) -> dict:
         else -1.0
     )
     std = float(values.std(ddof=1))
-    sharpe = float(values.mean() / std * np.sqrt(252.0)) if std > 0 else 0.0
+    sharpe = (
+        float(values.mean() / std * np.sqrt(252.0))
+        if std > 1e-12
+        else 0.0
+    )
     drawdown = equity / equity.cummax() - 1.0
     return {
         "days": int(len(values)),
