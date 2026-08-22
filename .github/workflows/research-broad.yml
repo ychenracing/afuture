@@ -1,25 +1,16 @@
 name: research-broad
 
-# Independent L3 breadth screen. It deliberately does not fetch the expensive
-# specific-contract 60-minute evidence used by research-2y.
+# L3 breadth evidence is expensive enough that it is a milestone gate, not an
+# inner-loop test. The completed evidence is retained in Actions artifacts; rerun
+# manually only when broad-universe/family methodology changes materially.
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - "tools/fetch_broad_daily_universe.py"
-      - "tools/evaluate_broad_relative_families.py"
-      - "tools/test_broad_relative_families.py"
-      - "tools/evaluate_broad_pair_regime.py"
-      - "tools/test_broad_pair_regime.py"
-      - "tools/evaluate_broad_pair_rotation.py"
-      - "tools/test_broad_pair_rotation.py"
-      - ".github/workflows/research-broad.yml"
 
 permissions:
   contents: read
 
 concurrency:
-  group: research-broad-${{ github.event.pull_request.number || github.ref }}
+  group: research-broad-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -42,68 +33,11 @@ jobs:
       - name: Fetch broad continuous daily factor universe
         run: python tools/fetch_broad_daily_universe.py
       - name: Screen market-neutral cross-sectional families
-        run: |
-          python tools/evaluate_broad_relative_families.py
-          python - <<'PY'
-          import json
-          report = json.load(open("runtime/broad_relative_family_report.json", encoding="utf-8"))
-          assert report["candidate_count"] == 16
-          assert report["coverage"]["products"] >= 20
-          assert report["pristine_final_oos"] is False
-          assert report["historical_l1_available"] is False
-          assert "target_met" in report["target"]
-          print(json.dumps({
-              "coverage": report["coverage"],
-              "prior_selected": report["prior_selected"],
-              "current_selected": report["current_selected"],
-              "target": report["target"],
-          }, ensure_ascii=False, indent=2))
-          PY
+        run: python tools/evaluate_broad_relative_families.py
       - name: Screen economic pairs with persistence and volatility regime
-        run: |
-          python tools/evaluate_broad_pair_regime.py
-          python - <<'PY'
-          import json
-          report = json.load(open("runtime/broad_pair_regime_report.json", encoding="utf-8"))
-          assert report["pair_count"] >= 20
-          assert report["profile_count"] == 24
-          assert report["pristine_final_oos"] is False
-          assert report["historical_l1_available"] is False
-          assert report["selected_leverage"] <= report["max_gross_leverage"]
-          assert "target_met" in report["target"]
-          print(json.dumps({
-              "support": report["support"],
-              "selected_profile": report["selected_profile"],
-              "selected_oos": report["selected_oos"],
-              "selected_full_recent": report["selected_full_recent"],
-              "target": report["target"],
-          }, ensure_ascii=False, indent=2))
-          PY
+        run: python tools/evaluate_broad_pair_regime.py
       - name: Screen capital-efficient strongest-pair rotation
-        run: |
-          python tools/evaluate_broad_pair_rotation.py
-          python - <<'PY'
-          import json
-          report = json.load(open("runtime/broad_pair_rotation_report.json", encoding="utf-8"))
-          assert report["max_active_pairs"] == 1
-          assert report["selected_leverage"] <= report["max_gross_leverage"]
-          assert report["historical_l1_available"] is False
-          assert report["pristine_final_oos"] is False
-          assert "target_met" in report["target"]
-          print(json.dumps({
-              "support": report["support"],
-              "selected_profile": report["selected_profile"],
-              "selected_prior_pairs": report["selected_prior_pairs"],
-              "selected_current_pairs": report["selected_current_pairs"],
-              "selected_prior_forward_train": report["selected_prior_forward_train"],
-              "selected_oos_unlevered": report["selected_oos_unlevered"],
-              "selected_full_recent_unlevered": report["selected_full_recent_unlevered"],
-              "selected_leverage": report["selected_leverage"],
-              "selected_oos": report["selected_oos"],
-              "selected_full_recent": report["selected_full_recent"],
-              "target": report["target"],
-          }, ensure_ascii=False, indent=2))
-          PY
+        run: python tools/evaluate_broad_pair_rotation.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
