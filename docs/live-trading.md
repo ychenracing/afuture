@@ -4,20 +4,27 @@
 
 `afuture` 支持两种账户互斥模式：Calendar Spread / Auto 与 Execution-Aligned Directional。两者共用 Broker、`RiskManager`、Kill Switch、`REDUCE_ONLY`、StateStore、启动对账和审计链。
 
-Directional 的 107.4623% 是存在历史选择偏差的 float-notional L4 结果，不等于真实资金已获批准。
+Directional 必须同时理解两套证据：
+
+- float-notional L4：selection-biased 最近两年 Base 年化 **107.4623%**；
+- production-mechanics proxy：当前账户机械和风险门下 Base 年化约 **6.7861%**，2024-09-19 触发 5% 日亏损门后停机。
+
+所以当前代码级生产接线完成不等于 100% 收益已经 production-equivalent，更不等于真实资金已获批准。
 
 ## 2. 推荐上线顺序
 
 ```text
-历史 L4 + production-mechanics proxy
+历史 L4 + production-mechanics evidence
 → 多交易日 CTP Shadow
 → CTP doctor
 → 测试柜台 FAK/partial/reject/reconnect
 → 极小真实仓位
 → execution-quality / 结算单核对
 → 新发生未来数据
-→ 再决定是否扩大
+→ 再决定是否扩大或调整风险
 ```
+
+当前最重要的验证问题不是“还能否把历史回测调得更高”，而是：真实 margin、slippage、commission、risk-off 是否支持比 proxy 更有效、同时仍安全的风险暴露。
 
 ## 3. 凭证
 
@@ -44,62 +51,61 @@ AFUTURE_LIVE_ACK=I_UNDERSTAND_FUTURES_RISK
 使用 `config/afuture.directional-live.example.toml` 作为 test/Shadow 起点：
 
 - 冻结 50 品种；
-- gross target ≤2.0x；
+- gross target 上限 2.0x；
 - 20 天 expiry filter；
 - `20:55-09:10` 跨午夜 rebalance window；
-- account/margin/cash/depth/limit/order-rate 硬门。
+- max margin 35%；
+- min available 25%；
+- daily loss 5%；
+- total drawdown 30%；
+- account/depth/limit/order-rate 硬门。
 
-宽 rebalance window 只表示“允许各品种在其第一个 fresh session 执行”，不保证所有品种同一秒成交。
+2.0x 是**允许的策略 target 上限**，不是承诺生产账户会持续保持 2.0x。Production proxy 已经证明现有风险门会显著改变实际风险路径。
 
 ## 5. Previous-day activity snapshot
 
-生产不再在开盘后用**当前交易日累计** OI/volume 重新挑主力。
+生产不在开盘后用当前交易日累计 OI/volume 重新挑主力。
 
-`DirectionalActivityTracker` 按 CTP `Tick.trading_day` 记录每个允许合约最后可见 activity。当 trading day 从 D 推进到下一日时：
+`DirectionalActivityTracker` 按 CTP `Tick.trading_day` 记录每个允许合约最后可见 activity。trading day 从 D 推进时：
 
 ```text
 D 日最终 volume/OI
 → DirectionalActivitySnapshot
 → 原子保存 directional_activity.json
-→ D+1 合约选择只读这个 completed snapshot
+→ D+1 选约只读 completed snapshot
 ```
 
-D+1 当前 Tick 仍必须 fresh，并用于 bid/ask、depth、limit、价格和实际下单；它只是不能改变已经冻结的 D 日主力选择。
+D+1 当前 Tick 仍用于 fresh quote、bid/ask、depth、limit、价格和下单，但不能改变 D 已冻结的主力。
 
-全新部署尚未积累 completed snapshot 时不允许新增 directional 风险。重启可从 sidecar 恢复最近完整 snapshot。
+全新部署无 completed snapshot 时不新增风险。重启可恢复 snapshot，但如果 OHLC 已证明存在比它更新的完整交易日，陈旧 snapshot 不能继续用于开仓。
 
 ## 6. Signal-day freshness
 
-每天进入 rebalance 生命周期时：
-
 ```text
 required_signal_day = completed activity day
-连续 OHLC 最新日期必须 >= required_signal_day
+continuous OHLC latest day >= required_signal_day
 ```
 
-`signal_max_age_hours=96` 只作为第二层长期停更/异常 timestamp 保护，不再靠小时数猜交易日。
+`signal_max_age_hours=96` 只是第二层长期停更/异常 timestamp 保护。
 
-- provider 临时失败，但缓存已覆盖 required day：允许使用缓存；
+- provider 临时失败，但缓存已覆盖 required day：允许缓存；
 - required day 缺失且账户为空：拒绝新增风险；
-- required day 缺失且已有 directional risk：返回 `risk_off`，进入 `REDUCE_ONLY` 并持续 flatten；
-- 数据来自未来或超过小时上限：同样 fail-closed。
+- required day 缺失且已有 directional risk：`risk_off → REDUCE_ONLY → flatten`；
+- completed activity 明显落后于已完成 signal day：fail-closed；
+- 数据来自未来或超过小时上限：fail-closed。
 
-因此外部日线源失效不会让接近 2x gross 的旧方向仓位无限期“原地不动”。
+因此外部日线源或 activity sidecar 异常不会让接近 2x gross 的旧仓无限期无管理地保留。
 
-## 7. 合约不可用时的 reduction-first
+## 7. 合约不可用时 reduction-first
 
-某个新目标产品没有 eligible contract/fresh quote 时，不再整体 reject 全组合。
+某个新目标产品没有 eligible contract/fresh quote 时不整体 reject 全组合：
 
-顺序为：
-
-1. 先读取 Broker 真实 positions；
+1. 读取 Broker 真实 positions；
 2. 计算 target weights；
-3. 找出 target=0、反转、超额等确定性 reductions；
-4. 缺失的新目标只禁止该产品新增/换月；已有该产品仓位临时保持当前手数；
-5. 其它 reductions 正常提交；
-6. reductions 结算后下一周期才允许 openings。
-
-这保证“新增风险不可用”不会阻塞“风险下降”。
+3. target=0、反转、超额等确定性 reductions 先执行；
+4. 缺失新目标只禁止该产品新增/换月；已有该产品仓位临时保持当前手数；
+5. 其它 reductions 继续；
+6. reductions 经 Broker 确认后的下一 cycle 才允许 openings。
 
 ## 8. Shadow
 
@@ -114,9 +120,26 @@ Directional Shadow 使用真实：
 - continuous OHLC signal；
 - 冻结 96-template policy；
 - integer target lots；
-- 正式 RiskManager 和 quality 生命周期。
+- 正式 RiskManager；
+- directional execution-quality 生命周期。
 
-账户/订单/成交/持仓由本地 SimBroker 维护，`ShadowBroker.send_order()` 不调用真实 CTP 报单。
+账户/订单/成交/持仓由本地 SimBroker 维护，Shadow 不调用真实 CTP `send_order()`。
+
+### Shadow 必须重点回答
+
+Production proxy 已发现巨大 research/live gap，因此 Shadow 不应只检查“程序不崩”。至少要持续记录：
+
+- target gross vs actual gross；
+- target lots vs actual lots；
+- margin ratio / available ratio；
+- daily loss / high-watermark drawdown；
+- planned vs realized turnover；
+- median/p95 slippage；
+- commission；
+- margin/reject/risk-off 次数；
+- 主力切换是否与 previous-day activity 一致。
+
+如果 Shadow 经常在目标建立前就触发 margin/risk gates，说明当前生产风险路径本身与 107.4623% L4 不同，而不是简单的“成交滑点问题”。
 
 ## 9. Doctor
 
@@ -128,84 +151,79 @@ Doctor 只检查登录、account/position snapshot、catalog、multiplier、pric
 
 ## 10. 新增风险门
 
-单合约 opening：
+单合约 opening：fresh quote、session、bid/ask width、top-of-book depth、limit-distance、contract volume cap。
 
-- fresh quote；
-- session；
-- bid/ask width；
-- top-of-book depth；
-- limit-distance；
-- contract volume cap。
+Opening batch：日亏损、high-watermark drawdown、当前/预计 margin、available cash、contract total volume、order-rate limiter。
 
-opening batch：
+Production proxy 最近两年：
 
-- 日亏损；
-- high-watermark drawdown；
-- 当前/预计 margin；
-- available cash；
-- contract total volume；
-- order-rate limiter。
+- Base：2024-09-19 `daily loss limit reached`；
+- Stress：14 个 margin reject days，最终 2024-09-19 `margin ratio limit reached`。
 
-2x gross 是策略目标上限，不是放宽账户保证金门的授权。
+这些不是应自动绕过的“回测障碍”，而是当前生产权限的真实组成部分。
 
 ## 11. REDUCE_ONLY
-
-Directional 的已有方向风险需要主动退出时：
 
 ```text
 RUNNING
 → REDUCE_ONLY
 → flatten/reducing FAK
-→ Broker 真实持仓变为 0
+→ Broker 真实持仓为 0
 → HALTED，等待人工复核
 ```
 
-账户日亏损/总回撤等场景不会直接 HALTED 后遗留 directional 风险。
+账户日亏损/总回撤/关键 signal failure 等需要退出已有方向风险时，不会直接 HALTED 后遗留 directional 风险。
 
 ## 12. 启动对账
 
-Directional 不持久化第二份策略仓位。重启时统一执行：
+Directional 不持久化第二份策略仓位。重启：
 
 1. Broker ready；
 2. fresh account/complete position snapshot；
 3. 处理活动订单；
 4. `RuntimeState.positions` 与 Broker 完整持仓逐合约比较；
 5. metadata/account gates；
-6. 完全一致才允许恢复。
+6. 完全一致才恢复。
 
 任何 mismatch 都 fail-closed。
 
 ## 13. Execution quality
 
-Directional 下单时 manager 只注册 expected execution metadata；真实 order/trade callback 到达后：
+下单时 manager 只注册 expected metadata；真实 order/trade callback 到达后：
 
 - 基础 TradingEngine 先更新统一 position truth；
 - quality 再记录 realized fill/slippage/commission；
 - order 终态不会在 trade callback 到达前抢先结束 cycle。
 
-`quality-report` 的 `directional` 子汇总应持续检查：
+持续检查 `quality-report.directional`：realized turnover、median/p95 slippage、commission、tracking error、completion latency、partial/rejected count。
 
-- realized turnover；
-- median / p95 slippage bps；
-- commission；
-- target tracking error；
-- completion latency；
-- partial/rejected count。
+## 14. Production proxy 的边界
 
-## 14. Production-mechanics proxy 的边界
-
-Proxy 已加入 multiplier、整数手数、contract cap、reduction-first、margin/cash、daily-loss/high-watermark，但仍没有多年历史真实：
+当前 production proxy 比 float L4 更接近账户语义，但仍没有多年历史真实：
 
 - L1 bid/ask/depth；
 - queue；
 - partial/reject；
 - CTP/交易所流控；
 - 逐日 Broker margin schedule；
-- 真实结算手续费。
+- 真实结算手续费；
+- reduction 成交确认后的下一 cycle opening 价格。
 
-因此它比 float-notional L4 更接近账户语义，但仍不是实盘收益承诺。
+日线 proxy 在一个交易日内只能用 open/close 近似阶段执行，因此 **6.7861% 也不是未来真实收益预测**。
 
-## 15. 测试柜台必须验证
+## 15. 风险参数调整原则
+
+不要因为 production proxy 低于 100% 就直接放宽 daily-loss、drawdown、margin、cash reserve 或 leverage。任何调整必须来自：
+
+- 实际账户风险承受能力；
+- 多日 Shadow；
+- 测试柜台真实 margin/fee/fill；
+- 极小资金 realized drawdown；
+- 新发生未见数据。
+
+目标是提高**可兑现净收益/风险比**，不是强制让历史 production proxy 回到某个预设数字。
+
+## 16. 测试柜台必须验证
 
 - FAK 开/平；
 - partial / reject；
@@ -214,8 +232,8 @@ Proxy 已加入 multiplier、整数手数、contract cap、reduction-first、mar
 - 断线重连；
 - metadata/query/order rate；
 - 多合约 reduction-first；
-- signal risk-off → REDUCE_ONLY；
+- signal/activity risk-off → REDUCE_ONLY；
 - restart reconcile；
-- 实际手续费。
+- 实际手续费和 margin。
 
 这些通过后再进入极小真实仓位。
