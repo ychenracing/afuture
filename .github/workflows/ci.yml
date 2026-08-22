@@ -24,5 +24,6 @@ jobs:
           tests/test_directional_quality.py
           tests/test_directional_acceptance.py
           tests/test_directional_acceptance_simulation.py
+          tests/test_directional_surface.py
       - run: python tools/test_directional_production_mechanics.py
       - run: python -m compileall -q afuture
