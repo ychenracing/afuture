@@ -1,7 +1,10 @@
 import numpy as np
 import pandas as pd
 
-from afuture.execution_aligned_policy import ExecutionAlignedAggressivePolicy
+from afuture.execution_aligned_policy import (
+    ExecutionAlignedAggressivePolicy,
+    _clean_prices,
+)
 
 
 def _history(periods: int = 220):
@@ -35,6 +38,12 @@ def test_execution_aligned_policy_is_causal_and_capped_at_two_x():
     pd.testing.assert_series_equal(weights.iloc[-1], changed.iloc[-1])
 
 
+def test_execution_aligned_policy_freezes_product_order():
+    _, close = _history()
+    ordered = _clean_prices(close, ("RB", "A", "M", "CU"))
+    assert list(ordered.columns) == ["A", "CU", "M", "RB"]
+
+
 def test_execution_aligned_policy_uses_frozen_meta_shape():
     policy = ExecutionAlignedAggressivePolicy(products=("A", "M"))
     assert policy.meta_lookback == 10
@@ -52,5 +61,4 @@ def test_execution_proxy_changes_meta_evidence_without_future_leakage():
     altered_open = open_prices.copy()
     altered_open.iloc[-30:-1] = altered_open.iloc[-30:-1] * 1.03
     altered = policy.weight_history(altered_open, close)
-    # Completed historical intraday execution evidence may change later target weights.
     assert not baseline.iloc[-1].equals(altered.iloc[-1])
