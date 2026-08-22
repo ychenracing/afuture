@@ -6,6 +6,8 @@ on:
     paths:
       - "tools/evaluate_return_target_portfolio.py"
       - "tools/test_return_target_portfolio.py"
+      - "tools/evaluate_aggressive_directional.py"
+      - "tools/test_aggressive_directional.py"
       - "tools/fetch_broad_daily_universe.py"
       - ".github/workflows/research-return-target.yml"
 
@@ -27,12 +29,16 @@ jobs:
           python-version: "3.13"
       - run: python -m pip install --upgrade pip
       - run: python -m pip install akshare pandas numpy
-      - name: Verify return-target causality and portfolio bounds
+      - name: Verify market-neutral return-target bounds
         run: python tools/test_return_target_portfolio.py
+      - name: Verify aggressive directional causality and bounds
+        run: python tools/test_aggressive_directional.py
       - name: Fetch broad Chinese commodity daily universe
         run: python tools/fetch_broad_daily_universe.py
-      - name: Search low-leverage multi-alpha return target
+      - name: Search low-leverage market-neutral return target
         run: python tools/evaluate_return_target_portfolio.py
+      - name: Search aggressive low-leverage directional return target
+        run: python tools/evaluate_aggressive_directional.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -43,4 +49,7 @@ jobs:
             runtime/broad_daily_universe_failures.txt
             runtime/return_target_report.json
             runtime/return_target_template_results.csv
+            runtime/aggressive_directional_report.json
+            runtime/aggressive_directional_results.csv
+            runtime/aggressive_directional_weights.csv
           retention-days: 14
