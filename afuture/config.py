@@ -14,6 +14,7 @@ except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib
 
 from .auto import AutoConfig
+from .directional import DirectionalConfig
 from .models import ContractInfo, ContractSpec, FeeSpec, PairConfig
 from .risk import RiskConfig
 
@@ -44,6 +45,7 @@ class AppConfig:
     alert_path: str = "runtime/alerts.jsonl"
     alert_webhook: str = ""
     auto: AutoConfig = field(default_factory=AutoConfig)
+    directional: DirectionalConfig = field(default_factory=DirectionalConfig)
     contract_catalog: list[ContractInfo] = field(default_factory=list)
 
 
@@ -73,13 +75,20 @@ def load_config(path: str | Path) -> AppConfig:
     contract_catalog = _load_contract_catalog(contract_rows)
     pairs = _load_pairs(data.get("pairs", []), contracts, mode)
     auto = _load_auto(data.get("auto", {}), mode)
+    directional = _load_directional(data.get("directional", {}))
+    if directional.enabled and (pairs or auto.enabled):
+        raise ValueError(
+            "directional mode is account-exclusive and cannot run with static pairs or auto"
+        )
     if mode == "replay" and auto.enabled and not contract_catalog:
         raise ValueError(
             "replay auto mode requires contract product/expiry metadata"
         )
     ctp = _load_ctp(data.get("ctp", {}), mode)
-    if mode == "live" and not pairs and not auto.enabled:
-        raise ValueError("live mode requires static pairs or auto.enabled=true")
+    if mode == "live" and not pairs and not auto.enabled and not directional.enabled:
+        raise ValueError(
+            "live mode requires static pairs, auto.enabled=true, or directional.enabled=true"
+        )
 
     execution = data.get("execution", {})
     slippage_ticks = int(execution.get("slippage_ticks", 1))
@@ -137,6 +146,7 @@ def load_config(path: str | Path) -> AppConfig:
         alert_path=str(paths.get("alert", "runtime/alerts.jsonl")),
         alert_webhook=str(alert.get("webhook", "")),
         auto=auto,
+        directional=directional,
         contract_catalog=contract_catalog,
     )
 
@@ -175,11 +185,7 @@ def _load_contracts(rows: list[dict]) -> dict[str, ContractSpec]:
 
 
 def _load_contract_catalog(rows: list[dict]) -> list[ContractInfo]:
-    """从研究配置提取自动回放所需的品种、挂牌边界和到期日。
-
-    实盘不依赖这些字段，真实目录始终来自 CTP；历史 replay 若提供 ``listing``，
-    则必须保留它供 point-in-time Universe 过滤，防止未来合约提前进入候选池。
-    """
+    """从研究配置提取自动回放所需的品种、挂牌边界和到期日。"""
     result: list[ContractInfo] = []
     for raw in rows:
         expiry = str(raw.get("expiry", "")).strip()
@@ -319,6 +325,22 @@ def _load_auto(raw: dict, mode: str) -> AutoConfig:
         if mode == "live" and not auto.session_windows:
             raise ValueError("auto session_windows are required in live mode")
     return auto
+
+
+def _load_directional(raw: dict) -> DirectionalConfig:
+    values = dict(raw)
+    for name in ("products", "exchanges"):
+        if name in values:
+            values[name] = tuple(str(item) for item in values[name])
+    config = DirectionalConfig(
+        **{
+            key: value
+            for key, value in values.items()
+            if key in DirectionalConfig.__dataclass_fields__
+        }
+    )
+    config.validate()
+    return config
 
 
 def _load_ctp(raw: dict, mode: str):
