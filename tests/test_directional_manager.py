@@ -150,6 +150,10 @@ def test_manager_subscribes_universe_and_reduces_before_opening_new_main_contrac
     for tick in broker.ticks.values():
         manager.observe(tick)
 
+    # Global stale-quote monitoring tracks only live risk, not every observed catalog
+    # contract. Candidate opens still have explicit quote/depth checks in maybe_rebalance.
+    assert manager.required_symbols() == {"A2609"}
+
     result = manager.maybe_rebalance(NOW)
     assert result.action == "reduce"
     assert broker.orders
@@ -159,6 +163,7 @@ def test_manager_subscribes_universe_and_reduces_before_opening_new_main_contrac
 
     broker.positions = []
     broker.orders.clear()
+    assert manager.required_symbols() == set()
     result = manager.maybe_rebalance(NOW)
     assert result.action == "open"
     assert broker.orders
