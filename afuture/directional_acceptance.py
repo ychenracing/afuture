@@ -71,6 +71,16 @@ class ProductionSimulationResult:
     first_divergence: str = ""
 
 
+@dataclass(frozen=True)
+class PreparedDirectionalContracts:
+    """Immutable-by-convention indexes shared across independent account simulations."""
+
+    frame: pd.DataFrame
+    by_day_symbol: Mapping[tuple[pd.Timestamp, str], pd.Series]
+    activity_by_day: Mapping[pd.Timestamp, pd.DataFrame]
+    available_activity_days: pd.DatetimeIndex
+
+
 class DirectionalProductionAcceptance:
     """Pure deterministic mechanics used by tests and the final L4 proxy tool."""
 
@@ -230,6 +240,25 @@ class DirectionalProductionAcceptance:
             (frame["open"] > 0) & (frame["close"] > 0)
         ].copy()
 
+    def prepare_contracts(self, raw: pd.DataFrame) -> PreparedDirectionalContracts:
+        frame = self._normalize_contracts(raw)
+        by_day_symbol = {
+            (pd.Timestamp(day).normalize(), str(symbol)): group.iloc[-1]
+            for (day, symbol), group in frame.groupby(
+                ["date", "symbol"], sort=False
+            )
+        }
+        activity_by_day = {
+            pd.Timestamp(day).normalize(): group
+            for day, group in frame.groupby("date", sort=False)
+        }
+        return PreparedDirectionalContracts(
+            frame=frame,
+            by_day_symbol=by_day_symbol,
+            activity_by_day=activity_by_day,
+            available_activity_days=pd.DatetimeIndex(sorted(activity_by_day)),
+        )
+
     def _select_contracts_from_snapshot(
         self, snapshot: pd.DataFrame, target_day: pd.Timestamp
     ) -> dict[str, str]:
@@ -315,8 +344,9 @@ class DirectionalProductionAcceptance:
         weights: pd.DataFrame,
         *,
         cost_bps: float,
+        prepared: PreparedDirectionalContracts | None = None,
     ) -> ProductionSimulationResult:
-        frame = self._normalize_contracts(raw)
+        context = prepared or self.prepare_contracts(raw)
         weight_frame = weights.copy()
         weight_frame.index = pd.to_datetime(
             weight_frame.index, errors="coerce"
@@ -332,19 +362,9 @@ class DirectionalProductionAcceptance:
         ):
             raise ValueError("production mechanics weights exceed 2x gross")
 
-        by_day_symbol = {
-            (pd.Timestamp(day).normalize(), str(symbol)): group.iloc[-1]
-            for (day, symbol), group in frame.groupby(
-                ["date", "symbol"], sort=False
-            )
-        }
-        activity_by_day = {
-            pd.Timestamp(day).normalize(): group
-            for day, group in frame.groupby("date", sort=False)
-        }
-        available_activity_days = pd.DatetimeIndex(
-            sorted(activity_by_day)
-        )
+        by_day_symbol = context.by_day_symbol
+        activity_by_day = context.activity_by_day
+        available_activity_days = context.available_activity_days
         equity = float(self.config.initial_capital)
         high_watermark = equity
         lots: dict[str, int] = {}
