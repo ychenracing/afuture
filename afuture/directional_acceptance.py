@@ -14,6 +14,7 @@ from typing import Mapping
 import pandas as pd
 
 from .directional import RebalancePlan
+from .directional_risk import DirectionalRiskGovernor
 
 
 PRODUCT_MULTIPLIERS: dict[str, float] = {
@@ -37,7 +38,7 @@ class ProductionMechanicsConfig:
     margin_estimate_buffer: float = 1.25
     max_margin_ratio: float = 0.35
     min_available_ratio: float = 0.25
-    max_contract_volume: int = 100
+    max_contract_volume: int = 35
     max_daily_loss_ratio: float = 0.05
     max_total_drawdown_ratio: float = 0.30
     min_days_to_delivery: int = 20
@@ -76,6 +77,7 @@ class DirectionalProductionAcceptance:
     def __init__(self, config: ProductionMechanicsConfig | None = None) -> None:
         self.config = config or ProductionMechanicsConfig()
         self.config.validate()
+        self.risk_governor = DirectionalRiskGovernor()
 
     @staticmethod
     def _product(symbol: str) -> str:
@@ -325,6 +327,7 @@ class DirectionalProductionAcceptance:
         high_watermark = equity
         lots: dict[str, int] = {}
         previous_close: dict[str, float] = {}
+        completed_returns: list[float] = []
         halted = False
         first_divergence = ""
         output_rows: list[dict] = []
@@ -337,6 +340,8 @@ class DirectionalProductionAcceptance:
             turnover_notional = 0.0
             risk_reason = ""
             margin_reject = ""
+            daily_circuit = False
+            risk_scale = self.risk_governor.scale(completed_returns)
 
             if halted:
                 output_rows.append(
@@ -349,6 +354,8 @@ class DirectionalProductionAcceptance:
                         "margin": 0.0,
                         "risk_reason": first_divergence,
                         "margin_reject": "",
+                        "daily_circuit": False,
+                        "risk_scale": risk_scale,
                         "halted": True,
                     }
                 )
@@ -383,6 +390,8 @@ class DirectionalProductionAcceptance:
                         "margin": 0.0,
                         "risk_reason": risk_reason,
                         "margin_reject": "",
+                        "daily_circuit": False,
+                        "risk_scale": risk_scale,
                         "halted": True,
                     }
                 )
@@ -398,16 +407,20 @@ class DirectionalProductionAcceptance:
                 high_watermark=high_watermark,
                 margin=current_margin,
             )
-            if risk_reason and lots:
+            if risk_reason:
                 first_divergence = first_divergence or risk_reason
-                closing = {symbol: -volume for symbol, volume in lots.items()}
-                close_turnover = self._turnover(closing, open_prices)
-                turnover_notional += close_turnover
-                equity -= close_turnover * cost_rate
-                lots.clear()
-                halted = True
+                if lots:
+                    closing = {symbol: -volume for symbol, volume in lots.items()}
+                    close_turnover = self._turnover(closing, open_prices)
+                    turnover_notional += close_turnover
+                    equity -= close_turnover * cost_rate
+                    lots.clear()
+                if risk_reason == "daily loss limit reached":
+                    daily_circuit = True
+                else:
+                    halted = True
 
-            if not halted:
+            if not halted and not daily_circuit:
                 selected = self.select_contracts_for_day(frame, day)
                 product_open: dict[str, float] = {}
                 selected_symbols: dict[str, str] = {}
@@ -421,7 +434,7 @@ class DirectionalProductionAcceptance:
                     close_prices[symbol] = float(row["close"])
 
                 product_weights = {
-                    str(product).upper(): float(value)
+                    str(product).upper(): float(value) * risk_scale
                     for product, value in weight_row.items()
                 }
                 target = self.target_lots(
@@ -491,13 +504,18 @@ class DirectionalProductionAcceptance:
                     high_watermark=high_watermark,
                     margin=close_margin,
                 )
-                if risk_reason and lots:
+                if risk_reason:
                     first_divergence = first_divergence or risk_reason
-                    close_turnover = self._turnover(lots, close_prices)
-                    turnover_notional += close_turnover
-                    equity -= close_turnover * cost_rate
-                    lots.clear()
-                    halted = True
+                    if lots:
+                        closing = {symbol: -volume for symbol, volume in lots.items()}
+                        close_turnover = self._turnover(closing, close_prices)
+                        turnover_notional += close_turnover
+                        equity -= close_turnover * cost_rate
+                        lots.clear()
+                    if risk_reason == "daily loss limit reached":
+                        daily_circuit = True
+                    else:
+                        halted = True
 
             valuation_prices = close_prices if close_prices else open_prices
             margin = self._margin(lots, valuation_prices) if lots else 0.0
@@ -514,16 +532,21 @@ class DirectionalProductionAcceptance:
                 for symbol in lots
                 if symbol in close_prices
             }
+            daily_return = equity / previous_equity - 1.0
+            completed_returns.append(float(daily_return))
+            completed_returns = completed_returns[-2:]
             output_rows.append(
                 {
                     "date": day,
                     "equity": equity,
-                    "daily_return": equity / previous_equity - 1.0,
+                    "daily_return": daily_return,
                     "turnover_notional": turnover_notional,
                     "gross_notional": gross_notional,
                     "margin": margin,
                     "risk_reason": risk_reason,
                     "margin_reject": margin_reject,
+                    "daily_circuit": daily_circuit,
+                    "risk_scale": risk_scale,
                     "halted": halted,
                 }
             )
@@ -534,7 +557,8 @@ class DirectionalProductionAcceptance:
                 columns=[
                     "equity", "daily_return", "turnover_notional",
                     "gross_notional", "margin", "risk_reason",
-                    "margin_reject", "halted",
+                    "margin_reject", "daily_circuit", "risk_scale",
+                    "halted",
                 ]
             )
         else:
