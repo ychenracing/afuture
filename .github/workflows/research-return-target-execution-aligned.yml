@@ -1,0 +1,76 @@
+name: research-return-target-execution-aligned
+
+on:
+  pull_request:
+    paths:
+      - "afuture/execution_aligned_policy.py"
+      - "afuture/execution_aligned_runtime.py"
+      - "afuture/runtime_factory.py"
+      - "tests/test_execution_aligned_policy.py"
+      - "tests/test_execution_aligned_runtime.py"
+      - "tools/evaluate_execution_aligned_target.py"
+      - "tools/test_return_target_specific.py"
+      - ".github/workflows/research-return-target-execution-aligned.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: return-target-execution-aligned-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  execution-aligned-l4:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install pandas numpy pytest
+      - name: Verify execution-aligned causal invariants
+        run: |
+          pytest -q tests/test_execution_aligned_policy.py tests/test_execution_aligned_runtime.py
+          python tools/test_return_target_specific.py
+      - name: Reuse completed concrete-contract L4 dataset
+        uses: actions/download-artifact@v4
+        with:
+          name: return-target-specific-evidence
+          path: runtime
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: 32562548653
+      - name: Evaluate frozen execution-aligned target
+        run: |
+          python tools/evaluate_execution_aligned_target.py
+          python - <<'PY'
+          import json
+          report = json.load(open("runtime/execution_aligned_target_report.json", encoding="utf-8"))
+          base = report["next_open_execution"]["base"]["full_recent"]
+          stress = report["next_open_execution"]["stress"]["full_recent"]
+          assert report["target"]["target_met"] is True
+          assert report["max_gross_leverage"] <= 2.0
+          assert base["annualized_return"] >= 1.0
+          assert base["max_drawdown"] > -0.30
+          assert stress["annualized_return"] > 0.0
+          print(json.dumps({
+              "base_full_recent": base,
+              "stress_full_recent": stress,
+              "base_oos": report["next_open_execution"]["base"]["oos"],
+              "stress_oos": report["next_open_execution"]["stress"]["oos"],
+              "target": report["target"],
+          }, ensure_ascii=False, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: execution-aligned-return-target-evidence
+          path: |
+            runtime/execution_aligned_target_report.json
+            runtime/execution_aligned_weights.csv
+            runtime/execution_aligned_specific_selection.csv
+          retention-days: 14
