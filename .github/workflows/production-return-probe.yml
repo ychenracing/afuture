@@ -1,0 +1,64 @@
+name: production-return-probe
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/production-return-probe.yml
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  probe:
+    if: github.head_ref == 'codex/afuture-production-return-100-20260823'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -e ".[dev]"
+      - name: Download frozen evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p /tmp/specific /tmp/final
+          gh api /repos/${{ github.repository }}/actions/artifacts/9473260618/zip > /tmp/specific.zip
+          gh api /repos/${{ github.repository }}/actions/artifacts/9474502870/zip > /tmp/final.zip
+          unzip -q /tmp/specific.zip -d /tmp/specific
+          unzip -q /tmp/final.zip -d /tmp/final
+      - name: Probe highest-information sizing candidates
+        run: |
+          python - <<'PY'
+          import json
+          import pandas as pd
+          from afuture.directional_acceptance import DirectionalProductionAcceptance, ProductionMechanicsConfig
+          from afuture.directional_risk import DirectionalRiskGovernor
+          from tools.evaluate_directional_production_mechanics import _result_stats
+
+          specific = pd.read_csv('/tmp/specific/return_target_specific_contracts.csv')
+          long_weights = pd.read_csv('/tmp/final/execution_aligned_weights.csv')
+          weights = long_weights.pivot(index='level_0', columns='level_1', values='weight').fillna(0.0)
+          weights.index = pd.to_datetime(weights.index)
+          weights = weights.sort_index().loc['2024-08-21':'2026-08-20']
+          prepared = DirectionalProductionAcceptance(ProductionMechanicsConfig()).prepare_contracts(specific)
+          profiles = {
+              'none': DirectionalRiskGovernor(volatility_trigger=99.0, loss_trigger=99.0, defensive_scale=1.0),
+              'loss3_q25': DirectionalRiskGovernor(volatility_trigger=99.0, loss_trigger=0.03, defensive_scale=0.25),
+          }
+          rows = []
+          for cap in (35, 40, 45, 50):
+              for name, governor in profiles.items():
+                  sim = DirectionalProductionAcceptance(ProductionMechanicsConfig(max_contract_volume=cap))
+                  sim.risk_governor = governor
+                  result = sim.simulate(specific, weights, cost_bps=5.0, prepared=prepared)
+                  stats = _result_stats(result)
+                  row = {'cap': cap, 'profile': name, **stats}
+                  rows.append(row)
+                  print('PROBE', json.dumps(row, sort_keys=True))
+          survivors = [r for r in rows if not r['halted'] and r['max_drawdown'] >= -0.30]
+          survivors.sort(key=lambda x: x['annualized_return'], reverse=True)
+          print('PROBE_TOP', json.dumps(survivors, sort_keys=True))
+          PY
