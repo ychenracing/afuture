@@ -26,6 +26,7 @@ class RuntimeState:
     auto_pairs: dict[str, dict] = field(default_factory=dict)
     runtime_mode: str = RuntimeMode.RUNNING.value
     reduce_reason: str = ""
+    daily_loss_lock_trading_day: str = ""
     metadata_verified: bool = False
     last_order_id: str = ""
     last_trade_id: str = ""
