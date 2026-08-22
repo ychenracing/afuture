@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import isfinite
 from statistics import stdev
-from typing import Iterable
+from typing import Callable, Iterable
 
 
 @dataclass(frozen=True)
@@ -46,3 +46,29 @@ class DirectionalRiskGovernor:
         ):
             return self.defensive_scale
         return 1.0
+
+
+class DirectionalRiskScaledPolicy:
+    """Decorate a frozen directional policy with a non-increasing gross scale."""
+
+    def __init__(
+        self,
+        policy,
+        *,
+        completed_returns_provider: Callable[[], Iterable[float]],
+        governor: DirectionalRiskGovernor | None = None,
+    ) -> None:
+        self.policy = policy
+        self.completed_returns_provider = completed_returns_provider
+        self.governor = governor or DirectionalRiskGovernor()
+
+    def target_weights(self, *args, **kwargs) -> dict[str, float]:
+        weights = self.policy.target_weights(*args, **kwargs)
+        scale = self.governor.scale(self.completed_returns_provider())
+        return {
+            str(product): float(weight) * scale
+            for product, weight in weights.items()
+        }
+
+    def __getattr__(self, name):
+        return getattr(self.policy, name)
