@@ -1,9 +1,8 @@
 """Causal low-gross-leverage return-target portfolio research.
 
-This module is research-only. It forms same-exchange long/short commodity pairs from
-lagged signals, charges turnover costs, and keeps gross exposure explicitly bounded.
-Continuous contracts are discovery evidence only; any production promotion must later
-pass specific-contract roll-safe validation.
+Research only. Signals observed through close t may earn only t+1 returns. Continuous
+contracts are L3 discovery evidence; production promotion requires later roll-safe
+specific-contract validation and never bypasses afuture's RiskManager/PairExecutor.
 """
 from __future__ import annotations
 
@@ -13,7 +12,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
 
 WINDOWS = {
     "prior1": ("2022-08-22", "2023-08-20"),
@@ -65,32 +63,23 @@ class AlphaTemplate:
 
 
 def primary_templates() -> tuple[AlphaTemplate, ...]:
-    """Return the bounded first-wave search space; leverage never exceeds 2x."""
     rows: list[AlphaTemplate] = []
     for slow in (10, 20, 40, 60, 120):
         for rebalance in (1, 5):
             for gross in (1.0, 1.5, 2.0):
-                rows.append(
-                    AlphaTemplate("momentum", slow, 0, 20, rebalance, 1, gross)
-                )
+                rows.append(AlphaTemplate("momentum", slow, 0, 20, rebalance, 1, gross))
     for fast in (1, 3, 5, 10):
         for rebalance in (1, 2, 5):
             for gross in (1.0, 1.5):
-                rows.append(
-                    AlphaTemplate("reversal", 0, fast, 20, rebalance, 1, gross)
-                )
+                rows.append(AlphaTemplate("reversal", 0, fast, 20, rebalance, 1, gross))
     for slow, fast in ((20, 3), (40, 5), (60, 5), (60, 10), (120, 10)):
         for rebalance in (1, 5):
             for gross in (1.0, 1.5, 2.0):
-                rows.append(
-                    AlphaTemplate("slow_fast", slow, fast, 20, rebalance, 1, gross)
-                )
+                rows.append(AlphaTemplate("slow_fast", slow, fast, 20, rebalance, 1, gross))
     for slow in (20, 40, 60):
         for rebalance in (1, 5):
             for gross in (1.0, 1.5, 2.0):
-                rows.append(
-                    AlphaTemplate("breakout", slow, 5, 20, rebalance, 1, gross)
-                )
+                rows.append(AlphaTemplate("breakout", slow, 5, 20, rebalance, 1, gross))
     return tuple(rows)
 
 
@@ -107,14 +96,11 @@ def _cross_sectional_z(frame: pd.DataFrame) -> pd.DataFrame:
     return frame.sub(mean, axis=0).div(std, axis=0)
 
 
-def _rolling_log_return(returns: pd.DataFrame, window: int) -> pd.DataFrame:
-    return np.log1p(returns.clip(lower=-0.99)).rolling(
-        window, min_periods=window
-    ).sum()
+def _rolling_log_return(values: pd.DataFrame, window: int) -> pd.DataFrame:
+    return np.log1p(values.clip(lower=-0.99)).rolling(window, min_periods=window).sum()
 
 
 def signal_scores(returns: pd.DataFrame, template: AlphaTemplate) -> pd.DataFrame:
-    """Build close-t scores; caller shifts execution to the following return."""
     if template.family == "momentum":
         return _rolling_log_return(returns, template.slow)
     if template.family == "reversal":
@@ -124,16 +110,10 @@ def signal_scores(returns: pd.DataFrame, template: AlphaTemplate) -> pd.DataFram
         fast = _cross_sectional_z(_rolling_log_return(returns, template.fast))
         return slow - 0.5 * fast
     if template.family == "breakout":
-        synthetic_price = (1.0 + returns.fillna(0.0)).cumprod()
-        rolling_low = synthetic_price.rolling(
-            template.slow, min_periods=template.slow
-        ).min()
-        rolling_high = synthetic_price.rolling(
-            template.slow, min_periods=template.slow
-        ).max()
-        location = (synthetic_price - rolling_low) / (
-            rolling_high - rolling_low
-        ).replace(0.0, np.nan)
+        synthetic = (1.0 + returns.fillna(0.0)).cumprod()
+        low = synthetic.rolling(template.slow, min_periods=template.slow).min()
+        high = synthetic.rolling(template.slow, min_periods=template.slow).max()
+        location = (synthetic - low) / (high - low).replace(0.0, np.nan)
         acceleration = _rolling_log_return(returns, template.fast)
         return _cross_sectional_z(location) + 0.5 * _cross_sectional_z(acceleration)
     raise ValueError(f"unknown alpha family: {template.family}")
@@ -147,10 +127,13 @@ def _pair_weights(
     max_pairs: int,
     gross_leverage: float,
 ) -> tuple[pd.Series, list[str]]:
-    columns = list(score.index)
+    columns = [str(column) for column in score.index]
     weights = pd.Series(0.0, index=columns, dtype=float)
     available = pd.DataFrame(
-        {"score": score, "volatility": volatility}, index=columns
+        {
+            "score": pd.Series(score.to_numpy(float), index=columns),
+            "volatility": pd.Series(volatility.to_numpy(float), index=columns),
+        }
     ).replace([np.inf, -np.inf], np.nan).dropna()
     available = available[available["volatility"] > 1e-12]
     if len(available) < 2 or max_pairs <= 0 or gross_leverage <= 0:
@@ -158,26 +141,18 @@ def _pair_weights(
 
     candidates: list[tuple[float, str, str]] = []
     for exchange in sorted(set(exchange_map.values())):
-        names = [
-            str(name)
-            for name in available.index
-            if exchange_map.get(str(name)) == exchange
-        ]
+        names = [name for name in available.index if exchange_map.get(name) == exchange]
         if len(names) < 2:
             continue
         ranked = available.loc[names].sort_values("score", kind="stable")
-        low_names = [str(name) for name in ranked.index]
-        high_names = list(reversed(low_names))
-        for long_name, short_name in zip(high_names, low_names):
+        lows = [str(name) for name in ranked.index]
+        highs = list(reversed(lows))
+        for long_name, short_name in zip(highs, lows):
             if long_name == short_name:
                 continue
-            spread = float(
-                available.loc[long_name, "score"]
-                - available.loc[short_name, "score"]
-            )
-            if not np.isfinite(spread) or spread <= 0:
-                continue
-            candidates.append((spread, long_name, short_name))
+            spread = float(available.loc[long_name, "score"] - available.loc[short_name, "score"])
+            if np.isfinite(spread) and spread > 0.0:
+                candidates.append((spread, long_name, short_name))
 
     selected: list[tuple[float, str, str]] = []
     used: set[str] = set()
@@ -186,8 +161,7 @@ def _pair_weights(
         if long_name in used or short_name in used:
             continue
         selected.append(item)
-        used.add(long_name)
-        used.add(short_name)
+        used.update((long_name, short_name))
         if len(selected) >= max_pairs:
             break
     if not selected:
@@ -202,7 +176,6 @@ def _pair_weights(
         weights.loc[long_name] = long_inv * scale
         weights.loc[short_name] = -short_inv * scale
         legs.extend((long_name, short_name))
-
     gross = float(weights.abs().sum())
     if gross > MAX_GROSS_LEVERAGE + 1e-12:
         weights *= MAX_GROSS_LEVERAGE / gross
@@ -216,18 +189,15 @@ def simulate_template(
     *,
     cost_bps: float,
 ) -> tuple[pd.Series, list[dict]]:
-    """Simulate one causal template with decisions made one row before PnL."""
     data = returns.astype(float).replace([np.inf, -np.inf], np.nan)
+    data.columns = [str(column) for column in data.columns]
     scores = signal_scores(data, template)
-    volatility = data.rolling(
-        template.vol_window, min_periods=template.vol_window
-    ).std()
+    volatility = data.rolling(template.vol_window, min_periods=template.vol_window).std()
     previous = pd.Series(0.0, index=data.columns, dtype=float)
-    output = pd.Series(0.0, index=data.index, dtype=float)
+    output = np.zeros(len(data), dtype=float)
     audit: list[dict] = []
-
     for index in range(1, len(data)):
-        legs: list[str] = [str(name) for name in previous[previous != 0].index]
+        legs = [str(name) for name in previous[previous != 0].index]
         turnover = 0.0
         if index % template.rebalance == 0:
             next_weights, legs = _pair_weights(
@@ -238,10 +208,10 @@ def simulate_template(
                 gross_leverage=template.gross_leverage,
             )
             turnover = float((next_weights - previous).abs().sum())
-            output.iloc[index] -= turnover * cost_bps / 10000.0
+            output[index] -= turnover * cost_bps / 10000.0
             previous = next_weights
         realized = data.iloc[index].fillna(0.0)
-        output.iloc[index] += float((previous * realized).sum())
+        output[index] += float((previous * realized).sum())
         audit.append(
             {
                 "date": data.index[index],
@@ -250,12 +220,12 @@ def simulate_template(
                 "legs": legs,
             }
         )
-    return output, audit
+    return pd.Series(output, index=data.index), audit
 
 
-def _metrics(series: pd.Series) -> dict:
-    values = series.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    if values.empty:
+def _metrics_array(values: np.ndarray) -> dict:
+    raw = np.nan_to_num(np.asarray(values, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    if raw.size == 0:
         return {
             "days": 0,
             "active_days": 0,
@@ -265,23 +235,16 @@ def _metrics(series: pd.Series) -> dict:
             "sharpe": 0.0,
             "max_drawdown": 0.0,
         }
-    equity = (1.0 + values).cumprod()
-    total = float(equity.iloc[-1] - 1.0)
-    annualized = (
-        (1.0 + total) ** (252.0 / len(values)) - 1.0
-        if total > -1.0
-        else -1.0
-    )
-    std = float(values.std(ddof=1))
-    sharpe = (
-        float(values.mean() / std * np.sqrt(252.0))
-        if std > 1e-12
-        else 0.0
-    )
-    drawdown = equity / equity.cummax() - 1.0
+    equity = np.cumprod(1.0 + raw)
+    total = float(equity[-1] - 1.0)
+    annualized = (1.0 + total) ** (252.0 / raw.size) - 1.0 if total > -1.0 else -1.0
+    std = float(raw.std(ddof=1)) if raw.size > 1 else 0.0
+    sharpe = float(raw.mean() / std * np.sqrt(252.0)) if std > 1e-12 else 0.0
+    peak = np.maximum.accumulate(equity)
+    drawdown = equity / peak - 1.0
     return {
-        "days": int(len(values)),
-        "active_days": int((values.abs() > 1e-15).sum()),
+        "days": int(raw.size),
+        "active_days": int((np.abs(raw) > 1e-15).sum()),
         "total_return": total,
         "annualized_return": float(annualized),
         "annualized_volatility": float(std * np.sqrt(252.0)),
@@ -290,32 +253,26 @@ def _metrics(series: pd.Series) -> dict:
     }
 
 
+def _metrics(series: pd.Series) -> dict:
+    return _metrics_array(series.to_numpy(float))
+
+
 def _window_metrics(series: pd.Series, name: str) -> dict:
     start, end = WINDOWS[name]
     return _metrics(series.loc[pd.Timestamp(start) : pd.Timestamp(end)])
 
 
 def choose_templates(
-    streams: dict[str, pd.Series],
-    *,
-    start,
-    end,
-    count: int,
+    streams: dict[str, pd.Series], *, start, end, count: int
 ) -> list[str]:
-    """Select positive calibration streams only; evaluation rows are never inspected."""
     if count <= 0:
         return []
     ranked: list[tuple[float, str]] = []
     for name, series in streams.items():
-        calibration = series.loc[pd.Timestamp(start) : pd.Timestamp(end)]
-        item = _metrics(calibration)
+        item = _metrics(series.loc[pd.Timestamp(start) : pd.Timestamp(end)])
         if item["annualized_return"] <= 0.0:
             continue
-        score = (
-            4.0 * item["annualized_return"]
-            + 0.5 * item["sharpe"]
-            - 2.0 * abs(item["max_drawdown"])
-        )
+        score = 4.0 * item["annualized_return"] + 0.5 * item["sharpe"] - 2.0 * abs(item["max_drawdown"])
         ranked.append((score, name))
     ranked.sort(key=lambda item: (-item[0], item[1]))
     return [name for _, name in ranked[:count]]
@@ -329,51 +286,44 @@ def dynamic_rotate(
     count: int,
     switch_cost_bps: float,
 ) -> tuple[pd.Series, list[dict]]:
-    """Rotate among template PnL streams using trailing history only."""
+    """Fast trailing-only meta rotation; selection never reads the current/future row."""
     if not streams:
         return pd.Series(dtype=float), []
     frame = pd.DataFrame(streams).sort_index().fillna(0.0)
-    output = pd.Series(0.0, index=frame.index, dtype=float)
-    selected: list[str] = []
+    names = [str(name) for name in frame.columns]
+    values = frame.to_numpy(float)
+    output = np.zeros(len(frame), dtype=float)
+    selected: list[int] = []
     audit: list[dict] = []
+    step = max(int(rebalance), 1)
     for index in range(len(frame)):
-        if index >= meta_lookback and (
-            not selected or index % max(rebalance, 1) == 0
-        ):
-            history = frame.iloc[index - meta_lookback : index]
-            ranked: list[tuple[float, str]] = []
-            for name in frame.columns:
-                item = _metrics(history[name])
-                if (
-                    item["annualized_return"] <= 0.0
-                    or item["max_drawdown"] <= -0.20
-                ):
+        if index >= meta_lookback and (not selected or index % step == 0):
+            history = values[index - meta_lookback : index]
+            ranked: list[tuple[float, int, str]] = []
+            for column_index, name in enumerate(names):
+                item = _metrics_array(history[:, column_index])
+                if item["annualized_return"] <= 0.0 or item["max_drawdown"] <= -0.20:
                     continue
-                score = (
-                    4.0 * item["annualized_return"]
-                    + 0.5 * item["sharpe"]
-                    - 2.0 * abs(item["max_drawdown"])
-                )
-                ranked.append((score, str(name)))
-            ranked.sort(key=lambda item: (-item[0], item[1]))
-            next_selected = [name for _, name in ranked[:count]]
+                score = 4.0 * item["annualized_return"] + 0.5 * item["sharpe"] - 2.0 * abs(item["max_drawdown"])
+                ranked.append((score, column_index, name))
+            ranked.sort(key=lambda item: (-item[0], item[2]))
+            next_selected = [column_index for _, column_index, _ in ranked[:count]]
             if next_selected != selected:
-                old = set(selected)
-                new = set(next_selected)
-                churn = len(old.symmetric_difference(new)) / max(count, 1)
-                output.iloc[index] -= churn * switch_cost_bps / 10000.0
+                churn = len(set(selected).symmetric_difference(next_selected)) / max(count, 1)
+                output[index] -= churn * switch_cost_bps / 10000.0
             selected = next_selected
         if selected:
-            output.iloc[index] += float(frame.iloc[index][selected].mean())
+            output[index] += float(values[index, selected].mean())
         audit.append(
-            {"date": frame.index[index], "selected": list(selected)}
+            {
+                "date": frame.index[index],
+                "selected": [names[column_index] for column_index in selected],
+            }
         )
-    return output, audit
+    return pd.Series(output, index=frame.index), audit
 
 
-def build_panel(
-    raw: pd.DataFrame,
-) -> tuple[pd.DataFrame, dict[str, str], dict]:
+def build_panel(raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str], dict]:
     frame = raw.copy()
     frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
     frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
@@ -381,11 +331,7 @@ def build_panel(
     frame = frame.dropna(subset=["date", "product", "close"])
     frame = frame[frame["close"] > 0]
     frame.drop_duplicates(["date", "product"], keep="last", inplace=True)
-    close = (
-        frame.pivot(index="date", columns="product", values="close")
-        .sort_index()
-        .astype(float)
-    )
+    close = frame.pivot(index="date", columns="product", values="close").sort_index().astype(float)
     returns = close.pct_change(fill_method=None)
     outlier = returns.abs() > MAX_ABS_DAILY_RETURN
     removed = int(outlier.sum().sum())
@@ -395,7 +341,7 @@ def build_panel(
         for product in returns.columns
         if str(product) in PRODUCT_EXCHANGE
     }
-    usable = [column for column in returns.columns if str(column) in exchanges]
+    usable = [str(column) for column in returns.columns if str(column) in exchanges]
     returns = returns[usable]
     coverage = {
         "products": int(len(usable)),
@@ -407,16 +353,17 @@ def build_panel(
     return returns, exchanges, coverage
 
 
-def _template_selection_score(row: dict) -> float:
+def _selection_score(row: dict) -> float:
     train = row["base"]["train"]
     validation = row["base"]["validation"]
     stress = row["stress"]["selection_full"]
+    worst_drawdown = max(abs(train["max_drawdown"]), abs(validation["max_drawdown"]))
     return (
         2.0 * train["annualized_return"]
         + 3.0 * validation["annualized_return"]
         + 0.5 * min(train["sharpe"], validation["sharpe"])
         + 0.5 * stress["annualized_return"]
-        - 2.0 * abs(max(train["max_drawdown"], validation["max_drawdown"], key=abs))
+        - 2.0 * worst_drawdown
     )
 
 
@@ -426,38 +373,26 @@ def evaluate(raw: pd.DataFrame) -> dict:
         raise ValueError("return-target research needs at least two known products")
 
     templates = primary_templates()
+    template_lookup: dict[str, AlphaTemplate] = {}
     base_streams: dict[str, pd.Series] = {}
     stress_streams: dict[str, pd.Series] = {}
-    extreme_streams: dict[str, pd.Series] = {}
-    template_lookup: dict[str, AlphaTemplate] = {}
     rows: list[dict] = []
-
     for template in templates:
         name = template_id(template)
         template_lookup[name] = template
-        base, base_audit = simulate_template(
-            returns, exchanges, template, cost_bps=BASE_COST_BPS
-        )
-        stress, _ = simulate_template(
-            returns, exchanges, template, cost_bps=STRESS_COST_BPS
-        )
+        base, audit = simulate_template(returns, exchanges, template, cost_bps=BASE_COST_BPS)
+        stress, _ = simulate_template(returns, exchanges, template, cost_bps=STRESS_COST_BPS)
         base_streams[name] = base
         stress_streams[name] = stress
-        turnover = sum(float(item["turnover"]) for item in base_audit)
+        turnover = sum(float(item["turnover"]) for item in audit)
         row = {
             "template_id": name,
             "template": asdict(template),
             "annual_turnover": float(turnover * 252.0 / max(len(base), 1)),
-            "base": {
-                key: _window_metrics(base, key)
-                for key in WINDOWS
-            },
-            "stress": {
-                key: _window_metrics(stress, key)
-                for key in WINDOWS
-            },
+            "base": {key: _window_metrics(base, key) for key in WINDOWS},
+            "stress": {key: _window_metrics(stress, key) for key in WINDOWS},
         }
-        row["selection_score"] = _template_selection_score(row)
+        row["selection_score"] = _selection_score(row)
         rows.append(row)
 
     rows.sort(key=lambda row: (-row["selection_score"], row["template_id"]))
@@ -465,8 +400,8 @@ def evaluate(raw: pd.DataFrame) -> dict:
     pool_base = {name: base_streams[name] for name in pool_ids}
     pool_stress = {name: stress_streams[name] for name in pool_ids}
 
-    meta_candidates: list[dict] = []
     selection_start, selection_end = WINDOWS["selection_full"]
+    meta_candidates: list[dict] = []
     for lookback in (20, 60, 120):
         for rebalance in (1, 5):
             for count in (1, 2, 3):
@@ -477,71 +412,51 @@ def evaluate(raw: pd.DataFrame) -> dict:
                     count=count,
                     switch_cost_bps=BASE_COST_BPS,
                 )
-                selection_metrics = _metrics(
-                    series.loc[
-                        pd.Timestamp(selection_start) : pd.Timestamp(selection_end)
-                    ]
-                )
-                score = (
-                    4.0 * selection_metrics["annualized_return"]
-                    + 0.5 * selection_metrics["sharpe"]
-                    - 2.0 * abs(selection_metrics["max_drawdown"])
-                )
+                item = _metrics(series.loc[pd.Timestamp(selection_start) : pd.Timestamp(selection_end)])
+                score = 4.0 * item["annualized_return"] + 0.5 * item["sharpe"] - 2.0 * abs(item["max_drawdown"])
                 meta_candidates.append(
                     {
                         "meta_lookback": lookback,
                         "rebalance": rebalance,
                         "count": count,
                         "score": score,
-                        "selection_metrics": selection_metrics,
+                        "selection_metrics": item,
                     }
                 )
-    meta_candidates.sort(
-        key=lambda row: (
-            -row["score"],
-            row["meta_lookback"],
-            row["rebalance"],
-            row["count"],
-        )
-    )
-    chosen_meta = meta_candidates[0]
+    meta_candidates.sort(key=lambda row: (-row["score"], row["meta_lookback"], row["rebalance"], row["count"]))
+    chosen = meta_candidates[0]
 
     chosen_base, base_audit = dynamic_rotate(
         pool_base,
-        meta_lookback=chosen_meta["meta_lookback"],
-        rebalance=chosen_meta["rebalance"],
-        count=chosen_meta["count"],
+        meta_lookback=chosen["meta_lookback"],
+        rebalance=chosen["rebalance"],
+        count=chosen["count"],
         switch_cost_bps=BASE_COST_BPS,
     )
     chosen_stress, _ = dynamic_rotate(
         pool_stress,
-        meta_lookback=chosen_meta["meta_lookback"],
-        rebalance=chosen_meta["rebalance"],
-        count=chosen_meta["count"],
+        meta_lookback=chosen["meta_lookback"],
+        rebalance=chosen["rebalance"],
+        count=chosen["count"],
         switch_cost_bps=STRESS_COST_BPS,
     )
+    extreme_streams: dict[str, pd.Series] = {}
     for name in pool_ids:
         extreme_streams[name], _ = simulate_template(
-            returns,
-            exchanges,
-            template_lookup[name],
-            cost_bps=EXTREME_COST_BPS,
+            returns, exchanges, template_lookup[name], cost_bps=EXTREME_COST_BPS
         )
     chosen_extreme, _ = dynamic_rotate(
         extreme_streams,
-        meta_lookback=chosen_meta["meta_lookback"],
-        rebalance=chosen_meta["rebalance"],
-        count=chosen_meta["count"],
+        meta_lookback=chosen["meta_lookback"],
+        rebalance=chosen["rebalance"],
+        count=chosen["count"],
         switch_cost_bps=EXTREME_COST_BPS,
     )
 
     base_windows = {name: _window_metrics(chosen_base, name) for name in WINDOWS}
     stress_windows = {name: _window_metrics(chosen_stress, name) for name in WINDOWS}
     extreme_windows = {name: _window_metrics(chosen_extreme, name) for name in WINDOWS}
-    effective_gross = max(
-        (template_lookup[name].gross_leverage for name in pool_ids),
-        default=0.0,
-    )
+    effective_gross = max((template_lookup[name].gross_leverage for name in pool_ids), default=0.0)
     full_recent = base_windows["full_recent"]
     stress_recent = stress_windows["full_recent"]
     target_met = bool(
@@ -563,13 +478,12 @@ def evaluate(raw: pd.DataFrame) -> dict:
             item["best_full_recent_annualized_return"],
             _window_metrics(base_streams[name], "full_recent")["annualized_return"],
         )
-
     selected_counts: dict[str, int] = {}
     for item in base_audit:
         for name in item["selected"]:
             selected_counts[name] = selected_counts.get(name, 0) + 1
 
-    report = {
+    return {
         "source": "AKShare/Sina continuous daily Chinese commodity futures",
         "role": "L3 return-target discovery only; production requires specific contracts",
         "historical_l1_available": False,
@@ -584,12 +498,12 @@ def evaluate(raw: pd.DataFrame) -> dict:
         "template_results": rows,
         "selection": {
             "pool_ids": pool_ids,
-            "meta_lookback": chosen_meta["meta_lookback"],
-            "rebalance": chosen_meta["rebalance"],
-            "count": chosen_meta["count"],
+            "meta_lookback": chosen["meta_lookback"],
+            "rebalance": chosen["rebalance"],
+            "count": chosen["count"],
             "portfolio_gross_multiplier": 1.0,
             "effective_gross_leverage": float(effective_gross),
-            "selection_score": float(chosen_meta["score"]),
+            "selection_score": float(chosen["score"]),
             "selected_day_counts": selected_counts,
         },
         "base": base_windows,
@@ -605,7 +519,6 @@ def evaluate(raw: pd.DataFrame) -> dict:
             "target_met": target_met,
         },
     }
-    return report
 
 
 def _write_template_csv(report: dict, path: Path) -> None:
@@ -620,12 +533,8 @@ def _write_template_csv(report: dict, path: Path) -> None:
         for scenario in ("base", "stress"):
             for window in ("train", "validation", "oos", "full_recent"):
                 item = row[scenario][window]
-                record[f"{scenario}_{window}_annualized_return"] = item[
-                    "annualized_return"
-                ]
-                record[f"{scenario}_{window}_max_drawdown"] = item[
-                    "max_drawdown"
-                ]
+                record[f"{scenario}_{window}_annualized_return"] = item["annualized_return"]
+                record[f"{scenario}_{window}_max_drawdown"] = item["max_drawdown"]
         records.append(record)
     pd.DataFrame(records).to_csv(path, index=False)
 
@@ -638,8 +547,7 @@ def main() -> None:
     output = Path("runtime")
     output.mkdir(parents=True, exist_ok=True)
     (output / "return_target_report.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
+        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8"
     )
     _write_template_csv(report, output / "return_target_template_results.csv")
     print(
