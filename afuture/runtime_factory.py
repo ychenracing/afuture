@@ -42,8 +42,6 @@ def build_runtime_engine(
             ExecutionAlignedDirectionalPortfolioManager,
         )
 
-        # Activity evidence follows the exact runtime StateStore location rather than
-        # depending on a second copy of the path in a configuration-like object.
         activity_path = Path(state_store.path).with_name("directional_activity.json")
         manager = ExecutionAlignedDirectionalPortfolioManager(
             config.directional,
@@ -53,6 +51,7 @@ def build_runtime_engine(
             metadata_timeout_seconds=config.metadata_timeout_seconds,
             static_specs=config.contracts,
             activity_store_path=activity_path,
+            quality_recorder=quality_recorder,
         )
         return DirectionalTradingEngine(
             broker,
