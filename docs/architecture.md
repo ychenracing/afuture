@@ -2,193 +2,183 @@
 
 ## 1. 总体原则
 
-`afuture` 只保留一套账户/订单/成交/持仓真相和一套统一风险治理，但现在支持两种**账户互斥**的策略模式：
+`afuture` 支持两种**账户互斥**的正式模式：
 
 - `calendar / auto`：同品种相邻月份跨期套利；
 - `directional`：冻结的 50 品种 execution-aligned 方向组合。
 
-配置加载阶段禁止 directional 与 static pairs/Auto 同时启用。两种模式最终都由 Broker 提供账户真相，由 `RiskManager`、TradingEngine 状态机、Kill Switch、Shadow 和审计边界治理。
+两种模式共用唯一的 Broker/TradingEngine 账户真相、`RiskManager`、Kill Switch、`REDUCE_ONLY`、StateStore、Shadow 和审计链。Directional 不创建第二套订单/成交/持仓状态机。
 
-## 2. Calendar Spread / Auto 数据流
+## 2. Calendar / Auto
 
 ```text
 CTP Catalog / Tick
-        ↓
-AutoPairManager
-expiry → front-3 → adjacent months
-        ↓
-activity / sync / stationarity / half-life / Net Edge
-        ↓
-CalendarSpreadStrategy
-        ↓
-PortfolioRisk + RiskManager
-        ↓
-PairExecutor
-        ↓
-SimBroker / ShadowBroker / CtpBroker
+→ AutoPairManager
+→ activity / sync / stationarity / half-life / Net Edge
+→ CalendarSpreadStrategy
+→ PortfolioRisk + RiskManager
+→ PairExecutor
+→ Broker
 ```
 
-`AutoPairManager` 只决定哪些同品种相邻月份组合具有开仓资格，不直接发订单。已有仓位失去资格时继续保持 managed，但立即失去 open-eligible 权限，直到退出后退役。
+Auto 只负责候选和开仓资格；已有仓位失去候选资格后继续 managed，但不再 open-eligible，直至退出。
 
-## 3. Execution-Aligned Directional 数据流
+## 3. Directional
 
 ```text
-Sina/AKShare 连续日线 OHLC
-        ↓
-ExecutionAlignedAggressivePolicy
-冻结 96-template pool
-        ↓
-前一收盘信号 + 已完成 intraday proxy meta score
-        ↓
-目标产品权重，gross <= 2.0x
-        ↓
-CTP Catalog + 实时 Tick
-        ↓
-DirectionalContractSelector
-point-in-time OI/volume + 20 天 expiry filter
-        ↓
-build_target_lots / build_rebalance_plan
-        ↓
-先减仓，再允许开仓
-        ↓
-RiskManager single-contract + batch account gates
-        ↓
-FAK → CtpBroker
+连续 OHLC
+→ ExecutionAlignedAggressivePolicy（唯一生产 directional signal policy）
+→ 冻结产品权重，gross <=2x
+
+CTP Tick.trading_day
+→ DirectionalActivityTracker
+→ trading day 切换时冻结前一日最终 OI/volume
+→ DirectionalActivityStore（原子 JSON sidecar）
+→ D+1 concrete contract selection
+
+Broker positions + D+1 fresh quotes
+→ integer target lots
+→ reduction-first rebalance
+→ RiskManager
+→ FAK
+→ Broker
 ```
 
 ### 冻结经济参数
 
-生产 copy 固定：
-
-- 50 个品种 Universe，按代码字母序规范化；
-- specific-contract 历史选择后的 96 个模板；
+- Universe：50 品种，代码字母序；
+- template pool：固定 96；
 - family：breakout / tsmom / momentum / moving-average / reversal / acceleration；
 - meta lookback = 10；
 - meta rebalance = 5；
-- meta count = 3；
-- meta score source = 已完成的连续合约 `open→close` 日内代理；
-- gross target ≤ 2.0x。
+- active templates = 3；
+- meta score = 已完成 continuous `open→close` intraday proxy；
+- gross target ≤2.0x。
 
-生产代码不在运行时重新做历史参数搜索。
+`execution_aligned_policy.py` 自包含最终 signal/meta helper。`directional.py` 只保留配置、合约选择、整数手数和 rebalance 原语，不再保留旧 32-template 中间 policy。
 
 ## 4. 因果时间边界
 
-Directional 的目标权重遵守：
+Directional 同时冻结两个“截至何时可见”的证据：
 
 ```text
-截至 t 日收盘可见数据
-        ↓
-计算 t+1 目标产品权重
-        ↓
-下一可交易时段使用当前 CTP 合约/盘口执行
+完整交易日 D 的 OHLC
+→ D+1 目标产品权重
+
+完整交易日 D 的具体合约最终 OI/volume
+→ D+1 应交易的具体合约
 ```
 
-历史 L4 对执行做更严格的分解：旧权重承担 `previous close → next open` gap，新目标权重承担 `next open → close`；换月收益始终来自上一决策日已选择的同一具体合约。
+当前交易日 D+1 尚未完成的累计 volume/OI 只用于盘口/风险上下文，**不能重新改变 D 已冻结的主力选择**。
 
-Final OOS 已被多轮观察，统一标记 `pristine_final_oos=false`。
+历史 L4 同样使用 D 日选择的同一具体合约承担 D→D+1 收益，因此不把 continuous roll jump 当作 Alpha。
 
-## 5. 合约选择边界
+## 5. Signal freshness
 
-### Calendar Spread
+`signal_max_age_hours` 不再承担“猜周末/节假日”的主要职责。
 
-- CTP/历史 point-in-time catalog；
-- 到期过滤；
-- front-3；
-- 相邻月份；
-- 双腿同步盘口和活动度。
+生产首先要求：
+
+```text
+required_signal_day = completed_activity_snapshot.trading_day
+latest OHLC day >= required_signal_day
+```
+
+然后才使用 `signal_max_age_hours` 作为未来时间戳/长期停更的第二道门。
+
+- provider 刷新失败但缓存已覆盖 required day：可使用缓存；
+- required day 缺失且已有 directional risk：返回 `risk_off`，engine 进入 `REDUCE_ONLY`；
+- required day 缺失且账户为空：拒绝新增风险，不制造无意义 Kill Switch；
+- 新启动尚无 completed activity snapshot：禁止新增风险，已有风险仍可由 reduction/flatten 管理。
+
+## 6. 合约选择
+
+### Calendar
+
+- point-in-time catalog；
+- expiry/front-3/adjacent months；
+- 双腿同步和活动度。
 
 ### Directional
 
-- 配置只允许冻结的 50 品种；
-- 从 CTP catalog 中保留已挂牌、允许交易所、未进入交割黑窗的合约；
-- 使用当前实时 Tick 的 Open Interest、成交量选择具体合约；
-- 没有 fresh/eligible contract 时 fail closed，不为该次 rebalance 新增风险。
+D+1 合约选择只使用 D 的 `DirectionalActivitySnapshot`：
 
-L4 的 specific-contract 数据也使用 point-in-time OI/volume 和 20 天黑窗，避免连续合约换月跳空伪造收益。
+1. product/exchange 允许；
+2. 当时已挂牌；
+3. D+1 距到期不少于配置阈值；
+4. D 日最终 volume/OI 达标；
+5. OI → volume → expiry → symbol 稳定排序。
 
-## 6. 风险权限
+选出的合约在真正下单前还必须存在 D+1 fresh quote 并通过全部微观结构风控。
 
-`RiskManager` 仍是新增风险最终权限拥有者。
+`DirectionalActivityStore` 是 market evidence sidecar，不拥有 account/order/fill/position。
 
-Calendar pair 额外有：
+## 7. Reduction-first
 
-- `max_open_pairs`；
-- 双腿同步；
-- 双腿 depth；
-- pair calendar/session；
-- PairExecutor Net Edge。
-
-Directional 单合约新增风险依次经过：
-
-1. fresh quote；
-2. session；
-3. bid/ask width；
-4. top-of-book depth；
-5. limit-distance；
-6. 单合约手数上限；
-7. 账户日亏损/总回撤；
-8. 合计保证金率；
-9. 最小可用资金率；
-10. 报单频率。
-
-2.0x gross 只是策略目标上限，不会放宽任何账户风险门。
-
-## 7. 减仓优先与状态机
-
-Directional 调仓不会在同一阶段一边平旧合约一边加新风险：
+任何新增风险不可用都不能阻塞确定性风险下降：
 
 ```text
-存在 reductions
-    ↓
-只发送 reducing FAK
-    ↓
-等待 Broker 确认后的下一周期
-    ↓
-无 reductions 才允许 openings
+读取 Broker 当前持仓
+→ 计算 target
+→ target=0 / 反转 / 超额 / 可执行换月的旧风险形成 reductions
+→ 只提交 reducing FAK
+→ 等 Broker 回报并重新读取持仓
+→ reductions 消失后才允许 openings
 ```
 
-TradingEngine 继续维护：
+若某个非零新目标暂时没有 eligible contract/fresh quote：
+
+- 不新增、不换月；
+- 若已有该产品仓位，临时冻结为当前净手数；
+- 其它产品的减仓继续执行。
+
+## 8. Risk state
+
+统一状态机仍是：
 
 ```text
 RUNNING
-  ├─ 严重异常 → HALTED
-  └─ 需要退出的风险 → REDUCE_ONLY → HALTED
+├─ 需要主动退出已有风险 → REDUCE_ONLY → HALTED
+└─ 无法安全继续的严重异常 → HALTED
 ```
 
-`DirectionalTradingEngine` 只扩展策略生命周期；状态文件、Kill Switch、账户检查、对账和 Broker 事件处理仍复用基础 `TradingEngine`。
+Directional 账户日亏损/高水位回撤等需要退出已有风险时，通过 `REDUCE_ONLY` 持续 flatten，而不是直接 HALTED 后把方向仓位遗留在账户。
 
-## 8. Broker 真相
+## 9. Broker/StateStore 真相与重启
 
-本地策略不自行推进“已成交仓位”。真实账户中的：
+Directional trade callback 先走基础 `TradingEngine._apply_expected_trade()` 更新统一 expected positions；quality callback 只观察，不改仓位。
 
-- account；
-- active order；
-- trade；
-- position；
-
-全部以 Broker/CTP 回报为准。Directional manager 每次调仓都读取 Broker 当前持仓再计算 delta。
-
-## 9. Shadow
-
-`ShadowBroker` 仍然使用：
+重启时：
 
 ```text
-真实 CTP：catalog / tick / trading_day / metadata / signal market context
-本地 SimBroker：account / order / trade / position
+RuntimeState.positions
+↔ Broker 完整 position snapshot
 ```
 
-Directional Shadow 与 Calendar Shadow 通过同一个 CLI runtime factory 进入对应 account-exclusive engine，但不会发真实 CTP 订单。
+逐合约今昨、多空完全一致才 reconciled。任何不一致直接 fail-closed。不存在 directional 自己的“策略仓位恢复表”。
 
-## 10. 研究与生产分离
+## 10. Execution quality
 
-研究脚本可以搜索和比较更多模板；生产 policy 只包含冻结结果。最终高收益证据分三层：
+同一 `ExecutionQualityRecorder` 记录：
 
-1. broad L3：连续合约发现高收益 family；
-2. specific-contract L4：真实换月和 next-open 执行；
-3. production policy：把最终冻结公式复制为独立模块，避免后续研究改动静默改变实盘行为。
+- pair：candidate / decision / round-trip；
+- directional：rebalance / fill / cycle。
 
-最终 historical L4：2024-08-21~2026-08-20，5bp 单边，年化约 107.46%、最大回撤约 27.41%、gross ≤2x；但该结果具有显式选择偏差，Final OOS 并未独立通过。
+Directional cycle 汇总包含 realized turnover、commission、median/p95 slippage bps、tracking error、completion latency、partial/rejected count。真实 fill 只来自 Broker `Trade` callback。
 
-## 11. 不增加的系统层
+## 11. Production-mechanics acceptance
 
-项目仍不需要数据库、消息队列、Web 服务、微服务或另一套账户状态机。当前优先级是收益来源、真实执行质量和未来新数据，而不是系统体量。
+研究证据分两层，不混称：
+
+1. **float-notional specific-contract L4**：证明冻结 Alpha 在 next-open / roll-safe 历史口径下的收益；
+2. **production-mechanics proxy**：相同冻结权重叠加 multiplier、整数手数、contract cap、reduction-first、margin/cash、daily-loss/high-watermark gates。
+
+Proxy 使用冻结产品 multiplier，但历史逐日 Broker margin 不可得，因此 Base/Stress 使用显式统一 margin proxy；该结果不是“精确历史柜台资金曲线”。
+
+## 12. Shadow
+
+Shadow 的市场侧来自真实 CTP catalog/tick/trading day/metadata，订单账户侧来自本地 SimBroker。Directional Shadow 仍走正式 activity snapshot、signal day、target lot、RiskManager 和 quality 生命周期，但不会调用真实 CTP `send_order()`。
+
+## 13. 不增加的系统层
+
+当前不需要数据库、消息队列、Web 服务、微服务或第二账户状态机。后续新增价值应来自未来新数据、真实执行质量和成本，而不是继续扩大系统体量。

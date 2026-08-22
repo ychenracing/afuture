@@ -1,6 +1,6 @@
 # Execution-aligned directional portfolio test/Shadow configuration.
-# The frozen 50-product universe and policy match the 2026-08-22 specific-contract L4.
-# The historical target is selection-biased; use Shadow/test CTP before any real capital.
+# The frozen 50-product universe and policy match the final specific-contract L4.
+# Historical return evidence is selection-biased; use Shadow/test CTP before real capital.
 [system]
 mode = "live"
 initial_capital = 500000
@@ -25,10 +25,11 @@ min_days_to_expiry = 20
 min_volume = 1000
 min_open_interest = 5000
 max_contract_volume = 100
-# Broad cross-midnight window permits the first fresh market session for each product.
-# Actual orders still require a fresh quote, sufficient depth and all RiskManager gates.
+# Broad cross-midnight window permits each product's first fresh tradable session.
+# Openings still require fresh quotes, sufficient depth and all RiskManager gates.
 rebalance_window = "20:55-09:10"
-# Covers normal weekends while still failing closed on a genuinely stale daily signal feed.
+# Primary freshness is trading-day alignment with the completed activity snapshot.
+# This is only a secondary ceiling for genuinely stale feeds / abnormal timestamps.
 signal_max_age_hours = 96
 account_exclusive = true
 
