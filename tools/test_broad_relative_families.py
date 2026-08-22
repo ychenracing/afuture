@@ -19,15 +19,15 @@ assert all(
     for candidate in module.CANDIDATES
 )
 
-# Synthetic cross-section with a persistent winner/loser proves the portfolio
-# remains market-neutral and the signal is lagged by one observation.
+# Synthetic cross-section has non-zero volatility and persistent ranking. This
+# proves the portfolio is able to form after the lookback while using lagged signals.
 dates = pd.date_range("2025-01-01", periods=80, freq="B")
 returns = pd.DataFrame(
     {
-        "A": [0.01] * 80,
-        "B": [0.005] * 80,
-        "C": [-0.005] * 80,
-        "D": [-0.01] * 80,
+        "A": [0.011 if i % 2 == 0 else 0.009 for i in range(80)],
+        "B": [0.006 if i % 2 == 0 else 0.004 for i in range(80)],
+        "C": [-0.004 if i % 2 == 0 else -0.006 for i in range(80)],
+        "D": [-0.009 if i % 2 == 0 else -0.011 for i in range(80)],
     },
     index=dates,
 )
