@@ -43,7 +43,11 @@ def test_directional_config_caps_gross_and_is_account_exclusive():
     config.validate()
     assert config.account_exclusive is True
     with pytest.raises(ValueError, match="gross leverage"):
-        DirectionalConfig(enabled=True, max_gross_leverage=2.01).validate()
+        DirectionalConfig(
+            enabled=True,
+            products=("A",),
+            max_gross_leverage=2.01,
+        ).validate()
 
 
 def test_frozen_policy_is_causal_and_never_exceeds_two_x_gross():
@@ -61,7 +65,6 @@ def test_frozen_policy_is_causal_and_never_exceeds_two_x_gross():
     weights = policy.weight_history(close)
     assert float(weights.abs().sum(axis=1).max()) <= 2.0 + 1e-12
 
-    # Weight used for the final date is based on information through the prior close.
     changed = close.copy()
     changed.iloc[-1] *= [10.0, 0.1, 8.0, 0.2]
     changed_weights = policy.weight_history(changed)
