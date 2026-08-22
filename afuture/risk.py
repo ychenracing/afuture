@@ -261,6 +261,47 @@ class RiskManager:
                     )
         return RiskDecision(True)
 
+    def check_contract_entry(
+        self,
+        tick: Tick,
+        side: OrderSide,
+        *,
+        requested_volume: int,
+        spec: ContractSpec,
+        session_windows: tuple[str, ...] = (),
+    ) -> RiskDecision:
+        """方向组合单合约开仓前复用实盘微观结构硬门。"""
+        if requested_volume <= 0:
+            return RiskDecision(False, "requested volume is not positive")
+        quote_decision = self.check_quotes([tick], tick.timestamp)
+        if not quote_decision.allowed:
+            return quote_decision
+        if session_windows and not self._inside_sessions(
+            tick.timestamp, session_windows
+        ):
+            return RiskDecision(False, "outside configured trading session")
+        if session_windows and not self._inside_open_close_buffer(
+            tick.timestamp, session_windows
+        ):
+            return RiskDecision(False, "inside session open/close safety window")
+
+        width_ticks = (tick.ask_price - tick.bid_price) / spec.price_tick
+        if width_ticks > self.config.max_bid_ask_ticks:
+            return RiskDecision(False, "bid/ask spread too wide")
+        depth = tick.ask_volume if side is OrderSide.BUY else tick.bid_volume
+        if depth < requested_volume * self.config.min_depth_multiple:
+            return RiskDecision(False, "top-of-book depth is insufficient")
+
+        if side is OrderSide.BUY and tick.limit_up > 0:
+            distance = (tick.limit_up - tick.ask_price) / spec.price_tick
+            if distance < self.config.limit_distance_ticks:
+                return RiskDecision(False, "buy leg is too close to upper limit")
+        if side is OrderSide.SELL and tick.limit_down > 0:
+            distance = (tick.bid_price - tick.limit_down) / spec.price_tick
+            if distance < self.config.limit_distance_ticks:
+                return RiskDecision(False, "sell leg is too close to lower limit")
+        return RiskDecision(True)
+
     def size_pair(
         self,
         account: AccountSnapshot,
@@ -302,22 +343,18 @@ class RiskManager:
             ),
         )
 
-    def check_open_batch(
+    def check_open_orders(
         self,
         account: AccountSnapshot,
         orders: list[OrderRequest],
         specs: dict[str, ContractSpec],
         *,
-        open_pair_count: int,
         current_contract_volumes: dict[str, int] | None = None,
     ) -> RiskDecision:
-        """一次校验双腿合计保证金，避免逐腿通过但组合超限。"""
+        """通用开仓批次账户/保证金/单合约上限门，不包含策略类型限制。"""
         account_decision = self.check_account(account)
         if not account_decision.allowed:
             return account_decision
-        if open_pair_count >= self.config.max_open_pairs:
-            return RiskDecision(False, "open pair limit reached")
-
         current_contract_volumes = current_contract_volumes or {}
         requested_by_symbol: dict[str, int] = {}
         estimated_margin = 0.0
@@ -362,6 +399,25 @@ class RiskManager:
                 False, "combined cash reserve would fall below limit"
             )
         return RiskDecision(True)
+
+    def check_open_batch(
+        self,
+        account: AccountSnapshot,
+        orders: list[OrderRequest],
+        specs: dict[str, ContractSpec],
+        *,
+        open_pair_count: int,
+        current_contract_volumes: dict[str, int] | None = None,
+    ) -> RiskDecision:
+        """套利开仓额外保留 pair 数量门，再复用通用批次风险。"""
+        if open_pair_count >= self.config.max_open_pairs:
+            return RiskDecision(False, "open pair limit reached")
+        return self.check_open_orders(
+            account,
+            orders,
+            specs,
+            current_contract_volumes=current_contract_volumes,
+        )
 
     def is_pair_session_active(self, pair: PairConfig, timestamp: datetime) -> bool:
         """判断组合当前是否处于中国本地交易时段；未配置时默认活跃。"""
