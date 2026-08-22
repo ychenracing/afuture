@@ -11,6 +11,15 @@ from .directional_runtime import DirectionalPortfolioManager, _CHINA_TZ
 from .execution_aligned_policy import ExecutionAlignedAggressivePolicy
 
 
+FROZEN_PRODUCTS = (
+    "A", "AG", "AL", "AP", "AU", "B", "BC", "BU", "C", "CF", "CJ", "CS",
+    "CU", "EB", "EG", "FG", "FU", "HC", "I", "J", "JM", "L", "LH", "LU",
+    "M", "MA", "NI", "NR", "OI", "P", "PB", "PF", "PG", "PK", "PP", "RB",
+    "RM", "RU", "SA", "SF", "SM", "SN", "SP", "SR", "SS", "TA", "UR", "V",
+    "Y", "ZN",
+)
+
+
 @dataclass(frozen=True)
 class ExecutionAlignedSignalHistory:
     open: pd.DataFrame
@@ -80,14 +89,19 @@ class ExecutionAlignedDirectionalPortfolioManager(DirectionalPortfolioManager):
     """Reuse the existing execution lifecycle while supplying OHLC-aware target weights."""
 
     def __init__(self, config, broker, risk_manager, *, signal_provider=None, policy=None, **kwargs):
+        if policy is None:
+            configured = tuple(sorted({str(item).upper() for item in config.products}))
+            if configured != FROZEN_PRODUCTS:
+                raise ValueError(
+                    "execution-aligned production requires the frozen 50-product universe"
+                )
+            policy = ExecutionAlignedAggressivePolicy(products=configured)
         super().__init__(
             config,
             broker,
             risk_manager,
             signal_provider=signal_provider or SinaContinuousOHLCProvider(),
-            policy=policy or ExecutionAlignedAggressivePolicy(
-                products=tuple(item.upper() for item in config.products)
-            ),
+            policy=policy,
             **kwargs,
         )
         self._execution_signal_history: ExecutionAlignedSignalHistory | None = None
