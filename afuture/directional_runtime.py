@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
-from datetime import datetime, time, timezone
+from datetime import datetime, time
 from typing import Mapping, Protocol
 from zoneinfo import ZoneInfo
 
@@ -54,7 +54,7 @@ class SinaContinuousSignalProvider:
     def _load_one(product: str) -> pd.Series:
         try:
             import akshare as ak
-        except ImportError as exc:  # live extra owns this dependency
+        except ImportError as exc:
             raise RuntimeError(
                 "directional live mode requires the 'live' extra with akshare"
             ) from exc
@@ -92,8 +92,9 @@ class SinaContinuousSignalProvider:
             raise RuntimeError(
                 "directional signal refresh failed: " + "; ".join(sorted(errors))
             )
-        frame = pd.concat([series[product] for product in unique], axis=1).sort_index()
-        return frame
+        return pd.concat(
+            [series[product] for product in unique], axis=1
+        ).sort_index()
 
 
 @dataclass(frozen=True)
@@ -182,19 +183,27 @@ class DirectionalPortfolioManager:
 
     def maybe_rebalance(self, now: datetime) -> DirectionalActionResult:
         if not self._initialized:
-            return DirectionalActionResult("reject", "directional manager is not initialized")
+            return DirectionalActionResult(
+                "reject", "directional manager is not initialized"
+            )
         if not self.broker.is_ready():
             return DirectionalActionResult("reject", "broker is not ready")
         if not self._inside_rebalance_window(now):
-            return DirectionalActionResult("hold", "outside directional rebalance window")
+            return DirectionalActionResult(
+                "hold", "outside directional rebalance window"
+            )
         if self.broker.get_active_orders():
-            return DirectionalActionResult("wait", "active orders must settle before rebalance")
+            return DirectionalActionResult(
+                "wait", "active orders must settle before rebalance"
+            )
 
         try:
             signal = self._load_signal(now)
             target_weights = self._next_target_weights(signal)
         except Exception as exc:
-            return DirectionalActionResult("reject", f"directional signal unavailable: {exc}")
+            return DirectionalActionResult(
+                "reject", f"directional signal unavailable: {exc}"
+            )
 
         local_date = self._local(now).date()
         selected = self.selector.select(self._catalog, self._ticks, local_date)
@@ -216,7 +225,9 @@ class DirectionalPortfolioManager:
         try:
             specs = self._ensure_specs(symbols)
         except Exception as exc:
-            return DirectionalActionResult("reject", f"directional metadata unavailable: {exc}")
+            return DirectionalActionResult(
+                "reject", f"directional metadata unavailable: {exc}"
+            )
 
         product_ticks = {
             product: self._ticks[selected[product].symbol]
@@ -236,10 +247,15 @@ class DirectionalPortfolioManager:
         plan = build_rebalance_plan(positions, target_lots)
         if plan.reductions:
             return self._submit_reductions(
-                positions, plan.reductions, now, reference="directional:rebalance"
+                positions,
+                plan.reductions,
+                now,
+                reference="directional:rebalance",
             )
         if not plan.openings:
-            return DirectionalActionResult("hold", "directional portfolio is at target")
+            return DirectionalActionResult(
+                "hold", "directional portfolio is at target"
+            )
         return self._submit_openings(
             positions,
             plan.openings,
@@ -250,25 +266,33 @@ class DirectionalPortfolioManager:
 
     def flatten(self, now: datetime) -> DirectionalActionResult:
         if self.broker.get_active_orders():
-            return DirectionalActionResult("wait", "active orders must settle before flatten")
+            return DirectionalActionResult(
+                "wait", "active orders must settle before flatten"
+            )
         positions = self.broker.get_positions()
         plan = build_rebalance_plan(positions, {})
         if not plan.reductions:
             return DirectionalActionResult("hold", "directional portfolio is flat")
         return self._submit_reductions(
-            positions, plan.reductions, now, reference="directional:flatten"
+            positions,
+            plan.reductions,
+            now,
+            reference="directional:flatten",
         )
 
     def has_risk(self) -> bool:
         return any(not position.empty for position in self.broker.get_positions())
 
     def required_symbols(self) -> set[str]:
+        """Return only symbols carrying live account/order risk for global health gates."""
         symbols = {
             position.symbol
             for position in self.broker.get_positions()
             if not position.empty
         }
-        symbols.update(self._ticks)
+        for order in self.broker.get_active_orders():
+            if order.request.reference.startswith("directional:"):
+                symbols.add(order.request.symbol)
         return symbols
 
     def _load_signal(self, now: datetime) -> pd.DataFrame:
@@ -283,10 +307,14 @@ class DirectionalPortfolioManager:
             frame.index = pd.to_datetime(frame.index, errors="coerce")
             frame = frame[~frame.index.isna()].sort_index()
             frame.columns = [str(item).upper() for item in frame.columns]
-            frame = frame.loc[frame.index.normalize() <= pd.Timestamp(local.date())]
+            frame = frame.loc[
+                frame.index.normalize() <= pd.Timestamp(local.date())
+            ]
             frame = frame.dropna(how="all")
             if len(frame) < 140:
-                raise RuntimeError("directional signal history is shorter than 140 days")
+                raise RuntimeError(
+                    "directional signal history is shorter than 140 days"
+                )
             latest = pd.Timestamp(frame.index[-1]).to_pydatetime().replace(
                 tzinfo=_CHINA_TZ
             )
@@ -313,10 +341,14 @@ class DirectionalPortfolioManager:
             raise RuntimeError(
                 f"directional signal exceeds configured gross leverage: {gross:.6f}"
             )
-        return {str(key).upper(): float(value) for key, value in weights.items()}
+        return {
+            str(key).upper(): float(value) for key, value in weights.items()
+        }
 
     def _ensure_specs(self, symbols: set[str]) -> dict[str, ContractSpec]:
-        missing = sorted(symbol for symbol in symbols if symbol not in self._specs)
+        missing = sorted(
+            symbol for symbol in symbols if symbol not in self._specs
+        )
         if missing:
             getter = getattr(self.broker, "get_live_contract_specs", None)
             if getter is None:
@@ -325,7 +357,9 @@ class DirectionalPortfolioManager:
                 missing, timeout_seconds=self.metadata_timeout_seconds
             )
             self._specs.update(fetched)
-        still_missing = sorted(symbol for symbol in symbols if symbol not in self._specs)
+        still_missing = sorted(
+            symbol for symbol in symbols if symbol not in self._specs
+        )
         if still_missing:
             raise RuntimeError(f"missing contract metadata: {still_missing}")
         return {symbol: self._specs[symbol] for symbol in symbols}
@@ -383,9 +417,13 @@ class DirectionalPortfolioManager:
                     )
                 except Exception as exc:
                     return DirectionalActionResult(
-                        "reject", f"directional reduction submission failed: {exc}", tuple(order_ids)
+                        "reject",
+                        f"directional reduction submission failed: {exc}",
+                        tuple(order_ids),
                     )
-        return DirectionalActionResult("reduce", order_ids=tuple(order_ids))
+        return DirectionalActionResult(
+            "reduce", order_ids=tuple(order_ids)
+        )
 
     def _submit_openings(
         self,
@@ -443,7 +481,9 @@ class DirectionalPortfolioManager:
             current_contract_volumes=current_volumes,
         )
         if not account_decision.allowed:
-            return DirectionalActionResult("reject", account_decision.reason)
+            return DirectionalActionResult(
+                "reject", account_decision.reason
+            )
 
         order_ids: list[str] = []
         for request in requests:
