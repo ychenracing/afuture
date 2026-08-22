@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from .directional_risk import DirectionalRiskScaledPolicy
 from .engine import TradingEngine
 from .models import Order, RuntimeMode, Tick, Trade
 
@@ -24,13 +25,14 @@ class DirectionalTradingEngine(TradingEngine):
         super().__init__(*args, **kwargs)
         self.directional_manager = directional_manager
         self._directional_initialized = False
-        setter = getattr(
-            self.directional_manager,
-            "set_completed_return_provider",
-            None,
-        )
-        if callable(setter):
-            setter(lambda: tuple(self.state.recent_daily_returns))
+        policy = getattr(self.directional_manager, "policy", None)
+        if policy is not None and not isinstance(policy, DirectionalRiskScaledPolicy):
+            self.directional_manager.policy = DirectionalRiskScaledPolicy(
+                policy,
+                completed_returns_provider=(
+                    lambda: tuple(self.state.recent_daily_returns)
+                ),
+            )
 
     def initialize_after_ready(self) -> None:
         super().initialize_after_ready()
