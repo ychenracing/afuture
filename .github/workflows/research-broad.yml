@@ -1,8 +1,9 @@
 name: research-broad
 
-# L3 breadth evidence is expensive enough that it is a milestone gate, not an
-# inner-loop test. The completed evidence is retained in Actions artifacts; rerun
-# manually only when broad-universe/family methodology changes materially.
+# L3 economic-pair breadth evidence is a milestone gate, not an inner-loop test.
+# The rejected cross-sectional families are summarized in docs/research-final-evidence.md
+# rather than retained as dead research code. Rerun manually only when the surviving
+# economic-pair methodology changes materially.
 on:
   workflow_dispatch:
 
@@ -24,16 +25,12 @@ jobs:
           python-version: "3.13"
       - run: python -m pip install --upgrade pip
       - run: python -m pip install akshare pandas
-      - name: Verify broad factor research causality and risk calibration
-        run: python tools/test_broad_relative_families.py
       - name: Verify economic-pair research causality and fail-closed leverage
         run: python tools/test_broad_pair_regime.py
       - name: Verify strongest-pair rotation and overlap control
         run: python tools/test_broad_pair_rotation.py
       - name: Fetch broad continuous daily factor universe
         run: python tools/fetch_broad_daily_universe.py
-      - name: Screen market-neutral cross-sectional families
-        run: python tools/evaluate_broad_relative_families.py
       - name: Screen economic pairs with persistence and volatility regime
         run: python tools/evaluate_broad_pair_regime.py
       - name: Screen capital-efficient strongest-pair rotation
@@ -41,12 +38,11 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: broad-relative-value-evidence
+          name: broad-economic-pair-evidence
           path: |
             runtime/broad_daily_universe.csv
             runtime/broad_daily_universe_summary.csv
             runtime/broad_daily_universe_failures.txt
-            runtime/broad_relative_family_report.json
             runtime/broad_pair_regime_report.json
             runtime/broad_pair_rotation_report.json
           retention-days: 14
