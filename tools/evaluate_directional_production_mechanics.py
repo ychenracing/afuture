@@ -8,7 +8,8 @@ Alpha or parameters and does not claim historical broker margin schedules are kn
 
 Each published reporting window is an independent account experiment: the frozen signal
 path is unchanged, while account equity, positions, margin state and high-watermark reset
-to the configured initial capital/flat state at that window's first day.
+to the configured initial capital/flat state at that window's first day. Static contract
+indexes are prepared once and safely reused across those independent account runs.
 """
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ if str(ROOT) not in sys.path:
 
 from afuture.directional_acceptance import (
     DirectionalProductionAcceptance,
+    PreparedDirectionalContracts,
     ProductionMechanicsConfig,
     ProductionSimulationResult,
 )
@@ -137,6 +139,7 @@ def _simulation_report(
     specific_raw: pd.DataFrame,
     weights: pd.DataFrame,
     *,
+    prepared: PreparedDirectionalContracts,
     cost_bps: float,
     margin_rate_proxy: float,
 ) -> tuple[dict, pd.DataFrame]:
@@ -150,6 +153,7 @@ def _simulation_report(
             specific_raw,
             window_weights,
             cost_bps=cost_bps,
+            prepared=prepared,
         )
         windows[name] = _result_stats(result)
         daily_by_window[name] = result.daily.copy()
@@ -222,10 +226,14 @@ def evaluate_with_weights(
             margin_rate_proxy=STRESS_MARGIN_PROXY,
         )
     )
+    # Contract data preparation is invariant to account capital, margin proxy and
+    # reporting window. Reuse it while every simulation still resets account state.
+    prepared = base_sim.prepare_contracts(specific_raw)
     base, base_daily = _simulation_report(
         base_sim,
         specific_raw,
         weights,
+        prepared=prepared,
         cost_bps=BASE_COST_BPS,
         margin_rate_proxy=BASE_MARGIN_PROXY,
     )
@@ -233,6 +241,7 @@ def evaluate_with_weights(
         stress_sim,
         specific_raw,
         weights,
+        prepared=prepared,
         cost_bps=STRESS_COST_BPS,
         margin_rate_proxy=STRESS_MARGIN_PROXY,
     )
@@ -290,6 +299,7 @@ def evaluate_with_weights(
                 ),
                 "defensive_scale": float(base_sim.risk_governor.defensive_scale),
             },
+            "prepared_contract_indexes_reused_across_windows": True,
             "state_reset_per_window": True,
         },
         "base": base,
