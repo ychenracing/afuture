@@ -230,10 +230,9 @@ class DirectionalProductionAcceptance:
             (frame["open"] > 0) & (frame["close"] > 0)
         ].copy()
 
-    def select_contracts_for_day(
-        self, raw: pd.DataFrame, target_day: pd.Timestamp
+    def _select_contracts_from_normalized(
+        self, frame: pd.DataFrame, target_day: pd.Timestamp
     ) -> dict[str, str]:
-        frame = self._normalize_contracts(raw)
         day = pd.Timestamp(target_day).normalize()
         prior_dates = frame.loc[frame["date"] < day, "date"]
         if prior_dates.empty:
@@ -257,6 +256,13 @@ class DirectionalProductionAcceptance:
             if not rows.empty:
                 result[str(product)] = str(rows.iloc[0]["symbol"])
         return result
+
+    def select_contracts_for_day(
+        self, raw: pd.DataFrame, target_day: pd.Timestamp
+    ) -> dict[str, str]:
+        return self._select_contracts_from_normalized(
+            self._normalize_contracts(raw), target_day
+        )
 
     def _margin(
         self,
@@ -424,7 +430,7 @@ class DirectionalProductionAcceptance:
                     halted = True
 
             if not halted and not daily_circuit:
-                selected = self.select_contracts_for_day(frame, day)
+                selected = self._select_contracts_from_normalized(frame, day)
                 product_open: dict[str, float] = {}
                 selected_symbols: dict[str, str] = {}
                 for product, symbol in selected.items():
