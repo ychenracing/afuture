@@ -15,8 +15,8 @@ sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 
 
-def synthetic_returns() -> tuple[pd.DataFrame, dict[str, str]]:
-    dates = pd.date_range("2024-01-01", periods=180, freq="B")
+def synthetic_returns(periods: int = 180) -> tuple[pd.DataFrame, dict[str, str]]:
+    dates = pd.date_range("2024-01-01", periods=periods, freq="B")
     even = np.arange(len(dates)) % 2 == 0
     values = pd.DataFrame(
         {
@@ -101,9 +101,72 @@ def test_fail_closed_when_no_positive_calibration_template() -> None:
     ) == []
 
 
+def test_dynamic_rotation_adapts_using_trailing_history() -> None:
+    dates = pd.date_range("2025-01-01", periods=160, freq="B")
+    streams = {
+        "early": pd.Series([0.010] * 80 + [-0.010] * 80, index=dates),
+        "late": pd.Series([-0.005] * 80 + [0.008] * 80, index=dates),
+    }
+    rotated, audit = module.dynamic_rotate(
+        streams,
+        meta_lookback=20,
+        rebalance=5,
+        count=1,
+        switch_cost_bps=0.0,
+    )
+    assert rotated.iloc[:20].abs().sum() == 0.0
+    assert rotated.iloc[30:70].mean() > 0.0
+    assert rotated.iloc[110:].mean() > 0.0
+    assert any(row["selected"] == ["early"] for row in audit[:80])
+    assert any(row["selected"] == ["late"] for row in audit[80:])
+
+
+def test_build_panel_infers_exchange_without_future_metadata() -> None:
+    raw = pd.DataFrame(
+        [
+            {"date": "2025-01-02", "product": "A", "close": 100.0},
+            {"date": "2025-01-03", "product": "A", "close": 101.0},
+            {"date": "2025-01-02", "product": "RB", "close": 3000.0},
+            {"date": "2025-01-03", "product": "RB", "close": 3030.0},
+        ]
+    )
+    returns, exchanges, coverage = module.build_panel(raw)
+    assert exchanges["A"] == "DCE"
+    assert exchanges["RB"] == "SHFE"
+    assert list(returns.columns) == ["A", "RB"]
+    assert coverage["products"] == 2
+
+
+def test_evaluate_reports_explicit_non_pristine_target_and_leverage_cap() -> None:
+    dates = pd.date_range("2022-08-22", "2026-08-20", freq="B")
+    even = np.arange(len(dates)) % 2 == 0
+    returns = {
+        "A": np.where(even, 0.006, 0.004),
+        "M": np.where(even, 0.003, 0.001),
+        "P": np.where(even, -0.001, -0.003),
+        "Y": np.where(even, -0.004, -0.006),
+    }
+    rows = []
+    for product, values in returns.items():
+        close = 100.0 * np.cumprod(1.0 + values)
+        rows.extend(
+            {"date": day, "product": product, "close": price}
+            for day, price in zip(dates, close)
+        )
+    report = module.evaluate(pd.DataFrame(rows))
+    assert report["pristine_final_oos"] is False
+    assert report["template_count"] == len(module.primary_templates())
+    assert report["target"]["annualized_return"] == 1.0
+    assert report["target"]["gross_leverage_cap"] == 2.0
+    assert report["selection"]["effective_gross_leverage"] <= 2.0 + 1e-12
+
+
 if __name__ == "__main__":
     test_causal_momentum_pairing_and_gross_cap()
     test_turnover_cost_reduces_return()
     test_primary_grid_is_bounded_and_multi_family()
     test_template_selection_uses_only_calibration_slice()
     test_fail_closed_when_no_positive_calibration_template()
+    test_dynamic_rotation_adapts_using_trailing_history()
+    test_build_panel_infers_exchange_without_future_metadata()
+    test_evaluate_reports_explicit_non_pristine_target_and_leverage_cap()
