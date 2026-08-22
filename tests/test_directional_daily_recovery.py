@@ -205,3 +205,39 @@ def test_drawdown_breach_remains_hard_halt_and_is_not_auto_recoverable(tmp_path)
 
     assert engine.halted is True
     assert engine.state.runtime_mode == RuntimeMode.HALTED.value
+
+
+def test_hard_drawdown_takes_precedence_when_daily_loss_is_also_breached(tmp_path):
+    broker, manager, engine = _engine(
+        tmp_path,
+        RiskManager(RiskConfig(max_daily_loss_ratio=0.05, max_total_drawdown_ratio=0.30)),
+    )
+    manager.risk = True
+    broker.account = AccountSnapshot(
+        balance=60000,
+        equity=60000,
+        available=60000,
+        margin=0,
+        realized_pnl=-40000,
+        unrealized_pnl=0,
+        trading_day="20260825",
+    )
+
+    engine.on_tick(_tick())
+    assert engine.state.runtime_mode == RuntimeMode.REDUCE_ONLY.value
+    assert engine.state.directional_daily_circuit_day == ""
+
+    _finish_reduce_only(manager, engine)
+    broker.account = AccountSnapshot(
+        balance=60000,
+        equity=60000,
+        available=60000,
+        margin=0,
+        realized_pnl=0,
+        unrealized_pnl=0,
+        trading_day="20260826",
+    )
+    engine._handle_account_event(broker.account)
+
+    assert engine.halted is True
+    assert engine.state.runtime_mode == RuntimeMode.HALTED.value
