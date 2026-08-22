@@ -1,7 +1,8 @@
 name: research-2y
 
-# 两年真实数据属于高成本 L4 经济证据。code 0=晋级，code 2=经济门拒绝；
-# 两者都表示研究程序正常完成，只有其它退出码才属于工程失败。
+# Two-year real data is an expensive L4 economic gate. code 0=promotion and
+# code 2=economic rejection for the specific-contract strategy; both mean the
+# research program completed normally. Other non-zero exits are engineering failures.
 on:
   workflow_dispatch:
   pull_request:
@@ -10,6 +11,9 @@ on:
       - "tools/test_alignment.py"
       - "tools/fetch_two_year_60m_universe.py"
       - "tools/fetch_prior_two_year_60m_universe.py"
+      - "tools/fetch_broad_daily_universe.py"
+      - "tools/evaluate_broad_relative_families.py"
+      - "tools/test_broad_relative_families.py"
       - ".github/workflows/research-2y.yml"
 
 permissions:
@@ -22,7 +26,7 @@ concurrency:
 jobs:
   real-data:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -30,13 +34,14 @@ jobs:
           python-version: "3.13"
       - run: python -m pip install --upgrade pip
       - run: python -m pip install akshare pandas
-      - name: 验证生产采样、交易日、front-3 和活动度语义
+
+      - name: Verify production sampling, trading-day, front-3 and activity semantics
         run: python tools/test_alignment.py
       - name: Fetch recent two-year 60-minute universe
         run: python tools/fetch_two_year_60m_universe.py
       - name: Fetch independent prior two-year 60-minute universe
         run: python tools/fetch_prior_two_year_60m_universe.py
-      - name: Validate two-window strategy evidence
+      - name: Validate two-window specific-contract strategy evidence
         run: |
           set +e
           python tools/evaluate_daily_relative_strategy.py
@@ -61,6 +66,33 @@ jobs:
               "target": report["target"],
           }, ensure_ascii=False, indent=2))
           PY
+
+      - name: Verify broad relative-value research causality
+        run: python tools/test_broad_relative_families.py
+      - name: Fetch broad continuous daily factor universe
+        run: python tools/fetch_broad_daily_universe.py
+      - name: Screen broad market-neutral relative-value families
+        run: |
+          python tools/evaluate_broad_relative_families.py
+          python - <<'PY'
+          import json
+          report = json.load(open("runtime/broad_relative_family_report.json", encoding="utf-8"))
+          assert report["candidate_count"] == 16
+          assert report["coverage"]["products"] >= 20
+          assert report["pristine_final_oos"] is False
+          assert report["historical_l1_available"] is False
+          assert "target_met" in report["target"]
+          print(json.dumps({
+              "coverage": report["coverage"],
+              "prior_selected": report["prior_selected"],
+              "current_selected": report["current_selected"],
+              "prior_forward_train": report["prior_forward_train"],
+              "selected_leverage": report["selected_leverage"],
+              "selected_stress": report["selected_stress"],
+              "target": report["target"],
+          }, ensure_ascii=False, indent=2))
+          PY
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -73,4 +105,8 @@ jobs:
             runtime/prior_two_year_broad_60m_summary.csv
             runtime/prior_two_year_broad_60m_failures.txt
             runtime/two_year_strategy_report.json
+            runtime/broad_daily_universe.csv
+            runtime/broad_daily_universe_summary.csv
+            runtime/broad_daily_universe_failures.txt
+            runtime/broad_relative_family_report.json
           retention-days: 14
