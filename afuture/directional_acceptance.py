@@ -230,6 +230,28 @@ class DirectionalProductionAcceptance:
             (frame["open"] > 0) & (frame["close"] > 0)
         ].copy()
 
+    def _select_contracts_from_snapshot(
+        self, snapshot: pd.DataFrame, target_day: pd.Timestamp
+    ) -> dict[str, str]:
+        day = pd.Timestamp(target_day).normalize()
+        eligible = snapshot[
+            (snapshot["delivery"] - day).dt.days
+            >= self.config.min_days_to_delivery
+        ]
+        eligible = eligible[
+            (eligible["volume"] >= self.config.min_volume)
+            & (eligible["hold"] >= self.config.min_open_interest)
+        ]
+        result: dict[str, str] = {}
+        for product, rows in eligible.groupby("product"):
+            rows = rows.sort_values(
+                ["hold", "volume", "delivery", "symbol"],
+                ascending=[False, False, True, True],
+            )
+            if not rows.empty:
+                result[str(product)] = str(rows.iloc[0]["symbol"])
+        return result
+
     def _select_contracts_from_normalized(
         self, frame: pd.DataFrame, target_day: pd.Timestamp
     ) -> dict[str, str]:
@@ -238,24 +260,8 @@ class DirectionalProductionAcceptance:
         if prior_dates.empty:
             return {}
         completed = pd.Timestamp(prior_dates.max()).normalize()
-        snapshot = frame[frame["date"] == completed].copy()
-        snapshot = snapshot[
-            (snapshot["delivery"] - day).dt.days
-            >= self.config.min_days_to_delivery
-        ]
-        snapshot = snapshot[
-            (snapshot["volume"] >= self.config.min_volume)
-            & (snapshot["hold"] >= self.config.min_open_interest)
-        ]
-        result: dict[str, str] = {}
-        for product, rows in snapshot.groupby("product"):
-            rows = rows.sort_values(
-                ["hold", "volume", "delivery", "symbol"],
-                ascending=[False, False, True, True],
-            )
-            if not rows.empty:
-                result[str(product)] = str(rows.iloc[0]["symbol"])
-        return result
+        snapshot = frame[frame["date"] == completed]
+        return self._select_contracts_from_snapshot(snapshot, day)
 
     def select_contracts_for_day(
         self, raw: pd.DataFrame, target_day: pd.Timestamp
@@ -332,6 +338,13 @@ class DirectionalProductionAcceptance:
                 ["date", "symbol"], sort=False
             )
         }
+        activity_by_day = {
+            pd.Timestamp(day).normalize(): group
+            for day, group in frame.groupby("date", sort=False)
+        }
+        available_activity_days = pd.DatetimeIndex(
+            sorted(activity_by_day)
+        )
         equity = float(self.config.initial_capital)
         high_watermark = equity
         lots: dict[str, int] = {}
@@ -430,7 +443,18 @@ class DirectionalProductionAcceptance:
                     halted = True
 
             if not halted and not daily_circuit:
-                selected = self._select_contracts_from_normalized(frame, day)
+                activity_position = int(
+                    available_activity_days.searchsorted(day, side="left")
+                ) - 1
+                if activity_position < 0:
+                    selected = {}
+                else:
+                    completed_activity_day = pd.Timestamp(
+                        available_activity_days[activity_position]
+                    ).normalize()
+                    selected = self._select_contracts_from_snapshot(
+                        activity_by_day[completed_activity_day], day
+                    )
                 product_open: dict[str, float] = {}
                 selected_symbols: dict[str, str] = {}
                 for product, symbol in selected.items():
