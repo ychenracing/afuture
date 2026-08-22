@@ -42,7 +42,9 @@ def build_runtime_engine(
             ExecutionAlignedDirectionalPortfolioManager,
         )
 
-        activity_path = Path(config.state_path).with_name("directional_activity.json")
+        # Activity evidence follows the exact runtime StateStore location rather than
+        # depending on a second copy of the path in a configuration-like object.
+        activity_path = Path(state_store.path).with_name("directional_activity.json")
         manager = ExecutionAlignedDirectionalPortfolioManager(
             config.directional,
             broker,
