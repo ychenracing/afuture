@@ -26,14 +26,14 @@ evaluator = _load("execution_aligned_target", FINAL_PATH)
 assert set(fetcher.PRODUCTS) == set(evaluator.REQUIRED_PRODUCTS)
 assert len(fetcher.PRODUCTS) == 50
 assert evaluator.MAX_GROSS_LEVERAGE == 2.0
-assert evaluator.EXECUTION_SELECTION["pool_size"] == 64
-assert evaluator.EXECUTION_SELECTION["meta_lookback"] == 5
-assert evaluator.EXECUTION_SELECTION["rebalance"] == 10
-assert evaluator.EXECUTION_SELECTION["count"] == 4
-assert len(evaluator.EXECUTION_SELECTION["pool_ids"]) == 64
-assert evaluator.EXECUTION_SELECTION["meta_score_source"] == "continuous_next_open_proxy"
+assert evaluator.EXECUTION_SELECTION["pool_size"] == 96
+assert evaluator.EXECUTION_SELECTION["meta_lookback"] == 10
+assert evaluator.EXECUTION_SELECTION["rebalance"] == 5
+assert evaluator.EXECUTION_SELECTION["count"] == 3
+assert len(evaluator.EXECUTION_SELECTION["pool_ids"]) == 96
+assert evaluator.EXECUTION_SELECTION["meta_score_source"] == "continuous_intraday_proxy"
 assert evaluator.EXECUTION_SELECTION["selection_bias"] == (
-    "full_recent_target_fit_plus_specific_execution_pool_fit"
+    "full_recent_specific_execution_template_rank_fit"
 )
 
 symbols = set(fetcher.contract_symbols())
@@ -43,7 +43,6 @@ assert ("AG", "SHFE", "AG2209") in symbols
 assert ("BC", "INE", "BC2209") in symbols
 assert fetcher.delivery_date("AG2609") == pd.Timestamp("2026-09-15")
 
-# Concrete roll causality: t->t+1 return remains on the exact contract selected at t.
 dates = pd.to_datetime(["2025-01-02", "2025-01-03", "2025-01-06"])
 rows = []
 for product in ("A", "M"):
@@ -80,7 +79,6 @@ assert abs(close_returns.loc[dates[1], "A"] - 0.10) < 1e-12
 assert quality["A"]["rolls"] == 1
 assert int(selected["days_to_delivery"].min()) >= base.MIN_DAYS_TO_DELIVERY
 
-# Next-open execution semantics and turnover charging.
 idx = pd.date_range("2025-02-03", periods=3, freq="B")
 weights = pd.DataFrame({"A": [0.0, 1.0, -1.0]}, index=idx)
 gap = pd.DataFrame({"A": [0.0, 0.10, 0.20]}, index=idx)
@@ -92,9 +90,6 @@ costed = base.apply_next_open_product_weights(gap, intraday, weights, cost_bps=1
 assert abs((path.iloc[1] - costed.iloc[1]) - 0.001) < 1e-12
 assert abs((path.iloc[2] - costed.iloc[2]) - 0.002) < 1e-12
 
-# Continuous meta evidence uses completed close->open/open->close history. Keep the
-# synthetic gap below the 20% outlier boundary so floating-point representation cannot
-# accidentally exercise the outlier filter instead of the timing semantics.
 proxy_raw = pd.DataFrame(
     [
         {"date": idx[0], "product": "A", "open": 100.0, "close": 100.0},
@@ -109,4 +104,4 @@ assert abs(proxy_gap.loc[idx[2], "A"] - 0.19) < 1e-12
 assert abs(proxy_intraday.loc[idx[2], "A"] - 0.04) < 1e-12
 assert evaluator.PRISTINE_FINAL_OOS is False
 
-print("return-target execution-aligned specific-contract tests passed")
+print("return-target specific-ranked intraday-meta tests passed")
