@@ -34,7 +34,7 @@ _RECOVERY_ACK = "I_VERIFIED_CTP_POSITIONS"
 def build_parser() -> argparse.ArgumentParser:
     """创建 CLI，并把研究、观察和真实交易入口明确分离。"""
     parser = argparse.ArgumentParser(
-        prog="afuture", description="国内期货跨期套利交易系统"
+        prog="afuture", description="国内期货套利与方向组合交易系统"
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -398,32 +398,46 @@ def _auto_manager(config, *, evidence=None, shadow: bool = False):
     )
 
 
+def _build_cli_engine(
+    config,
+    broker,
+    state_store: StateStore,
+    *,
+    journal=None,
+    alert_manager=None,
+    auto_manager=None,
+    quality_recorder=None,
+):
+    """Create the account-exclusive runtime selected by validated configuration."""
+    from .runtime_factory import build_runtime_engine
+
+    return build_runtime_engine(
+        config,
+        broker,
+        state_store,
+        journal=journal,
+        alert_manager=alert_manager,
+        auto_manager=auto_manager,
+        quality_recorder=quality_recorder,
+    )
+
+
 def _run_live(config, args, logger) -> int:
     """完成柜台、快照、元数据、活动订单和持仓安全门后才进入实时循环。"""
     from .broker.ctp import CtpBroker
-    from .engine import TradingEngine
     from .journal import AuditJournal
     from .report import write_account_report
-    from .risk import RiskManager
 
     broker = CtpBroker(config.ctp)
     quality = _quality_recorder(config)
-    engine = TradingEngine(
+    engine = _build_cli_engine(
+        config,
         broker,
-        config.pairs,
-        config.contracts,
-        RiskManager(config.risk),
         StateStore(config.state_path),
-        auto_flatten_imbalance=config.auto_flatten_imbalance,
-        aggressive_ticks=config.aggressive_ticks,
-        slippage_ticks=config.slippage_ticks,
-        legging_timeout_seconds=config.legging_timeout_seconds,
         journal=AuditJournal(config.journal_path),
         alert_manager=_build_alert_manager(config),
         auto_manager=_auto_manager(config, evidence=quality),
         quality_recorder=quality,
-        require_live_metadata=config.require_live_metadata,
-        metadata_timeout_seconds=config.metadata_timeout_seconds,
     )
     engine.start()
     try:
@@ -455,7 +469,13 @@ def _run_live(config, args, logger) -> int:
         elif not engine.reconcile_startup():
             raise RuntimeError("startup reconciliation failed")
 
-        if config.auto.enabled:
+        if config.directional.enabled:
+            logger.info(
+                "CTP 已就绪，方向组合已启用：品种=%d，gross 上限=%.2fx",
+                len(config.directional.products),
+                config.directional.max_gross_leverage,
+            )
+        elif config.auto.enabled:
             logger.info(
                 "CTP 已就绪，自动发现已启用：品种=%s，最多激活组合=%d",
                 ",".join(config.auto.products),
@@ -494,9 +514,7 @@ def _run_shadow(config, args, logger) -> int:
     """使用真实 CTP 行情/元数据，但所有订单只进入本地保守 SimBroker。"""
     from .broker.ctp import CtpBroker
     from .broker.shadow import ShadowBroker
-    from .engine import TradingEngine
     from .journal import AuditJournal
-    from .risk import RiskManager
 
     if config.mode != "live" or config.ctp is None:
         raise ValueError("shadow requires system.mode=live")
@@ -515,22 +533,14 @@ def _run_shadow(config, args, logger) -> int:
     # Shadow 的 SimBroker 不代表真实持仓；每次观察会话都从空虚拟账户开始。
     if shadow_state.exists():
         shadow_state.unlink()
-    engine = TradingEngine(
+    engine = _build_cli_engine(
+        config,
         broker,
-        config.pairs,
-        config.contracts,
-        RiskManager(config.risk),
         StateStore(shadow_state),
-        auto_flatten_imbalance=config.auto_flatten_imbalance,
-        aggressive_ticks=config.aggressive_ticks,
-        slippage_ticks=config.slippage_ticks,
-        legging_timeout_seconds=config.legging_timeout_seconds,
         journal=AuditJournal(_runtime_path(config, "shadow_audit.jsonl")),
         alert_manager=_build_alert_manager(config),
         auto_manager=_auto_manager(config, evidence=quality, shadow=True),
         quality_recorder=quality,
-        require_live_metadata=config.require_live_metadata,
-        metadata_timeout_seconds=config.metadata_timeout_seconds,
     )
     engine.start()
     deadline = time.monotonic() + args.duration_seconds if args.duration_seconds > 0 else None
