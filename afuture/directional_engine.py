@@ -93,7 +93,39 @@ class DirectionalTradingEngine(TradingEngine):
         except Exception as exc:
             self.emergency_stop(f"directional rebalance failed: {exc}")
 
+    def _hard_account_risk_reason(self) -> str:
+        """Return non-recoverable account risk without letting daily loss mask it."""
+        try:
+            account = self.broker.get_account()
+        except Exception as exc:
+            return f"daily circuit hard-risk classification failed: {exc}"
+        if account.equity <= 0:
+            return "equity is not positive"
+
+        high_watermark = max(
+            float(self.risk_manager.high_watermark or 0.0),
+            float(self.state.equity_high_watermark or 0.0),
+            float(account.equity),
+        )
+        drawdown = max(0.0, high_watermark - account.equity) / high_watermark
+        margin_ratio = max(0.0, float(account.margin)) / account.equity
+        available_ratio = float(account.available) / account.equity
+        config = self.risk_manager.config
+
+        if drawdown >= config.max_total_drawdown_ratio:
+            return "drawdown limit reached"
+        if margin_ratio > config.max_margin_ratio:
+            return "margin ratio limit reached"
+        if available_ratio < config.min_available_ratio:
+            return "available cash reserve too low"
+        return ""
+
     def emergency_stop(self, reason: str) -> None:
+        if reason == _DAILY_CIRCUIT_REASON:
+            hard_reason = self._hard_account_risk_reason()
+            if hard_reason:
+                reason = hard_reason
+
         if reason == _DAILY_CIRCUIT_REASON:
             circuit_day = str(self.state.trading_day or "")
             if not circuit_day:
