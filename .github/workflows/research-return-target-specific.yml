@@ -5,11 +5,6 @@ name: research-return-target-specific
 # production-mechanics methodology. One fetch feeds every L4 evaluator below.
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - codex/afuture-production-reality-closure-20260822
-    paths:
-      - .github/workflows/research-return-target-specific.yml
 
 permissions:
   contents: read
