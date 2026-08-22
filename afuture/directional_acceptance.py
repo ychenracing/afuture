@@ -1,9 +1,9 @@
 """Deterministic production-mechanics proxy for the frozen directional portfolio.
 
-This module deliberately does not search Alpha or parameters.  It translates frozen
-product weights into integer contract lots and applies the same account-style hard gates
-used by production. Historical broker margin schedules are unavailable, so margin is
-explicitly a conservative proxy assumption rather than claimed exact CTP history.
+This module deliberately does not search Alpha or parameters. It translates frozen
+product weights into integer contract lots and applies production-style account hard
+gates. Historical broker margin schedules are unavailable, so margin is explicitly a
+proxy assumption rather than claimed exact CTP history.
 """
 from __future__ import annotations
 
@@ -17,56 +17,16 @@ from .directional import RebalancePlan
 
 
 PRODUCT_MULTIPLIERS: dict[str, float] = {
-    "A": 10.0,
-    "B": 10.0,
-    "C": 10.0,
-    "CS": 10.0,
-    "M": 10.0,
-    "P": 10.0,
-    "Y": 10.0,
-    "OI": 10.0,
-    "RM": 10.0,
-    "SR": 10.0,
-    "TA": 10.0,
-    "MA": 10.0,
-    "AG": 15.0,
-    "AL": 5.0,
-    "CU": 5.0,
-    "PB": 5.0,
-    "ZN": 5.0,
-    "AU": 1000.0,
-    "AP": 10.0,
-    "BC": 5.0,
-    "BU": 10.0,
-    "FU": 10.0,
-    "HC": 10.0,
-    "RB": 10.0,
-    "RU": 10.0,
-    "SP": 10.0,
-    "CF": 5.0,
-    "CJ": 5.0,
-    "EB": 5.0,
-    "EG": 10.0,
-    "FG": 20.0,
-    "I": 100.0,
-    "J": 100.0,
-    "JM": 60.0,
-    "L": 5.0,
-    "PP": 5.0,
-    "V": 5.0,
-    "PF": 5.0,
-    "PK": 5.0,
-    "SF": 5.0,
-    "SM": 5.0,
-    "SS": 5.0,
-    "LH": 16.0,
-    "LU": 10.0,
-    "NR": 10.0,
-    "NI": 1.0,
-    "SN": 1.0,
-    "PG": 20.0,
-    "SA": 20.0,
-    "UR": 20.0,
+    "A": 10.0, "B": 10.0, "C": 10.0, "CS": 10.0, "M": 10.0,
+    "P": 10.0, "Y": 10.0, "OI": 10.0, "RM": 10.0, "SR": 10.0,
+    "TA": 10.0, "MA": 10.0, "AG": 15.0, "AL": 5.0, "CU": 5.0,
+    "PB": 5.0, "ZN": 5.0, "AU": 1000.0, "AP": 10.0, "BC": 5.0,
+    "BU": 10.0, "FU": 10.0, "HC": 10.0, "RB": 10.0, "RU": 10.0,
+    "SP": 10.0, "CF": 5.0, "CJ": 5.0, "EB": 5.0, "EG": 10.0,
+    "FG": 20.0, "I": 100.0, "J": 100.0, "JM": 60.0, "L": 5.0,
+    "PP": 5.0, "V": 5.0, "PF": 5.0, "PK": 5.0, "SF": 5.0,
+    "SM": 5.0, "SS": 5.0, "LH": 16.0, "LU": 10.0, "NR": 10.0,
+    "NI": 1.0, "SN": 1.0, "PG": 20.0, "SA": 20.0, "UR": 20.0,
 }
 
 
@@ -103,8 +63,15 @@ class ProductionMechanicsConfig:
             raise ValueError("max_total_drawdown_ratio must be in (0, 1)")
 
 
+@dataclass(frozen=True)
+class ProductionSimulationResult:
+    daily: pd.DataFrame
+    final_equity: float
+    first_divergence: str = ""
+
+
 class DirectionalProductionAcceptance:
-    """Pure production-mechanics primitives shared by unit tests and L4 proxy tooling."""
+    """Pure deterministic mechanics used by tests and the final L4 proxy tool."""
 
     def __init__(self, config: ProductionMechanicsConfig | None = None) -> None:
         self.config = config or ProductionMechanicsConfig()
@@ -169,10 +136,7 @@ class DirectionalProductionAcceptance:
                 reductions[symbol] = target - have
             elif abs(target) > abs(have):
                 openings[symbol] = target - have
-        return RebalancePlan(
-            reductions=reductions,
-            openings={} if reductions else openings,
-        )
+        return RebalancePlan(reductions=reductions, openings={} if reductions else openings)
 
     def check_opening_batch(
         self,
@@ -198,10 +162,7 @@ class DirectionalProductionAcceptance:
                 return False, f"missing opening price: {symbol}", estimated
             multiplier = PRODUCT_MULTIPLIERS[self._product(symbol)]
             estimated += (
-                price
-                * multiplier
-                * requested
-                * self.config.margin_rate_proxy
+                price * multiplier * requested * self.config.margin_rate_proxy
                 * self.config.margin_estimate_buffer
             )
         post_margin = float(current_margin) + estimated
@@ -228,25 +189,30 @@ class DirectionalProductionAcceptance:
             return "drawdown limit reached"
         return ""
 
-    def select_contracts_for_day(
-        self, raw: pd.DataFrame, target_day: pd.Timestamp
-    ) -> dict[str, str]:
+    @staticmethod
+    def _normalize_contracts(raw: pd.DataFrame) -> pd.DataFrame:
         frame = raw.copy()
-        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
         frame["delivery"] = pd.to_datetime(frame["delivery"], errors="coerce")
         frame["product"] = frame["product"].astype(str).str.upper()
         frame["symbol"] = frame["symbol"].astype(str).str.upper()
-        for column in ("volume", "hold"):
+        for column in ("open", "close", "volume", "hold"):
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
         frame = frame.dropna(
-            subset=["date", "delivery", "product", "symbol", "volume", "hold"]
+            subset=["date", "delivery", "product", "symbol", "open", "close", "volume", "hold"]
         )
+        return frame[(frame["open"] > 0) & (frame["close"] > 0)].copy()
+
+    def select_contracts_for_day(
+        self, raw: pd.DataFrame, target_day: pd.Timestamp
+    ) -> dict[str, str]:
+        frame = self._normalize_contracts(raw)
         day = pd.Timestamp(target_day).normalize()
         prior_dates = frame.loc[frame["date"] < day, "date"]
         if prior_dates.empty:
             return {}
         completed = pd.Timestamp(prior_dates.max()).normalize()
-        snapshot = frame[frame["date"].dt.normalize() == completed].copy()
+        snapshot = frame[frame["date"] == completed].copy()
         snapshot = snapshot[
             (snapshot["delivery"] - day).dt.days >= self.config.min_days_to_delivery
         ]
@@ -263,3 +229,254 @@ class DirectionalProductionAcceptance:
             if not rows.empty:
                 result[str(product)] = str(rows.iloc[0]["symbol"])
         return result
+
+    def _margin(
+        self,
+        lots: Mapping[str, int],
+        prices: Mapping[str, float],
+    ) -> float:
+        return float(
+            sum(
+                abs(int(volume))
+                * float(prices.get(symbol, 0.0))
+                * PRODUCT_MULTIPLIERS[self._product(symbol)]
+                * self.config.margin_rate_proxy
+                * self.config.margin_estimate_buffer
+                for symbol, volume in lots.items()
+            )
+        )
+
+    @staticmethod
+    def _apply_deltas(lots: dict[str, int], deltas: Mapping[str, int]) -> None:
+        for symbol, delta in deltas.items():
+            lots[symbol] = int(lots.get(symbol, 0)) + int(delta)
+            if lots[symbol] == 0:
+                lots.pop(symbol, None)
+
+    def _turnover(
+        self,
+        deltas: Mapping[str, int],
+        prices: Mapping[str, float],
+    ) -> float:
+        return float(
+            sum(
+                abs(int(delta))
+                * float(prices.get(symbol, 0.0))
+                * PRODUCT_MULTIPLIERS[self._product(symbol)]
+                for symbol, delta in deltas.items()
+            )
+        )
+
+    def simulate(
+        self,
+        raw: pd.DataFrame,
+        weights: pd.DataFrame,
+        *,
+        cost_bps: float,
+    ) -> ProductionSimulationResult:
+        frame = self._normalize_contracts(raw)
+        weight_frame = weights.copy()
+        weight_frame.index = pd.to_datetime(weight_frame.index, errors="coerce").normalize()
+        weight_frame = weight_frame[~weight_frame.index.isna()].sort_index().fillna(0.0)
+        weight_frame.columns = [str(column).upper() for column in weight_frame.columns]
+        if bool((weight_frame.abs().sum(axis=1) > 2.0 + 1e-10).any()):
+            raise ValueError("production mechanics weights exceed 2x gross")
+
+        by_day_symbol = {
+            (pd.Timestamp(day).normalize(), str(symbol)): group.iloc[-1]
+            for (day, symbol), group in frame.groupby(["date", "symbol"], sort=False)
+        }
+        equity = float(self.config.initial_capital)
+        high_watermark = equity
+        lots: dict[str, int] = {}
+        previous_close: dict[str, float] = {}
+        halted = False
+        first_divergence = ""
+        output_rows: list[dict] = []
+        cost_rate = float(cost_bps) / 10000.0
+
+        for day, weight_row in weight_frame.iterrows():
+            day = pd.Timestamp(day).normalize()
+            previous_equity = equity
+            turnover_notional = 0.0
+            risk_reason = ""
+            margin_reject = ""
+
+            if halted:
+                output_rows.append(
+                    {
+                        "date": day,
+                        "equity": equity,
+                        "daily_return": 0.0,
+                        "turnover_notional": 0.0,
+                        "gross_notional": 0.0,
+                        "margin": 0.0,
+                        "risk_reason": first_divergence,
+                        "margin_reject": "",
+                        "halted": True,
+                    }
+                )
+                continue
+
+            # Existing concrete contracts earn only their own previous-close -> current-open gap.
+            open_prices: dict[str, float] = {}
+            close_prices: dict[str, float] = {}
+            missing_existing = False
+            for symbol, volume in list(lots.items()):
+                row = by_day_symbol.get((day, symbol))
+                if row is None or symbol not in previous_close:
+                    risk_reason = f"missing same-contract next price: {symbol}"
+                    first_divergence = first_divergence or risk_reason
+                    missing_existing = True
+                    break
+                open_price = float(row["open"])
+                close_price = float(row["close"])
+                open_prices[symbol] = open_price
+                close_prices[symbol] = close_price
+                equity += (
+                    open_price - float(previous_close[symbol])
+                ) * int(volume) * PRODUCT_MULTIPLIERS[self._product(symbol)]
+            if missing_existing:
+                halted = True
+                output_rows.append(
+                    {
+                        "date": day,
+                        "equity": equity,
+                        "daily_return": equity / previous_equity - 1.0,
+                        "turnover_notional": 0.0,
+                        "gross_notional": 0.0,
+                        "margin": 0.0,
+                        "risk_reason": risk_reason,
+                        "margin_reject": "",
+                        "halted": True,
+                    }
+                )
+                continue
+
+            day_start_equity = equity
+            risk_reason = self.account_risk_reason(
+                equity=equity,
+                day_start_equity=day_start_equity,
+                high_watermark=high_watermark,
+            )
+            if risk_reason and lots:
+                first_divergence = first_divergence or risk_reason
+                closing = {symbol: -volume for symbol, volume in lots.items()}
+                turnover_notional += self._turnover(closing, open_prices)
+                equity -= turnover_notional * cost_rate
+                lots.clear()
+                halted = True
+
+            if not halted:
+                selected = self.select_contracts_for_day(frame, day)
+                product_open: dict[str, float] = {}
+                selected_symbols: dict[str, str] = {}
+                for product, symbol in selected.items():
+                    row = by_day_symbol.get((day, symbol))
+                    if row is None:
+                        continue
+                    selected_symbols[product] = symbol
+                    product_open[product] = float(row["open"])
+                    open_prices[symbol] = float(row["open"])
+                    close_prices[symbol] = float(row["close"])
+
+                target = self.target_lots(
+                    equity=equity,
+                    product_weights={
+                        str(product): float(value)
+                        for product, value in weight_row.items()
+                    },
+                    product_open_prices=product_open,
+                    selected_symbols=selected_symbols,
+                )
+                phase = self.rebalance_plan(current_lots=lots, target_lots=target)
+                if phase.reductions:
+                    reduction_turnover = self._turnover(phase.reductions, open_prices)
+                    turnover_notional += reduction_turnover
+                    equity -= reduction_turnover * cost_rate
+                    self._apply_deltas(lots, phase.reductions)
+
+                phase = self.rebalance_plan(current_lots=lots, target_lots=target)
+                if phase.openings:
+                    current_margin = self._margin(lots, open_prices)
+                    allowed, margin_reject, _ = self.check_opening_batch(
+                        equity=equity,
+                        current_margin=current_margin,
+                        current_lots=lots,
+                        openings=phase.openings,
+                        open_prices=open_prices,
+                    )
+                    if allowed:
+                        opening_turnover = self._turnover(phase.openings, open_prices)
+                        turnover_notional += opening_turnover
+                        equity -= opening_turnover * cost_rate
+                        self._apply_deltas(lots, phase.openings)
+                    else:
+                        first_divergence = first_divergence or margin_reject
+
+                intraday_pnl = 0.0
+                for symbol, volume in lots.items():
+                    if symbol not in open_prices or symbol not in close_prices:
+                        continue
+                    intraday_pnl += (
+                        close_prices[symbol] - open_prices[symbol]
+                    ) * int(volume) * PRODUCT_MULTIPLIERS[self._product(symbol)]
+                equity += intraday_pnl
+                high_watermark = max(high_watermark, equity)
+                risk_reason = self.account_risk_reason(
+                    equity=equity,
+                    day_start_equity=day_start_equity,
+                    high_watermark=high_watermark,
+                )
+                if risk_reason and lots:
+                    first_divergence = first_divergence or risk_reason
+                    close_turnover = self._turnover(lots, close_prices)
+                    turnover_notional += close_turnover
+                    equity -= close_turnover * cost_rate
+                    lots.clear()
+                    halted = True
+
+            valuation_prices = close_prices if close_prices else open_prices
+            margin = self._margin(lots, valuation_prices) if lots else 0.0
+            gross_notional = float(
+                sum(
+                    abs(int(volume))
+                    * float(valuation_prices.get(symbol, 0.0))
+                    * PRODUCT_MULTIPLIERS[self._product(symbol)]
+                    for symbol, volume in lots.items()
+                )
+            )
+            previous_close = {
+                symbol: float(close_prices[symbol])
+                for symbol in lots
+                if symbol in close_prices
+            }
+            output_rows.append(
+                {
+                    "date": day,
+                    "equity": equity,
+                    "daily_return": equity / previous_equity - 1.0,
+                    "turnover_notional": turnover_notional,
+                    "gross_notional": gross_notional,
+                    "margin": margin,
+                    "risk_reason": risk_reason,
+                    "margin_reject": margin_reject,
+                    "halted": halted,
+                }
+            )
+
+        daily = pd.DataFrame(output_rows)
+        if daily.empty:
+            daily = pd.DataFrame(
+                columns=[
+                    "equity", "daily_return", "turnover_notional", "gross_notional",
+                    "margin", "risk_reason", "margin_reject", "halted"
+                ]
+            )
+        else:
+            daily.set_index("date", inplace=True)
+        return ProductionSimulationResult(
+            daily=daily,
+            final_equity=float(equity),
+            first_divergence=first_divergence,
+        )
