@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 
 import pandas as pd
 
@@ -107,47 +107,90 @@ class ExecutionAlignedDirectionalPortfolioManager(DirectionalPortfolioManager):
         self._execution_signal_history: ExecutionAlignedSignalHistory | None = None
 
     @staticmethod
-    def _normalize_frame(frame: pd.DataFrame, local_date) -> pd.DataFrame:
+    def _normalize_frame(frame: pd.DataFrame, max_date: date) -> pd.DataFrame:
         result = frame.copy()
         result.index = pd.to_datetime(result.index, errors="coerce")
         result = result[~result.index.isna()].sort_index()
         result.columns = [str(item).upper() for item in result.columns]
-        result = result.loc[result.index.normalize() <= pd.Timestamp(local_date)]
+        result = result.loc[result.index.normalize() <= pd.Timestamp(max_date)]
         return result.dropna(how="all")
 
-    def _load_signal(self, now: datetime) -> ExecutionAlignedSignalHistory:
+    def _normalize_history(
+        self,
+        history: ExecutionAlignedSignalHistory,
+        *,
+        max_date: date,
+    ) -> ExecutionAlignedSignalHistory:
+        close = self._normalize_frame(history.close, max_date)
+        open_prices = self._normalize_frame(history.open, max_date)
+        common = close.index.intersection(open_prices.index)
+        close = close.reindex(common)
+        open_prices = open_prices.reindex(index=common, columns=close.columns)
+        if len(close) < 140:
+            raise RuntimeError("directional signal history is shorter than 140 days")
+        return ExecutionAlignedSignalHistory(open_prices, close)
+
+    def _validate_signal_history(
+        self,
+        history: ExecutionAlignedSignalHistory,
+        local: datetime,
+        required_signal_day: date | None,
+    ) -> None:
+        latest_day = pd.Timestamp(history.close.index[-1]).date()
+        if required_signal_day is not None and latest_day < required_signal_day:
+            raise RuntimeError(
+                "directional history does not cover required signal trading day "
+                f"{required_signal_day.isoformat()}; latest={latest_day.isoformat()}"
+            )
+        latest = pd.Timestamp(history.close.index[-1]).to_pydatetime().replace(
+            tzinfo=_CHINA_TZ
+        )
+        age_hours = (local - latest).total_seconds() / 3600.0
+        if age_hours < -1:
+            raise RuntimeError("directional signal history is from the future")
+        if age_hours > self.config.signal_max_age_hours:
+            raise RuntimeError(
+                f"directional signal history is stale by {age_hours:.1f}h"
+            )
+
+    def _load_signal(
+        self,
+        now: datetime,
+        required_signal_day: date | None = None,
+    ) -> ExecutionAlignedSignalHistory:
         local = self._local(now)
-        if (
+        max_date = required_signal_day or local.date()
+        refresh = (
             self._execution_signal_history is None
             or self._signal_refresh_date != local.date()
-        ):
-            history = self.signal_provider.load(
-                tuple(item.upper() for item in self.config.products)
-            )
-            if not isinstance(history, ExecutionAlignedSignalHistory):
-                raise RuntimeError("execution-aligned signal provider must return OHLC history")
-            close = self._normalize_frame(history.close, local.date())
-            open_prices = self._normalize_frame(history.open, local.date())
-            common = close.index.intersection(open_prices.index)
-            close = close.reindex(common)
-            open_prices = open_prices.reindex(index=common, columns=close.columns)
-            if len(close) < 140:
-                raise RuntimeError("directional signal history is shorter than 140 days")
-            latest = pd.Timestamp(close.index[-1]).to_pydatetime().replace(
-                tzinfo=_CHINA_TZ
-            )
-            age_hours = (local - latest).total_seconds() / 3600.0
-            if age_hours < -1:
-                raise RuntimeError("directional signal history is from the future")
-            if age_hours > self.config.signal_max_age_hours:
-                raise RuntimeError(
-                    f"directional signal history is stale by {age_hours:.1f}h"
+        )
+        if refresh:
+            try:
+                raw = self.signal_provider.load(
+                    tuple(item.upper() for item in self.config.products)
                 )
-            self._execution_signal_history = ExecutionAlignedSignalHistory(
-                open_prices, close
-            )
+                if not isinstance(raw, ExecutionAlignedSignalHistory):
+                    raise RuntimeError(
+                        "execution-aligned signal provider must return OHLC history"
+                    )
+                history = self._normalize_history(raw, max_date=max_date)
+                self._execution_signal_history = history
+            except Exception:
+                if self._execution_signal_history is None:
+                    raise
+                history = self._normalize_history(
+                    self._execution_signal_history,
+                    max_date=max_date,
+                )
+                self._execution_signal_history = history
             self._signal_refresh_date = local.date()
+
         history = self._execution_signal_history
+        if history is None:
+            raise RuntimeError("execution-aligned signal history is unavailable")
+        history = self._normalize_history(history, max_date=max_date)
+        self._validate_signal_history(history, local, required_signal_day)
+        self._execution_signal_history = history
         return ExecutionAlignedSignalHistory(history.open.copy(), history.close.copy())
 
     def _next_target_weights(

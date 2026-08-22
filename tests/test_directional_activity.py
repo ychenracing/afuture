@@ -1,9 +1,10 @@
 from datetime import date, datetime, timezone
 
-from afuture.directional import DirectionalConfig, DirectionalContractSelector
+from afuture.directional import DirectionalConfig
 from afuture.directional_activity import (
     DirectionalActivityStore,
     DirectionalActivityTracker,
+    select_contracts_from_activity,
 )
 from afuture.models import ContractInfo, Tick
 
@@ -42,7 +43,6 @@ def test_activity_tracker_freezes_previous_trading_day_and_reloads(tmp_path):
     tracker.observe(_tick("A2611", "20260821", volume=12000, oi=20000), catalog["A2611"])
     assert tracker.completed_snapshot is None
 
-    # The first tick of the next CTP trading day freezes all latest observations from D.
     tracker.observe(_tick("A2611", "20260825", volume=1, oi=99999), catalog["A2611"])
     snapshot = tracker.completed_snapshot
     assert snapshot is not None
@@ -62,17 +62,16 @@ def test_previous_completed_activity_controls_contract_selection_not_current_tic
     tracker.observe(_tick("A2611", "20260821", volume=30000, oi=30000), catalog["A2611"])
     tracker.observe(_tick("A2611", "20260825", volume=500000, oi=999999), catalog["A2611"])
 
-    selector = DirectionalContractSelector(
-        DirectionalConfig(
-            enabled=True,
-            products=("A",),
-            exchanges=("DCE",),
-            min_days_to_expiry=20,
-            min_volume=1000,
-            min_open_interest=5000,
-        )
+    config = DirectionalConfig(
+        enabled=True,
+        products=("A",),
+        exchanges=("DCE",),
+        min_days_to_expiry=20,
+        min_volume=1000,
+        min_open_interest=5000,
     )
-    selected = selector.select_from_activity(
+    selected = select_contracts_from_activity(
+        config,
         list(catalog.values()),
         tracker.completed_snapshot,
         date(2026, 8, 25),
