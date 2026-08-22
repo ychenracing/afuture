@@ -2,7 +2,18 @@ from datetime import datetime, timezone
 
 from afuture.directional_engine import DirectionalTradingEngine
 from afuture.directional_runtime import DirectionalActionResult
-from afuture.models import AccountSnapshot, RuntimeMode, Tick
+from afuture.models import (
+    AccountSnapshot,
+    Offset,
+    Order,
+    OrderRequest,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    RuntimeMode,
+    Tick,
+    Trade,
+)
 from afuture.risk import RiskConfig, RiskManager
 from afuture.state import StateStore
 
@@ -18,6 +29,11 @@ class _Manager:
         self.flatten_calls = 0
         self.risk = False
         self.closed = False
+        self.next_result = DirectionalActionResult("hold")
+        self.quality_expectations = {}
+        self.quality_orders = []
+        self.quality_fills = []
+        self.quality_finalize_calls = 0
 
     def bootstrap(self, now):
         self.bootstrap_calls += 1
@@ -27,7 +43,7 @@ class _Manager:
 
     def maybe_rebalance(self, now):
         self.rebalance_calls += 1
-        return DirectionalActionResult("hold")
+        return self.next_result
 
     def flatten(self, now):
         self.flatten_calls += 1
@@ -41,6 +57,18 @@ class _Manager:
 
     def close(self):
         self.closed = True
+
+    def directional_order_expectation(self, order_id):
+        return self.quality_expectations.get(order_id)
+
+    def note_directional_quality_order(self, order):
+        self.quality_orders.append(order)
+
+    def note_directional_quality_fill(self, trade, **kwargs):
+        self.quality_fills.append((trade, kwargs))
+
+    def _finalize_quality_cycle_if_settled(self, now):
+        self.quality_finalize_calls += 1
 
 
 class _Broker:
@@ -83,6 +111,9 @@ class _Broker:
     def health_error(self):
         return None
 
+    def owns_order(self, order_id):
+        return True
+
 
 def _tick():
     return Tick(
@@ -102,19 +133,24 @@ def _tick():
     )
 
 
-def test_directional_engine_forwards_ticks_and_runs_manager(tmp_path):
+def _engine(tmp_path, manager=None, risk=None):
     broker = _Broker()
-    manager = _Manager()
+    manager = manager or _Manager()
     engine = DirectionalTradingEngine(
         broker,
         [],
         {},
-        RiskManager(RiskConfig()),
+        risk or RiskManager(RiskConfig()),
         StateStore(tmp_path / "state.json"),
         directional_manager=manager,
         health_clock=lambda: NOW,
     )
     engine.start()
+    return broker, manager, engine
+
+
+def test_directional_engine_forwards_ticks_and_runs_manager(tmp_path):
+    broker, manager, engine = _engine(tmp_path)
     assert manager.bootstrap_calls == 1
 
     tick = _tick()
@@ -127,19 +163,48 @@ def test_directional_engine_forwards_ticks_and_runs_manager(tmp_path):
     assert manager.closed is True
 
 
-def test_directional_reduce_only_flattens_before_halting(tmp_path):
-    broker = _Broker()
-    manager = _Manager()
-    engine = DirectionalTradingEngine(
-        broker,
-        [],
-        {},
-        RiskManager(RiskConfig()),
-        StateStore(tmp_path / "state.json"),
-        directional_manager=manager,
-        health_clock=lambda: NOW,
+def test_directional_signal_risk_off_enters_reduce_only_only_when_risk_exists(tmp_path):
+    _, manager, engine = _engine(tmp_path)
+    manager.risk = True
+    manager.next_result = DirectionalActionResult(
+        "risk_off", "required signal trading day unavailable"
     )
-    engine.start()
+    engine.run_once()
+    assert engine.state.runtime_mode == RuntimeMode.REDUCE_ONLY.value
+    assert engine.halted is False
+
+    _, flat_manager, flat_engine = _engine(tmp_path / "flat")
+    flat_manager.risk = False
+    flat_manager.next_result = DirectionalActionResult(
+        "risk_off", "required signal trading day unavailable"
+    )
+    flat_engine.run_once()
+    assert flat_engine.state.runtime_mode == RuntimeMode.RUNNING.value
+    assert flat_engine.halted is False
+
+
+def test_directional_account_risk_breach_reduces_existing_risk_instead_of_halting(tmp_path):
+    risk = RiskManager(
+        RiskConfig(max_daily_loss_ratio=0.05, max_total_drawdown_ratio=0.30)
+    )
+    broker, manager, engine = _engine(tmp_path, risk=risk)
+    manager.risk = True
+    broker.account = AccountSnapshot(
+        balance=90000,
+        equity=90000,
+        available=90000,
+        margin=0,
+        realized_pnl=-10000,
+        unrealized_pnl=0,
+        trading_day="20260825",
+    )
+    engine.on_tick(_tick())
+    assert engine.state.runtime_mode == RuntimeMode.REDUCE_ONLY.value
+    assert engine.halted is False
+
+
+def test_directional_reduce_only_flattens_before_halting(tmp_path):
+    broker, manager, engine = _engine(tmp_path)
     manager.risk = True
     engine.enter_reduce_only("directional test")
     assert engine.state.runtime_mode == RuntimeMode.REDUCE_ONLY.value
@@ -153,3 +218,58 @@ def test_directional_reduce_only_flattens_before_halting(tmp_path):
     assert engine.halted is True
     assert engine.state.runtime_mode == RuntimeMode.HALTED.value
     engine.stop()
+
+
+def test_directional_engine_records_broker_order_and_trade_callbacks_after_position_truth(tmp_path):
+    _, manager, engine = _engine(tmp_path)
+    request = OrderRequest(
+        symbol="A2609",
+        exchange="DCE",
+        side=OrderSide.BUY,
+        offset=Offset.OPEN,
+        volume=1,
+        price=100.0,
+        order_type=OrderType.FAK,
+        reference="directional:A",
+    )
+    manager.quality_expectations["o-1"] = {
+        "expected_price": 100.0,
+        "multiplier": 10.0,
+    }
+    order = Order(
+        "o-1",
+        request,
+        status=OrderStatus.FILLED,
+        traded=1,
+        average_price=100.2,
+    )
+    engine._handle_order_event(order)
+    assert manager.quality_orders == [order]
+    # Terminal order status must not finalize the cycle before its Trade callback.
+    assert manager.quality_finalize_calls == 0
+
+    trade = Trade(
+        "t-1",
+        "o-1",
+        "A2609",
+        "DCE",
+        OrderSide.BUY,
+        Offset.OPEN,
+        1,
+        100.2,
+        NOW,
+        commission=1.5,
+    )
+    engine._handle_trade_event(trade)
+
+    # Base TradingEngine remains the only expected-position owner.
+    positions = engine.state_store.positions_from_state(engine.state)
+    assert len(positions) == 1
+    assert positions[0].symbol == "A2609"
+    assert positions[0].long_total == 1
+    assert manager.quality_fills
+    recorded_trade, kwargs = manager.quality_fills[-1]
+    assert recorded_trade == trade
+    assert kwargs["commission"] == 1.5
+    assert kwargs["commission_source"] == "broker_trade"
+    assert manager.quality_finalize_calls == 1

@@ -1,8 +1,8 @@
 name: research-return-target-specific
 
-# Expensive 50-product concrete-contract L4 milestone gate. Official 2026-08-22
-# execution-aware evidence has completed; rerun manually only for a material change to
-# the frozen strategy, execution timing, contract selection, costs, or data methodology.
+# Expensive 50-product concrete-contract L4 milestone gate. Re-run manually only after a
+# material change to the frozen policy, execution timing, contract selection, costs or
+# production-mechanics methodology. One fetch feeds every L4 evaluator below.
 on:
   workflow_dispatch:
 
@@ -25,14 +25,16 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install akshare pandas numpy
       - name: Verify execution timing and roll-safe causality
-        run: python tools/test_return_target_specific.py
+        run: |
+          python tools/test_return_target_specific.py
+          python tools/test_directional_production_mechanics.py
       - name: Rebuild baseline L3 directional evidence
         run: |
           python tools/fetch_broad_daily_universe.py
           python tools/evaluate_aggressive_directional.py
-      - name: Fetch all concrete contracts needed for L4
+      - name: Fetch all concrete contracts needed for every L4 evaluator
         run: python tools/fetch_return_target_specific_daily.py
-      - name: Validate next-open execution on roll-safe concrete contracts
+      - name: Validate original execution-aware concrete-contract baseline
         run: |
           python tools/evaluate_return_target_specific.py
           python - <<'PY'
@@ -45,13 +47,36 @@ jobs:
           assert report["selection_frozen"] is True
           assert report["execution_selection"]["pool_size"] == 32
           assert report["execution_selection"]["effective_gross_leverage"] <= 2.0
-          print(json.dumps({
-              "execution_selection": report["execution_selection"],
-              "data_quality": report["data_quality"],
-              "close_to_close_diagnostic": report["close_to_close_diagnostic"],
-              "next_open_execution": report["next_open_execution"],
-              "target": report["target"],
-          }, ensure_ascii=False, indent=2))
+          PY
+      - name: Validate frozen 96-template execution-aligned L4
+        run: |
+          python tools/evaluate_execution_aligned_target.py
+          python - <<'PY'
+          import json
+          report = json.load(open("runtime/execution_aligned_target_report.json", encoding="utf-8"))
+          assert report["specific_contracts"] is True
+          assert report["roll_safe"] is True
+          assert report["selection_frozen"] is True
+          assert report["pristine_final_oos"] is False
+          assert report["max_gross_leverage"] <= 2.0
+          assert report["execution_selection"]["pool_size"] == 96
+          assert report["target"]["target_met"] is True
+          PY
+      - name: Validate integer/account production-mechanics proxy on the same data
+        run: |
+          python tools/evaluate_directional_production_mechanics.py
+          python - <<'PY'
+          import json
+          report = json.load(open("runtime/directional_production_mechanics_report.json", encoding="utf-8"))
+          assert report["selection_frozen"] is True
+          assert report["parameter_search"] is False
+          assert report["margin_is_historical_truth"] is False
+          assert report["mechanics"]["integer_lots"] is True
+          assert report["mechanics"]["previous_completed_activity"] is True
+          assert report["mechanics"]["reduction_before_open"] is True
+          assert report["base"]["margin_rate_proxy"] == 0.12
+          assert report["stress"]["margin_rate_proxy"] == 0.15
+          assert set(report["production_gap"]) == {"base", "stress"}
           PY
       - uses: actions/upload-artifact@v4
         if: always()
@@ -67,4 +92,10 @@ jobs:
             runtime/return_target_specific_selection.csv
             runtime/return_target_execution_weights.csv
             runtime/return_target_specific_report.json
+            runtime/execution_aligned_target_report.json
+            runtime/execution_aligned_weights.csv
+            runtime/execution_aligned_specific_selection.csv
+            runtime/directional_production_mechanics_report.json
+            runtime/directional_production_base_daily.csv
+            runtime/directional_production_stress_daily.csv
           retention-days: 14

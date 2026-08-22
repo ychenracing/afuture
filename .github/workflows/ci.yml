@@ -17,18 +17,42 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[dev]"
-      - run: python -m pytest -q
+
+      - name: Full repository tests
+        run: python -m pytest -q
       - run: python -m compileall -q afuture
+
       - run: afuture validate --config config/afuture.example.toml
-      - name: 验证两年证据生产配置
+      - name: Validate calendar live example
         env:
           AFUTURE_CTP_USER: test-user
           AFUTURE_CTP_PASSWORD: test-password
           AFUTURE_CTP_BROKER: test-broker
         run: afuture validate --config config/afuture.live.example.toml
+      - name: Validate directional live example
+        env:
+          AFUTURE_CTP_USER: test-user
+          AFUTURE_CTP_PASSWORD: test-password
+          AFUTURE_CTP_BROKER: test-broker
+        run: afuture validate --config config/afuture.directional-live.example.toml
+
+      - name: Directional production smoke
+        run: >-
+          python -m pytest -q
+          tests/test_directional_activity.py
+          tests/test_execution_aligned_runtime.py
+          tests/test_directional_manager.py
+          tests/test_directional_engine.py
+          tests/test_directional_quality.py
+          tests/test_directional_restart.py
+          tests/test_directional_surface.py
+          tests/test_directional_acceptance.py
+          tests/test_directional_acceptance_simulation.py
+          tests/test_directional_review_regressions.py
+          tests/test_directional_trading_day_selection.py
 
       - run: afuture replay --config config/afuture.example.toml --data examples/sample_ticks.csv
-      - name: 验证样例回放闭环
+      - name: Verify fixed-pair replay closure
         run: |
           python - <<'PY'
           import json
@@ -40,7 +64,7 @@ jobs:
 
       - run: afuture validate --config config/afuture.auto-replay.example.toml
       - run: afuture replay --config config/afuture.auto-replay.example.toml --data examples/auto_sample_ticks.csv
-      - name: 验证自动发现回放闭环
+      - name: Verify Auto replay closure
         run: |
           python - <<'PY'
           import json
@@ -62,14 +86,14 @@ jobs:
           --step-days 2
           --stress-multipliers 1.0,1.5,2.0
 
-      - name: 验证 Auto 研究数据质量
+      - name: Verify Auto research data quality
         run: >-
           afuture data-check
           --config config/afuture.auto-replay.example.toml
           --data examples/research_ticks.csv
           --output runtime/data_quality.json
 
-      - name: 执行最终 Auto Portfolio Walk-forward/OOS/Stress
+      - name: Run final Auto Portfolio walk-forward/OOS/stress entrypoint
         shell: bash
         run: |
           set +e
@@ -84,7 +108,6 @@ jobs:
             --output runtime/auto_acceptance.json
           code=$?
           set -e
-          # 示例数据只验证研究器本身；0=晋级，2=被预注册经济门拒绝，两者都不是工程失败。
           if [ "$code" -ne 0 ] && [ "$code" -ne 2 ]; then
             exit "$code"
           fi
@@ -108,7 +131,7 @@ jobs:
           assert "aggregate_oos_return" in report["gate_metrics"]
           PY
 
-      - name: 验证执行质量报告入口
+      - name: Verify execution quality report entrypoint
         run: |
           afuture quality-report \
             --config config/afuture.auto-replay.example.toml \
@@ -118,6 +141,19 @@ jobs:
           report = json.load(open("runtime/execution_quality_report.json", encoding="utf-8"))
           assert "round_trips" in report
           assert "p95_slippage" in report
+          assert "directional" in report
+          for key in (
+              "rebalance_events",
+              "fill_count",
+              "cycles",
+              "turnover_notional",
+              "commission_total",
+              "median_slippage_bps",
+              "p95_slippage_bps",
+              "median_tracking_error",
+          ):
+              assert key in report["directional"]
           PY
 
+      - run: python tools/test_directional_production_mechanics.py
       - run: python -m afuture --help

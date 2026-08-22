@@ -1,6 +1,8 @@
 """Construct the single runtime engine selected by the validated account strategy mode."""
 from __future__ import annotations
 
+from pathlib import Path
+
 from .engine import TradingEngine
 from .risk import RiskManager
 
@@ -40,6 +42,7 @@ def build_runtime_engine(
             ExecutionAlignedDirectionalPortfolioManager,
         )
 
+        activity_path = Path(state_store.path).with_name("directional_activity.json")
         manager = ExecutionAlignedDirectionalPortfolioManager(
             config.directional,
             broker,
@@ -47,6 +50,8 @@ def build_runtime_engine(
             aggressive_ticks=config.aggressive_ticks,
             metadata_timeout_seconds=config.metadata_timeout_seconds,
             static_specs=config.contracts,
+            activity_store_path=activity_path,
+            quality_recorder=quality_recorder,
         )
         return DirectionalTradingEngine(
             broker,

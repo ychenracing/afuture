@@ -1,7 +1,5 @@
 from datetime import datetime, timezone
 
-import numpy as np
-import pandas as pd
 import pytest
 
 from afuture.models import (
@@ -14,7 +12,6 @@ from afuture.models import (
 from afuture.directional import (
     DirectionalConfig,
     DirectionalContractSelector,
-    FrozenAggressivePolicy,
     build_target_lots,
     build_rebalance_plan,
 )
@@ -39,7 +36,9 @@ def _tick(symbol: str, oi: float, *, price: float = 100.0, volume: float = 10000
 
 
 def test_directional_config_caps_gross_and_is_account_exclusive():
-    config = DirectionalConfig(enabled=True, products=("A", "M"), max_gross_leverage=2.0)
+    config = DirectionalConfig(
+        enabled=True, products=("A", "M"), max_gross_leverage=2.0
+    )
     config.validate()
     assert config.account_exclusive is True
     with pytest.raises(ValueError, match="gross leverage"):
@@ -48,27 +47,6 @@ def test_directional_config_caps_gross_and_is_account_exclusive():
             products=("A",),
             max_gross_leverage=2.01,
         ).validate()
-
-
-def test_frozen_policy_is_causal_and_never_exceeds_two_x_gross():
-    dates = pd.date_range("2025-01-01", periods=180, freq="B")
-    close = pd.DataFrame(
-        {
-            "A": 100 * np.cumprod([1.002 if i % 5 else 0.995 for i in range(180)]),
-            "M": 100 * np.cumprod([0.998 if i % 7 else 1.004 for i in range(180)]),
-            "RB": 100 * np.cumprod([1.0015 if i % 3 else 0.997 for i in range(180)]),
-            "CU": 100 * np.cumprod([0.999 if i % 4 else 1.003 for i in range(180)]),
-        },
-        index=dates,
-    )
-    policy = FrozenAggressivePolicy(products=tuple(close.columns))
-    weights = policy.weight_history(close)
-    assert float(weights.abs().sum(axis=1).max()) <= 2.0 + 1e-12
-
-    changed = close.copy()
-    changed.iloc[-1] *= [10.0, 0.1, 8.0, 0.2]
-    changed_weights = policy.weight_history(changed)
-    pd.testing.assert_series_equal(weights.iloc[-1], changed_weights.iloc[-1])
 
 
 def test_contract_selector_uses_point_in_time_oi_and_delivery_blackout():

@@ -1,31 +1,141 @@
-"""Frozen specific-ranked directional portfolio policy.
+"""Frozen 96-template execution-aligned directional portfolio policy.
 
-The template pool was selected on the already-observed 2024-08-21..2026-08-20
-specific-contract next-open history. Daily live rotation remains causal: each template
-signal uses the previous close and the meta allocator ranks templates only from completed
-continuous-contract open->close returns. Product ordering is frozen alphabetically so
-stable ranking ties cannot change the strategy. Gross notional is capped at 2x.
+This is the only production directional signal policy. The template pool was selected on
+the already-observed 2024-08-21..2026-08-20 specific-contract next-open history. Daily
+live rotation remains causal: template signals use the previous close and the meta
+allocator ranks templates only from completed continuous-contract open->close returns.
+Product ordering is frozen alphabetically. Gross target notional is capped at 2x.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 import numpy as np
 import pandas as pd
 
-from .directional import (
-    MAX_ABS_DAILY_RETURN,
-    MAX_GROSS_LEVERAGE,
-    _parse_template_id,
-    _template_weight_path,
-    _trailing_scores,
-)
-
+MAX_GROSS_LEVERAGE = 2.0
+MAX_ABS_DAILY_RETURN = 0.20
 BASE_COST_BPS = 5.0
 META_LOOKBACK = 10
 META_REBALANCE = 5
 META_COUNT = 3
 META_SCORE_SOURCE = "continuous_intraday_proxy"
+
+
+@dataclass(frozen=True)
+class _Template:
+    family: str
+    slow: int
+    fast: int
+    max_products: int
+    rebalance: int
+    gross_leverage: float = MAX_GROSS_LEVERAGE
+
+
+def _parse_template_id(raw: str) -> _Template:
+    match = re.fullmatch(r"(.+)_s(\d+)_f(\d+)_k(\d+)_r(\d+)_g([0-9.]+)", raw)
+    if match is None:
+        raise ValueError(f"invalid frozen directional template: {raw}")
+    family, slow, fast, max_products, rebalance, gross = match.groups()
+    value = float(gross)
+    if value > MAX_GROSS_LEVERAGE:
+        raise ValueError(f"frozen template exceeds gross cap: {raw}")
+    return _Template(
+        family,
+        int(slow),
+        int(fast),
+        int(max_products),
+        int(rebalance),
+        value,
+    )
+
+
+def _rolling_log_return(returns: pd.DataFrame, window: int) -> pd.DataFrame:
+    return np.log1p(returns.clip(lower=-0.99)).rolling(
+        window, min_periods=window
+    ).sum()
+
+
+def _normalized_price(returns: pd.DataFrame) -> pd.DataFrame:
+    return (1.0 + returns.fillna(0.0)).cumprod()
+
+
+def _signal_scores(returns: pd.DataFrame, template: _Template) -> pd.DataFrame:
+    vol20 = returns.rolling(20, min_periods=20).std().replace(0.0, np.nan)
+    if template.family == "tsmom":
+        momentum = _rolling_log_return(returns, template.slow)
+        return momentum / (vol20 * np.sqrt(max(template.slow, 1)))
+    if template.family == "momentum":
+        return _rolling_log_return(returns, template.slow)
+    if template.family == "reversal":
+        momentum = _rolling_log_return(returns, template.fast)
+        return -momentum / (vol20 * np.sqrt(max(template.fast, 1)))
+    if template.family == "moving_average":
+        price = _normalized_price(returns)
+        average = price.rolling(template.slow, min_periods=template.slow).mean()
+        deviation = price / average - 1.0
+        return deviation / (vol20 * np.sqrt(max(template.slow, 1)))
+    if template.family == "breakout":
+        price = _normalized_price(returns)
+        rolling_low = price.rolling(template.slow, min_periods=template.slow).min()
+        rolling_high = price.rolling(template.slow, min_periods=template.slow).max()
+        return (
+            (price - rolling_low)
+            / (rolling_high - rolling_low).replace(0.0, np.nan)
+            - 0.5
+        )
+    if template.family == "acceleration":
+        slow = _rolling_log_return(returns, template.slow)
+        fast = _rolling_log_return(returns, template.fast)
+        return (slow - fast) / (vol20 * np.sqrt(max(template.slow, 1)))
+    raise ValueError(f"unknown frozen directional family: {template.family}")
+
+
+def _template_weight_path(
+    returns: pd.DataFrame, template: _Template
+) -> pd.DataFrame:
+    scores = _signal_scores(returns, template).to_numpy(float)
+    current = np.zeros(returns.shape[1], dtype=float)
+    audit = np.zeros(returns.shape, dtype=float)
+    step = max(template.rebalance, 1)
+    for position in range(1, len(returns)):
+        if position % step == 0:
+            lagged = scores[position - 1]
+            valid = np.flatnonzero(
+                np.isfinite(lagged) & (np.abs(lagged) > 1e-12)
+            )
+            next_weights = np.zeros(returns.shape[1], dtype=float)
+            if valid.size:
+                order = valid[np.argsort(-np.abs(lagged[valid]), kind="stable")]
+                selected = order[: min(template.max_products, len(order))]
+                if selected.size:
+                    each = min(
+                        template.gross_leverage, MAX_GROSS_LEVERAGE
+                    ) / float(selected.size)
+                    next_weights[selected] = np.sign(lagged[selected]) * each
+            current = next_weights
+        audit[position] = current
+    return pd.DataFrame(audit, index=returns.index, columns=returns.columns)
+
+
+def _trailing_scores(frame: pd.DataFrame, lookback: int = 10) -> np.ndarray:
+    values = frame.fillna(0.0).to_numpy(float)
+    score = np.full_like(values, np.nan, dtype=float)
+    for index in range(lookback, len(frame)):
+        history = values[index - lookback : index]
+        log_total = np.log1p(np.clip(history, -0.999999, None)).sum(axis=0)
+        annualized = np.exp(log_total * (252.0 / lookback)) - 1.0
+        mean = history.mean(axis=0)
+        std = history.std(axis=0, ddof=1)
+        sharpe = np.zeros(history.shape[1], dtype=float)
+        valid = std > 1e-12
+        sharpe[valid] = mean[valid] / std[valid] * np.sqrt(252.0)
+        row = 4.0 * annualized + 0.5 * sharpe
+        row[annualized <= 0.0] = np.nan
+        score[index] = row
+    return score
+
 
 _EXECUTION_TEMPLATE_IDS = (
     "breakout_s120_f0_k1_r1_g2",
@@ -125,7 +235,9 @@ _EXECUTION_TEMPLATE_IDS = (
     "breakout_s40_f0_k1_r5_g2",
     "reversal_s0_f5_k3_r10_g2",
 )
-_EXECUTION_TEMPLATES = tuple(_parse_template_id(item) for item in _EXECUTION_TEMPLATE_IDS)
+_EXECUTION_TEMPLATES = tuple(
+    _parse_template_id(item) for item in _EXECUTION_TEMPLATE_IDS
+)
 
 
 def _clean_prices(frame: pd.DataFrame, products: tuple[str, ...]) -> pd.DataFrame:
@@ -193,9 +305,7 @@ class ExecutionAlignedAggressivePolicy:
             weights = _template_weight_path(returns, template)
             paths[template_id] = weights
             streams[template_id] = _intraday_proxy_stream(
-                open_prices,
-                close,
-                weights,
+                open_prices, close, weights
             )
 
         stream_frame = pd.DataFrame(streams).sort_index().fillna(0.0)

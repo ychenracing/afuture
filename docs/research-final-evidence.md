@@ -1,186 +1,132 @@
 # afuture 研究证据总览
 
-本文件保留 2026-08-21~2026-08-22 的研究脉络，并说明后续收益目标计划如何改变全局结论。旧的套利专项结果没有被删除或改写；新的 directional 结果是另一条账户互斥策略链。
+本文件保留 2026-08-21~2026-08-22 的主要研究结论。旧套利专项没有被删除或改写；Execution-Aligned Directional 是另一条账户互斥策略链。
 
 ## 1. 全局结论
 
-研究分成两个阶段：
+研究最终形成三个必须同时成立的事实：
 
-1. **套利优先阶段**：corrected M/OI、经济 pair、BU/FU/PP/V、intraday、结构套利等均没有接近 100% 年化；
-2. **收益优先阶段**：在用户允许有限历史过拟合、但 gross leverage 不超过 2x 的前提下，引入多品种 directional 组合，并在 specific-contract / next-open 历史口径上达到最近两年 **107.46% 年化 / 27.41% 最大回撤**。
+1. corrected M/OI、经济 pair、BU/FU、intraday、结构套利等市场中性路线没有接近 100% 年化；
+2. 50 品种 directional 在明确允许历史选择偏差、gross≤2x 的 specific-contract / next-open float-notional 口径达到 **107.4623% 年化 / 27.4097% 最大回撤**；
+3. 相同冻结权重经过当前生产账户机械和风险门后，最近两年 production proxy Base 只有 **6.7861% 年化**，并于 **2024-09-19** 触发 5% daily-loss gate 后停机。
 
-因此：
+因此“研究历史达到 100%”是事实，但“当前生产账户语义已经达到 100%”不是事实。Final OOS 已被观察且为负，也没有独立泛化证明。
 
-- “旧套利 Alpha 没有达到 100%”仍然正确；
-- “afuture 全项目从未达到 100%”已经被后续研究取代；
-- 最终高收益结果具有明确选择偏差，Final OOS 已观察且为负，不能写成独立泛化证明。
+最新正式证据：
 
-最新收益证据以 [`return-target-100-evidence.md`](return-target-100-evidence.md) 为准。
+- [`return-target-100-evidence.md`](return-target-100-evidence.md)
+- [`directional-production-mechanics-evidence.md`](directional-production-mechanics-evidence.md)
 
-## 2. corrected M/OI 同品种跨期
+## 2. corrected M/OI calendar
 
-修正中国期货交易日、同步采样、front-3 Universe、交割黑窗、历史 listing 和当时可见成交量后：
-
-- prior-forward：4 笔，约 -1.958R；
-- Final OOS：2 笔，约 +0.296R；
-- 最近两年：5 笔，约 +1.028R；
-- 16 个局部邻域：0 个通过；
-- 2% 单笔风险资本代理年化约 1.07%。
-
-因此旧“M/OI 已验证生产高收益 Alpha”结论作废。该结果与 directional 策略无关。
-
-## 3. 参考策略思想的套利研究
-
-研究吸收了三类思想：
-
-- 商品期限结构、basis / momentum / reversal；
-- 经济关系过滤、滚动残差、持久性、半衰期、volatility regime；
-- slow momentum / fast reversion。
-
-没有复制第三方交易代码，也没有为历史数字引入重型不可解释框架。
-
-### 3.1 Broad cross-sectional / market-neutral
-
-约 50 个中国商品期货主连上的 momentum / slow-fast / reversal / skewness 等市场中性配置，没有形成足够稳定且高收益的家族。
-
-### 3.2 Economic pair L3
-
-固定经济关系后，滚动 beta、残差 Z-score、相关门、OU 半衰期与波动 regime 出现过一簇正结果，但收益仍远低于 100%。
-
-### 3.3 Specific-contract pair L4
-
-六条重点关系：P/Y、PP/V、AL/ZN、BU/FU、CU/AL、J/JM。
-
-在真实具体合约、20 天交割黑窗、同合约 t→t+1、30bp 单边压力成本、最多 1 个 pair、gross≤2x 下，最终主要收敛到 BU/FU：
+修正中国期货 trading day、同步采样、front-3、20 天黑窗、historical listing 和 point-in-time volume 后：
 
 ```text
-recent annualized       ≈ 4.20%
-recent max drawdown     ≈ 12.88%
-final OOS annualized    ≈ 5.78%
-final OOS max drawdown  ≈ 11.78%
-alpha_survives_specific_contract = true
-target_met = false
+prior-forward             4 trades, -1.958R
+final OOS                  2 trades, +0.296R
+recent two years           5 trades, +1.028R
+neighbor stability         0 / 16
+2% risk proxy annualized   ≈ 1.07%
 ```
 
-它证明 BU/FU 研究信号不是单纯换月拼接假象，但没有成为新的 directional 高收益策略来源。
+旧同品种策略没有通过高收益经济门。
 
-### 3.4 Intraday 与结构套利
+## 3. 其它套利研究
 
-- BU/FU + PP/V 60 分钟 intraday：24 个预注册 profile，0 个通过 pre-OOS；
-- soybean crush、steel/coke margin、polymer/base-metals 等多腿结构：没有形成收益/稳定性足够的家族；
-- 失败实验不进入长期生产维护面。
+研究过 cross-sectional / market-neutral momentum、reversal、skewness；rolling residual / beta / OU half-life / regime；P/Y、PP/V、AL/ZN、BU/FU、CU/AL、J/JM 等经济关系；60 分钟 intraday；soybean crush、steel/coke、polymer/base-metals 等结构关系。
 
-## 4. 收益优先 directional 阶段
+BU/FU specific-contract 信号证明并非单纯 continuous roll 假象，但收益仍远低于目标；失败 intraday/structural 实验不进入生产维护面。
 
-纯套利收益与 100% 目标相差一个数量级后，研究空间扩展到 directionally exposed commodity portfolio，同时保留：
+## 4. Directional 收益优先阶段
 
-- 因果信号；
-- 具体合约换月；
-- explicit cost；
-- gross leverage ≤2x；
-- 账户/订单/成交状态机不绕过。
+研究 family：breakout、time-series momentum、momentum、moving average、reversal、acceleration / slow-fast。
 
-研究 family 包括：
+连续合约 L3 首先发现高收益候选，但初版 specific-contract next-open 明显衰减，暴露理论目标与实际执行错位。最终策略把模板筛选/meta evidence 对齐到 execution-aware 历史，并明确承认 selection bias。
 
-- breakout；
-- time-series momentum；
-- momentum；
-- moving-average trend；
-- reversal；
-- acceleration / slow-fast。
-
-连续合约 L3 首先发现可达 100% 的高收益组合，但 specific-contract next-open 初版下降明显，说明理论 PnL 与真实执行目标错位。随后把模板筛选和 meta score 对齐到 execution-aware 历史口径，并明确承认选择偏差。
-
-## 5. 最终 execution-aligned L4
+## 5. Final float-notional L4
 
 固定原始数据：
 
-- 50 品种；
-- 3,000 候选合约请求；
-- 2,540 可用具体合约；
-- 约 495,086 行日线；
-- point-in-time OI/volume；
-- 20 天交割黑窗；
-- final products `missing_next_contract_returns=0`。
+```text
+products                  = 50
+candidate contract calls  = 3000
+usable concrete contracts = 2540
+specific daily rows       ≈ 495086
+missing next returns      = 0 on final products
+```
 
-冻结策略：
+冻结策略：96-template pool、meta lookback=10、meta rebalance=5、meta count=3、completed continuous intraday proxy causal ranking、point-in-time concrete-contract selection、20 天黑窗、gross≤2x。
 
-- 96-template pool；
-- meta lookback=10；
-- meta rebalance=5；
-- meta count=3；
-- continuous intraday proxy 只用于已完成历史的 meta ranking；
-- gross≤2x。
-
-2024-08-21~2026-08-20：
+`2024-08-21 ~ 2026-08-20` 官方 final artifact：
 
 | 指标 | Base 5bp | Stress 15bp |
 |---|---:|---:|
-| 年化收益 | **107.46%** | **58.14%** |
-| 累计收益 | **317.54%** | **142.94%** |
-| 最大回撤 | **27.41%** | **32.96%** |
-| Sharpe | **1.69** | **1.22** |
+| 年化收益 | **107.4623%** | **58.1372%** |
+| 累计收益 | **306.1855%** | **141.1415%** |
+| 最大回撤 | **27.4097%** | **32.9554%** |
+| Sharpe | **1.6874** | **1.1525** |
 
-30bp extreme 最近两年约 9.96% 年化。
+Extreme 30bp：年化约 **5.09%**、最大回撤约 **43.51%**。
 
-该阶段正式满足用户要求的“历史年化 100%”目标，但只能在下面的选择偏差限定下成立。
+Final OOS `2026-02-21 ~ 2026-08-20`：Base 年化约 `-10.73%`、Base 最大回撤约 `27.41%`、Stress 年化约 `-31.42%`，因此 `pristine_final_oos=false`。
 
-## 6. 选择偏差与反证
+## 6. 生产真实性收口
 
-用户明确允许有限过拟合，因此模板池使用已经观察过的最近两年 specific-contract 执行历史做收益优先选择。
+后续没有继续扩大 Alpha/template/leverage，而是收口 research/live 差异：
 
-必须同时记录：
+- D 日 completed activity 决定 D+1 concrete contract；
+- required signal trading day = completed activity day；
+- provider cache 只有覆盖 required day 才能容错；
+- stale persisted activity 不能掩盖更新的完整 signal day；
+- stale/missing required signal + existing risk → `REDUCE_ONLY`；
+- missing new target 不阻塞其它 reductions；
+- Broker 仍是唯一 order/fill/position truth；
+- restart mismatch fail-closed；
+- directional rebalance/fill/cycle execution quality；
+- production-mechanics 加入 multiplier、integer lots、contract cap、margin/cash、daily-loss/high-watermark。
 
-```text
-selection_bias_acknowledged = true
-pristine_final_oos          = false
-```
+最终生产 signal policy 只有 `ExecutionAlignedAggressivePolicy`；旧 32-template 中间 policy 已移除。
 
-已观察 Final OOS（2026-02-21~2026-08-20）：
+## 7. Production-mechanics 结果
 
-- base 年化约 -10.73%；
-- base 最大回撤约 24.98%；
-- stress 年化约 -31.42%。
+固定 artifact + 当前 mechanics、无重新拟合/抓取的最近两年结果：
 
-所以该策略具有强烈行情依赖/选择偏差风险。107.46% 不是未来收益承诺。
+| 指标 | Base | Stress |
+|---|---:|---:|
+| 年化 | **6.7861%** | **3.4290%** |
+| 累计 | **13.4401%** | **6.6897%** |
+| 最大回撤 | **5.5680%** | **5.3020%** |
+| active days | **20 / 484** | **17 / 484** |
+| margin reject days | 0 | **14** |
+| fatal gate | daily loss | margin ratio |
+| halt date | **2024-09-19** | **2024-09-19** |
 
-## 7. 生产晋级状态
+Base 12% margin proxy、Stress 15%，都乘 1.25 buffer；当前生产硬门保持 daily loss 5%、total DD 30%、max margin 35%、min available 25%。
 
-与旧研究不同，execution-aligned directional 已经完成**代码级生产接线**：
+这证明当前主要 production gap 来自账户风险权限会很早终止风险路径，而不是只来自整数手数或手续费。
 
-- 与 Calendar/Auto 账户互斥；
-- 冻结 50 品种 Universe 和生产 policy；
-- CTP 当前合约自动选择；
-- 整数手数目标；
-- 先减旧风险，再开新风险；
-- fresh quote / depth / spread / limit-distance；
-- 账户/保证金/现金/单合约上限；
-- FAK；
-- Broker 持仓真相；
-- `REDUCE_ONLY` / Kill Switch / startup reconciliation。
+较小的 proxy 最大回撤不能解释成“策略变稳”，因为 proxy 在 2024-09-19 之后基本不再持有风险。
 
-但“代码级 production path”不等于“真实资金已批准”。还需要 Shadow、测试柜台、极小真实仓位和未来数据。
+## 8. 为什么不继续历史调参
 
-## 8. 历史 L4 的剩余模型差异
+当前最差的做法是为了恢复 production proxy 100% 去：
 
-即使 specific-contract / next-open 已通过，仍没有：
+- 扩大模板池；
+- 提高 gross >2x；
+- 静默放宽 5% daily loss / 30% DD；
+- 静默放宽 margin/cash gate。
 
-- 多年完整 L1 bid/ask/depth；
-- queue/partial fill/reject；
-- 真实 CTP 流控；
-- 逐日真实结算费率；
-- 针对某一个账户的 multiplier + integer lot + margin 完整资金曲线。
+这些都会把“生产真实性检查”重新变成“对同一历史追数字”。因此本轮明确停止这种方向。
 
-因此真实收益可能显著低于历史目标值。
+## 9. 当前最重要的新证据
 
-## 9. 后续研究治理
+后续高信息价值证据依次是：
 
-接下来高信息量证据优先级：
+1. 新发生未来数据；
+2. 多日 CTP Shadow；
+3. realized turnover/slippage/commission/tracking；
+4. 真实 Broker margin/risk-off 行为；
+5. 测试柜台真实订单生命周期；
+6. 极小真实仓位。
 
-1. 新发生未来交易日；
-2. 多交易日 CTP Shadow；
-3. 测试柜台真实订单；
-4. 极小资金 realized execution；
-5. 更可靠历史 L1 数据。
-
-没有新证据时，不继续用更高杠杆或无限参数空间追历史数字。
+未来如需调整生产风险参数，应基于这些新证据，而不是以必须恢复 107.4623% 为目标。
