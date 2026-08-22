@@ -24,13 +24,14 @@ eval_spec.loader.exec_module(evaluator)
 assert set(fetcher.PRODUCTS) == set(evaluator.REQUIRED_PRODUCTS)
 assert len(fetcher.PRODUCTS) == 50
 assert evaluator.MAX_GROSS_LEVERAGE == 2.0
-assert evaluator.EXECUTION_SELECTION["pool_size"] == 32
-assert evaluator.EXECUTION_SELECTION["meta_lookback"] == 10
-assert evaluator.EXECUTION_SELECTION["rebalance"] == 5
-assert evaluator.EXECUTION_SELECTION["count"] == 2
-assert len(evaluator.EXECUTION_SELECTION["pool_ids"]) == 32
+assert evaluator.EXECUTION_SELECTION["pool_size"] == 64
+assert evaluator.EXECUTION_SELECTION["meta_lookback"] == 5
+assert evaluator.EXECUTION_SELECTION["rebalance"] == 10
+assert evaluator.EXECUTION_SELECTION["count"] == 4
+assert len(evaluator.EXECUTION_SELECTION["pool_ids"]) == 64
+assert evaluator.EXECUTION_SELECTION["meta_score_source"] == "continuous_next_open_proxy"
 assert evaluator.EXECUTION_SELECTION["selection_bias"] == (
-    "full_recent_target_fit_plus_roll_safe_next_open_execution_fit"
+    "full_recent_target_fit_plus_specific_execution_pool_fit"
 )
 
 symbols = set(fetcher.contract_symbols())
@@ -115,11 +116,25 @@ assert abs(path.iloc[2] - (0.20 - 0.04)) < 1e-12
 costed = evaluator.apply_next_open_product_weights(
     gap, intraday, weights, cost_bps=10.0
 )
-# d1 target 0->1 costs 10bp; d2 +1->-1 costs 20bp.
 assert abs((path.iloc[1] - costed.iloc[1]) - 0.001) < 1e-12
 assert abs((path.iloc[2] - costed.iloc[2]) - 0.002) < 1e-12
 
-# Signal t-1 determines the current target; realized return t cannot change exposure t.
+# Continuous execution proxy is causal and uses open/close timing rather than same-day close.
+proxy_raw = pd.DataFrame(
+    [
+        {"date": idx[0], "product": "A", "open": 100.0, "close": 100.0},
+        {"date": idx[1], "product": "A", "open": 110.0, "close": 113.3},
+        {"date": idx[2], "product": "A", "open": 135.96, "close": 141.3984},
+    ]
+)
+proxy_gap, proxy_intraday = evaluator.build_continuous_execution_proxy(
+    proxy_raw, products=("A",)
+)
+assert abs(proxy_gap.loc[idx[1], "A"] - 0.10) < 1e-12
+assert abs(proxy_intraday.loc[idx[1], "A"] - 0.03) < 1e-12
+assert abs(proxy_gap.loc[idx[2], "A"] - 0.20) < 1e-12
+assert abs(proxy_intraday.loc[idx[2], "A"] - 0.04) < 1e-12
+
 assert hasattr(evaluator, "generate_execution_signal_weights")
 assert evaluator.PRISTINE_FINAL_OOS is False
 
