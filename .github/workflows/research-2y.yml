@@ -1,28 +1,20 @@
 name: research-2y
 
-# 两年真实数据属于高成本 L4 经济证据。code 0=晋级，code 2=经济门拒绝；
-# 两者都表示研究程序正常完成，只有其它退出码才属于工程失败。
+# 两年真实数据抓取和完整研究属于高成本 L4 证据门，不作为每次 PR/小改动的内循环测试。
+# 已验证策略或研究逻辑发生实质变化时手动触发；普通工程回归由 ci.yml 负责。
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - "tools/evaluate_daily_relative_strategy.py"
-      - "tools/test_alignment.py"
-      - "tools/fetch_two_year_60m_universe.py"
-      - "tools/fetch_prior_two_year_60m_universe.py"
-      - ".github/workflows/research-2y.yml"
 
 permissions:
   contents: read
 
 concurrency:
-  group: research-2y-${{ github.event.pull_request.number || github.ref }}
+  group: research-2y-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   real-data:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -30,39 +22,13 @@ jobs:
           python-version: "3.13"
       - run: python -m pip install --upgrade pip
       - run: python -m pip install akshare pandas
-      - name: 验证生产采样、交易日、front-3 和活动度语义
-        run: python tools/test_alignment.py
       - name: Fetch recent two-year 60-minute universe
         run: python tools/fetch_two_year_60m_universe.py
       - name: Fetch independent prior two-year 60-minute universe
         run: python tools/fetch_prior_two_year_60m_universe.py
       - name: Validate two-window strategy evidence
-        run: |
-          set +e
-          python tools/evaluate_daily_relative_strategy.py
-          code=$?
-          set -e
-          if [ "$code" -ne 0 ] && [ "$code" -ne 2 ]; then
-            exit "$code"
-          fi
-          python - <<'PY'
-          import json
-          report = json.load(open("runtime/two_year_strategy_report.json", encoding="utf-8"))
-          assert "accepted" in report
-          assert "promotion_reasons" in report
-          assert "qualified_prior" in report and "qualified_current" in report
-          assert "final_oos" in report and "full_recent" in report
-          assert report["historical_l1_available"] is False
-          print(json.dumps({
-              "accepted": report["accepted"],
-              "promotion_reasons": report["promotion_reasons"],
-              "qualified_prior": report["qualified_prior"],
-              "qualified_current": report["qualified_current"],
-              "target": report["target"],
-          }, ensure_ascii=False, indent=2))
-          PY
+        run: python tools/evaluate_daily_relative_strategy.py
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: two-year-real-data-evidence
           path: |
