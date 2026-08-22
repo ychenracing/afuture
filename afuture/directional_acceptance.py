@@ -136,7 +136,10 @@ class DirectionalProductionAcceptance:
                 reductions[symbol] = target - have
             elif abs(target) > abs(have):
                 openings[symbol] = target - have
-        return RebalancePlan(reductions=reductions, openings={} if reductions else openings)
+        return RebalancePlan(
+            reductions=reductions,
+            openings={} if reductions else openings,
+        )
 
     def check_opening_batch(
         self,
@@ -162,7 +165,10 @@ class DirectionalProductionAcceptance:
                 return False, f"missing opening price: {symbol}", estimated
             multiplier = PRODUCT_MULTIPLIERS[self._product(symbol)]
             estimated += (
-                price * multiplier * requested * self.config.margin_rate_proxy
+                price
+                * multiplier
+                * requested
+                * self.config.margin_rate_proxy
                 * self.config.margin_estimate_buffer
             )
         post_margin = float(current_margin) + estimated
@@ -192,16 +198,31 @@ class DirectionalProductionAcceptance:
     @staticmethod
     def _normalize_contracts(raw: pd.DataFrame) -> pd.DataFrame:
         frame = raw.copy()
-        frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
-        frame["delivery"] = pd.to_datetime(frame["delivery"], errors="coerce")
+        frame["date"] = pd.to_datetime(
+            frame["date"], errors="coerce"
+        ).dt.normalize()
+        frame["delivery"] = pd.to_datetime(
+            frame["delivery"], errors="coerce"
+        )
         frame["product"] = frame["product"].astype(str).str.upper()
         frame["symbol"] = frame["symbol"].astype(str).str.upper()
         for column in ("open", "close", "volume", "hold"):
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
         frame = frame.dropna(
-            subset=["date", "delivery", "product", "symbol", "open", "close", "volume", "hold"]
+            subset=[
+                "date",
+                "delivery",
+                "product",
+                "symbol",
+                "open",
+                "close",
+                "volume",
+                "hold",
+            ]
         )
-        return frame[(frame["open"] > 0) & (frame["close"] > 0)].copy()
+        return frame[
+            (frame["open"] > 0) & (frame["close"] > 0)
+        ].copy()
 
     def select_contracts_for_day(
         self, raw: pd.DataFrame, target_day: pd.Timestamp
@@ -214,7 +235,8 @@ class DirectionalProductionAcceptance:
         completed = pd.Timestamp(prior_dates.max()).normalize()
         snapshot = frame[frame["date"] == completed].copy()
         snapshot = snapshot[
-            (snapshot["delivery"] - day).dt.days >= self.config.min_days_to_delivery
+            (snapshot["delivery"] - day).dt.days
+            >= self.config.min_days_to_delivery
         ]
         snapshot = snapshot[
             (snapshot["volume"] >= self.config.min_volume)
@@ -247,7 +269,9 @@ class DirectionalProductionAcceptance:
         )
 
     @staticmethod
-    def _apply_deltas(lots: dict[str, int], deltas: Mapping[str, int]) -> None:
+    def _apply_deltas(
+        lots: dict[str, int], deltas: Mapping[str, int]
+    ) -> None:
         for symbol, delta in deltas.items():
             lots[symbol] = int(lots.get(symbol, 0)) + int(delta)
             if lots[symbol] == 0:
@@ -276,15 +300,25 @@ class DirectionalProductionAcceptance:
     ) -> ProductionSimulationResult:
         frame = self._normalize_contracts(raw)
         weight_frame = weights.copy()
-        weight_frame.index = pd.to_datetime(weight_frame.index, errors="coerce").normalize()
-        weight_frame = weight_frame[~weight_frame.index.isna()].sort_index().fillna(0.0)
-        weight_frame.columns = [str(column).upper() for column in weight_frame.columns]
-        if bool((weight_frame.abs().sum(axis=1) > 2.0 + 1e-10).any()):
+        weight_frame.index = pd.to_datetime(
+            weight_frame.index, errors="coerce"
+        ).normalize()
+        weight_frame = weight_frame[
+            ~weight_frame.index.isna()
+        ].sort_index().fillna(0.0)
+        weight_frame.columns = [
+            str(column).upper() for column in weight_frame.columns
+        ]
+        if bool(
+            (weight_frame.abs().sum(axis=1) > 2.0 + 1e-10).any()
+        ):
             raise ValueError("production mechanics weights exceed 2x gross")
 
         by_day_symbol = {
             (pd.Timestamp(day).normalize(), str(symbol)): group.iloc[-1]
-            for (day, symbol), group in frame.groupby(["date", "symbol"], sort=False)
+            for (day, symbol), group in frame.groupby(
+                ["date", "symbol"], sort=False
+            )
         }
         equity = float(self.config.initial_capital)
         high_watermark = equity
@@ -298,6 +332,7 @@ class DirectionalProductionAcceptance:
         for day, weight_row in weight_frame.iterrows():
             day = pd.Timestamp(day).normalize()
             previous_equity = equity
+            day_start_equity = previous_equity
             turnover_notional = 0.0
             risk_reason = ""
             margin_reject = ""
@@ -318,14 +353,16 @@ class DirectionalProductionAcceptance:
                 )
                 continue
 
-            # Existing concrete contracts earn only their own previous-close -> current-open gap.
+            # Existing contracts earn their own prior-close -> current-open gap.
             open_prices: dict[str, float] = {}
             close_prices: dict[str, float] = {}
             missing_existing = False
             for symbol, volume in list(lots.items()):
                 row = by_day_symbol.get((day, symbol))
                 if row is None or symbol not in previous_close:
-                    risk_reason = f"missing same-contract next price: {symbol}"
+                    risk_reason = (
+                        f"missing same-contract next price: {symbol}"
+                    )
                     first_divergence = first_divergence or risk_reason
                     missing_existing = True
                     break
@@ -335,7 +372,9 @@ class DirectionalProductionAcceptance:
                 close_prices[symbol] = close_price
                 equity += (
                     open_price - float(previous_close[symbol])
-                ) * int(volume) * PRODUCT_MULTIPLIERS[self._product(symbol)]
+                ) * int(volume) * PRODUCT_MULTIPLIERS[
+                    self._product(symbol)
+                ]
             if missing_existing:
                 halted = True
                 output_rows.append(
@@ -353,7 +392,8 @@ class DirectionalProductionAcceptance:
                 )
                 continue
 
-            day_start_equity = equity
+            # The production day-start baseline precedes the session's price move.
+            # Therefore the overnight gap counts against the daily-loss limit.
             risk_reason = self.account_risk_reason(
                 equity=equity,
                 day_start_equity=day_start_equity,
@@ -361,9 +401,14 @@ class DirectionalProductionAcceptance:
             )
             if risk_reason and lots:
                 first_divergence = first_divergence or risk_reason
-                closing = {symbol: -volume for symbol, volume in lots.items()}
-                turnover_notional += self._turnover(closing, open_prices)
-                equity -= turnover_notional * cost_rate
+                closing = {
+                    symbol: -volume for symbol, volume in lots.items()
+                }
+                close_turnover = self._turnover(
+                    closing, open_prices
+                )
+                turnover_notional += close_turnover
+                equity -= close_turnover * cost_rate
                 lots.clear()
                 halted = True
 
@@ -380,23 +425,47 @@ class DirectionalProductionAcceptance:
                     open_prices[symbol] = float(row["open"])
                     close_prices[symbol] = float(row["close"])
 
+                product_weights = {
+                    str(product).upper(): float(value)
+                    for product, value in weight_row.items()
+                }
                 target = self.target_lots(
                     equity=equity,
-                    product_weights={
-                        str(product): float(value)
-                        for product, value in weight_row.items()
-                    },
+                    product_weights=product_weights,
                     product_open_prices=product_open,
                     selected_symbols=selected_symbols,
                 )
-                phase = self.rebalance_plan(current_lots=lots, target_lots=target)
+                required_products = {
+                    product
+                    for product, value in product_weights.items()
+                    if abs(value) > 1e-15
+                }
+                unavailable_products = (
+                    required_products - set(selected_symbols)
+                )
+                # Match live semantics: a non-zero target with no executable
+                # next contract cannot add/roll risk, but it also cannot turn an
+                # existing same-product position into an artificial target=0.
+                for symbol, volume in lots.items():
+                    if self._product(symbol) in unavailable_products:
+                        target[symbol] = int(volume)
+
+                phase = self.rebalance_plan(
+                    current_lots=lots,
+                    target_lots=target,
+                )
                 if phase.reductions:
-                    reduction_turnover = self._turnover(phase.reductions, open_prices)
+                    reduction_turnover = self._turnover(
+                        phase.reductions, open_prices
+                    )
                     turnover_notional += reduction_turnover
                     equity -= reduction_turnover * cost_rate
                     self._apply_deltas(lots, phase.reductions)
 
-                phase = self.rebalance_plan(current_lots=lots, target_lots=target)
+                phase = self.rebalance_plan(
+                    current_lots=lots,
+                    target_lots=target,
+                )
                 if phase.openings:
                     current_margin = self._margin(lots, open_prices)
                     allowed, margin_reject, _ = self.check_opening_batch(
@@ -407,20 +476,29 @@ class DirectionalProductionAcceptance:
                         open_prices=open_prices,
                     )
                     if allowed:
-                        opening_turnover = self._turnover(phase.openings, open_prices)
+                        opening_turnover = self._turnover(
+                            phase.openings, open_prices
+                        )
                         turnover_notional += opening_turnover
                         equity -= opening_turnover * cost_rate
                         self._apply_deltas(lots, phase.openings)
                     else:
-                        first_divergence = first_divergence or margin_reject
+                        first_divergence = (
+                            first_divergence or margin_reject
+                        )
 
                 intraday_pnl = 0.0
                 for symbol, volume in lots.items():
-                    if symbol not in open_prices or symbol not in close_prices:
+                    if (
+                        symbol not in open_prices
+                        or symbol not in close_prices
+                    ):
                         continue
                     intraday_pnl += (
                         close_prices[symbol] - open_prices[symbol]
-                    ) * int(volume) * PRODUCT_MULTIPLIERS[self._product(symbol)]
+                    ) * int(volume) * PRODUCT_MULTIPLIERS[
+                        self._product(symbol)
+                    ]
                 equity += intraday_pnl
                 high_watermark = max(high_watermark, equity)
                 risk_reason = self.account_risk_reason(
@@ -430,14 +508,20 @@ class DirectionalProductionAcceptance:
                 )
                 if risk_reason and lots:
                     first_divergence = first_divergence or risk_reason
-                    close_turnover = self._turnover(lots, close_prices)
+                    close_turnover = self._turnover(
+                        lots, close_prices
+                    )
                     turnover_notional += close_turnover
                     equity -= close_turnover * cost_rate
                     lots.clear()
                     halted = True
 
-            valuation_prices = close_prices if close_prices else open_prices
-            margin = self._margin(lots, valuation_prices) if lots else 0.0
+            valuation_prices = (
+                close_prices if close_prices else open_prices
+            )
+            margin = (
+                self._margin(lots, valuation_prices) if lots else 0.0
+            )
             gross_notional = float(
                 sum(
                     abs(int(volume))
@@ -469,8 +553,14 @@ class DirectionalProductionAcceptance:
         if daily.empty:
             daily = pd.DataFrame(
                 columns=[
-                    "equity", "daily_return", "turnover_notional", "gross_notional",
-                    "margin", "risk_reason", "margin_reject", "halted"
+                    "equity",
+                    "daily_return",
+                    "turnover_notional",
+                    "gross_notional",
+                    "margin",
+                    "risk_reason",
+                    "margin_reject",
+                    "halted",
                 ]
             )
         else:
