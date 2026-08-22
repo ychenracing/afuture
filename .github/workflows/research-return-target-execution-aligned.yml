@@ -34,7 +34,7 @@ jobs:
       - run: python -m pip install pandas numpy pytest
       - name: Verify execution-aligned causal invariants
         run: |
-          pytest -q tests/test_execution_aligned_policy.py tests/test_execution_aligned_runtime.py
+          PYTHONPATH=. pytest -q tests/test_execution_aligned_policy.py tests/test_execution_aligned_runtime.py
           python tools/test_return_target_specific.py
       - name: Reuse completed concrete-contract L4 dataset
         uses: actions/download-artifact@v4
