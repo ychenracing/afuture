@@ -44,6 +44,10 @@ EXECUTION_SELECTION = {
 }
 
 
+def _product_order(products) -> list[str]:
+    return sorted({str(item).upper() for item in products})
+
+
 def build_continuous_execution_proxy(
     raw: pd.DataFrame,
     *,
@@ -57,10 +61,11 @@ def build_continuous_execution_proxy(
     frame = frame.dropna(subset=["date", "product", "open", "close"])
     frame = frame[(frame["open"] > 0) & (frame["close"] > 0)]
     frame.drop_duplicates(["date", "product"], keep="last", inplace=True)
+    ordered_products = _product_order(products)
     open_prices = (
         frame.pivot(index="date", columns="product", values="open")
         .sort_index()
-        .reindex(columns=list(products))
+        .reindex(columns=ordered_products)
     )
     close = (
         frame.pivot(index="date", columns="product", values="close")
@@ -128,11 +133,14 @@ def generate_execution_signal_weights(
 ) -> pd.DataFrame:
     signal_returns, _ = aggressive.build_panel(continuous_raw)
     signal_returns.columns = [str(column).upper() for column in signal_returns.columns]
-    missing = sorted(set(REQUIRED_PRODUCTS) - set(signal_returns.columns))
+    ordered_products = _product_order(REQUIRED_PRODUCTS)
+    missing = sorted(set(ordered_products) - set(signal_returns.columns))
     if missing:
         raise ValueError(f"continuous signal feed missing products: {missing}")
-    signal_returns = signal_returns[list(REQUIRED_PRODUCTS)]
-    _gap, intraday = build_continuous_execution_proxy(continuous_raw)
+    signal_returns = signal_returns[ordered_products]
+    _gap, intraday = build_continuous_execution_proxy(
+        continuous_raw, products=tuple(ordered_products)
+    )
     intraday = intraday.reindex(
         index=signal_returns.index, columns=signal_returns.columns
     )
@@ -221,6 +229,7 @@ def evaluate(
         "roll_safe": True,
         "selection_frozen": True,
         "selection_bias_acknowledged": True,
+        "product_ordering": "alphabetical",
         "pristine_final_oos": PRISTINE_FINAL_OOS,
         "historical_l1_available": False,
         "max_gross_leverage": MAX_GROSS_LEVERAGE,
