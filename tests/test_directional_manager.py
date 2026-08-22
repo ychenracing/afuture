@@ -39,7 +39,7 @@ def _tick(symbol: str, oi: float, *, depth: float = 1000.0) -> Tick:
 
 class _Provider:
     def __init__(self):
-        dates = pd.date_range("2025-12-01", periods=180, freq="B")
+        dates = pd.date_range(end="2026-08-21", periods=180, freq="B")
         self.frame = pd.DataFrame({"A": range(100, 280)}, index=dates, dtype=float)
         self.calls = 0
 
@@ -120,6 +120,7 @@ def _manager(broker):
         max_gross_leverage=2.0,
         max_contract_volume=5,
         rebalance_window="21:00-21:10",
+        signal_max_age_hours=120.0,
     )
     risk = RiskManager(
         RiskConfig(
@@ -156,7 +157,6 @@ def test_manager_subscribes_universe_and_reduces_before_opening_new_main_contrac
     assert all(order.order_type is OrderType.FAK for order in broker.orders)
     assert broker.orders[0].symbol == "A2609"
 
-    # After the broker confirms the reduction, the next cycle may add the new main risk.
     broker.positions = []
     broker.orders.clear()
     result = manager.maybe_rebalance(NOW)
