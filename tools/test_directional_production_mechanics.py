@@ -29,7 +29,7 @@ assert report["stress"]["cost_bps"] == 15.0
 assert report["margin_is_historical_truth"] is False
 assert report["base"]["final_equity"] > 0
 
-# Each published evaluation window is an independent account experiment. A Kill Switch
+# Each published evaluation window is an independent account experiment. A session lock
 # in an earlier regime must not make a later window look like a permanently flat account.
 module.WINDOWS = {
     "early": ("2026-08-21", "2026-08-21"),
@@ -46,7 +46,7 @@ window_weights = pd.DataFrame(
 )
 window_report = module.evaluate_with_weights(window_raw, window_weights)
 assert window_report["base"]["state_reset_per_window"] is True
-assert window_report["base"]["windows"]["early"]["halted"] is True
+assert window_report["base"]["windows"]["early"]["halted"] is False
 assert window_report["base"]["windows"]["late"]["active_days"] == 1
 assert window_report["base"]["windows"]["late"]["halted"] is False
 print("directional production mechanics tool tests passed")

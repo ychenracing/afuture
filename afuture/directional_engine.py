@@ -14,6 +14,7 @@ _ACCOUNT_RISK_REASONS = {
     "margin ratio limit reached",
     "available cash reserve too low",
 }
+_RECOVERABLE_SESSION_RISK_REASONS = {"daily loss limit reached"}
 
 
 class DirectionalTradingEngine(TradingEngine):
@@ -79,7 +80,28 @@ class DirectionalTradingEngine(TradingEngine):
         except Exception as exc:
             self.emergency_stop(f"directional rebalance failed: {exc}")
 
+    def _enter_daily_loss_lock(self, reason: str) -> None:
+        if self.state.runtime_mode == RuntimeMode.HALTED.value:
+            return
+        try:
+            trading_day = str(self.broker.get_account().trading_day or "")
+        except Exception:
+            trading_day = str(self.state.trading_day or "")
+        self.state.daily_loss_lock_trading_day = trading_day
+        self.enter_reduce_only(reason)
+        self._record(
+            "directional_daily_loss_lock",
+            {"reason": reason, "trading_day": trading_day},
+        )
+        self._persist()
+
     def emergency_stop(self, reason: str) -> None:
+        if (
+            reason in _RECOVERABLE_SESSION_RISK_REASONS
+            and hasattr(self, "directional_manager")
+        ):
+            self._enter_daily_loss_lock(reason)
+            return
         if (
             reason in _ACCOUNT_RISK_REASONS
             and hasattr(self, "directional_manager")
@@ -90,9 +112,6 @@ class DirectionalTradingEngine(TradingEngine):
         super().emergency_stop(reason)
 
     def _capture_quality_trade(self, trade: Trade) -> None:
-        # Directional expectations are registered at submission time. They are enough to
-        # identify the fill; querying Broker.get_order() here creates an unnecessary
-        # adapter dependency and can race order-cache propagation.
         expected = self.directional_manager.directional_order_expectation(
             trade.order_id
         )
@@ -112,8 +131,6 @@ class DirectionalTradingEngine(TradingEngine):
             if isinstance(trade, Trade)
             else None
         )
-        # Base handler owns validation, expected-position mutation, persistence and pair
-        # quality. Directional observability is layered around it, never instead of it.
         super()._handle_trade_event(trade)
         if expected is not None and not self.halted:
             self.directional_manager._finalize_quality_cycle_if_settled(
@@ -128,8 +145,6 @@ class DirectionalTradingEngine(TradingEngine):
             is not None
         ):
             self.directional_manager.note_directional_quality_order(order)
-            # Do not finalize here. Some gateways publish terminal order status before the
-            # corresponding trade callback; finalizing would discard the fill expectation.
 
     def stop(self) -> None:
         try:
@@ -173,6 +188,48 @@ class DirectionalTradingEngine(TradingEngine):
             max_quote_age=max_quote_age,
         )
 
+    def _resume_after_daily_loss_if_safe(self) -> bool:
+        lock_day = str(self.state.daily_loss_lock_trading_day or "")
+        if not lock_day:
+            return False
+        if not self.broker.is_ready() or self.broker.get_active_orders():
+            return False
+        try:
+            account = self.broker.get_account()
+        except Exception:
+            return False
+        current_day = str(account.trading_day or "")
+        if not current_day or current_day <= lock_day:
+            return False
+
+        self._advance_trading_day(account)
+        decision = self.risk_manager.check_account(account)
+        self.state.equity_high_watermark = self.risk_manager.high_watermark
+        if not decision.allowed:
+            if decision.reason not in _RECOVERABLE_SESSION_RISK_REASONS:
+                self.state.daily_loss_lock_trading_day = ""
+                super().emergency_stop(decision.reason)
+            else:
+                self._persist()
+            return False
+        if not self.clear_kill_switch_after_reconcile():
+            return False
+        try:
+            if not self._directional_initialized:
+                self.directional_manager.bootstrap(self._reference_now())
+                self._directional_initialized = True
+        except Exception as exc:
+            self.emergency_stop(f"directional initialization failed: {exc}")
+            return False
+
+        self.state.daily_loss_lock_trading_day = ""
+        self._record(
+            "directional_daily_loss_resume",
+            {"blocked_trading_day": lock_day, "trading_day": current_day},
+        )
+        self._persist()
+        return True
+
     def _reduce_only_cycle(self) -> None:
         if self.directional_manager.has_risk():
             try:
@@ -193,6 +250,9 @@ class DirectionalTradingEngine(TradingEngine):
                     else suffix
                 )
                 self._persist()
+            return
+        if self.state.daily_loss_lock_trading_day:
+            self._resume_after_daily_loss_if_safe()
             return
         super()._reduce_only_cycle()
 

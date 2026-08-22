@@ -46,8 +46,8 @@ def test_execution_aligned_policy_freezes_product_order():
 
 def test_execution_aligned_policy_uses_frozen_meta_shape():
     policy = ExecutionAlignedAggressivePolicy(products=("A", "M"))
-    assert policy.meta_lookback == 10
-    assert policy.meta_rebalance == 5
+    assert policy.meta_lookback == 11
+    assert policy.meta_rebalance == 3
     assert policy.meta_count == 3
     assert len(policy.template_ids) == 96
     assert policy.meta_score_source == "continuous_intraday_proxy"

@@ -85,6 +85,10 @@ class DirectionalProductionAcceptance:
             raise ValueError(f"unknown frozen product multiplier: {symbol}")
         return prefix
 
+    @staticmethod
+    def _recoverable_session_risk(reason: str) -> bool:
+        return reason == "daily loss limit reached"
+
     def target_lots(
         self,
         *,
@@ -337,6 +341,7 @@ class DirectionalProductionAcceptance:
             turnover_notional = 0.0
             risk_reason = ""
             margin_reject = ""
+            session_locked = False
 
             if halted:
                 output_rows.append(
@@ -349,6 +354,7 @@ class DirectionalProductionAcceptance:
                         "margin": 0.0,
                         "risk_reason": first_divergence,
                         "margin_reject": "",
+                        "session_locked": False,
                         "halted": True,
                     }
                 )
@@ -383,13 +389,12 @@ class DirectionalProductionAcceptance:
                         "margin": 0.0,
                         "risk_reason": risk_reason,
                         "margin_reject": "",
+                        "session_locked": False,
                         "halted": True,
                     }
                 )
                 continue
 
-            # Production observes account equity/margin at the session open before
-            # normal target rebalance. A favorable gap also establishes a new HWM.
             high_watermark = max(high_watermark, equity)
             current_margin = self._margin(lots, open_prices) if lots else 0.0
             risk_reason = self.account_risk_reason(
@@ -405,9 +410,12 @@ class DirectionalProductionAcceptance:
                 turnover_notional += close_turnover
                 equity -= close_turnover * cost_rate
                 lots.clear()
-                halted = True
+                if self._recoverable_session_risk(risk_reason):
+                    session_locked = True
+                else:
+                    halted = True
 
-            if not halted:
+            if not halted and not session_locked:
                 selected = self.select_contracts_for_day(frame, day)
                 product_open: dict[str, float] = {}
                 selected_symbols: dict[str, str] = {}
@@ -497,7 +505,10 @@ class DirectionalProductionAcceptance:
                     turnover_notional += close_turnover
                     equity -= close_turnover * cost_rate
                     lots.clear()
-                    halted = True
+                    if self._recoverable_session_risk(risk_reason):
+                        session_locked = True
+                    else:
+                        halted = True
 
             valuation_prices = close_prices if close_prices else open_prices
             margin = self._margin(lots, valuation_prices) if lots else 0.0
@@ -524,6 +535,7 @@ class DirectionalProductionAcceptance:
                     "margin": margin,
                     "risk_reason": risk_reason,
                     "margin_reject": margin_reject,
+                    "session_locked": session_locked,
                     "halted": halted,
                 }
             )
@@ -534,7 +546,7 @@ class DirectionalProductionAcceptance:
                 columns=[
                     "equity", "daily_return", "turnover_notional",
                     "gross_notional", "margin", "risk_reason",
-                    "margin_reject", "halted",
+                    "margin_reject", "session_locked", "halted",
                 ]
             )
         else:
