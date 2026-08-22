@@ -17,12 +17,13 @@ spec.loader.exec_module(module)
 
 def synthetic_returns() -> tuple[pd.DataFrame, dict[str, str]]:
     dates = pd.date_range("2024-01-01", periods=180, freq="B")
+    even = np.arange(len(dates)) % 2 == 0
     values = pd.DataFrame(
         {
-            "A": np.full(len(dates), 0.010),
-            "B": np.full(len(dates), 0.003),
-            "C": np.full(len(dates), -0.002),
-            "D": np.full(len(dates), -0.009),
+            "A": np.where(even, 0.011, 0.009),
+            "B": np.where(even, 0.004, 0.002),
+            "C": np.where(even, -0.001, -0.003),
+            "D": np.where(even, -0.008, -0.010),
         },
         index=dates,
     )
