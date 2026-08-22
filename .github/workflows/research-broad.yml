@@ -11,6 +11,8 @@ on:
       - "tools/test_broad_relative_families.py"
       - "tools/evaluate_broad_pair_regime.py"
       - "tools/test_broad_pair_regime.py"
+      - "tools/evaluate_broad_pair_rotation.py"
+      - "tools/test_broad_pair_rotation.py"
       - ".github/workflows/research-broad.yml"
 
 permissions:
@@ -35,6 +37,8 @@ jobs:
         run: python tools/test_broad_relative_families.py
       - name: Verify economic-pair research causality and fail-closed leverage
         run: python tools/test_broad_pair_regime.py
+      - name: Verify strongest-pair rotation and overlap control
+        run: python tools/test_broad_pair_rotation.py
       - name: Fetch broad continuous daily factor universe
         run: python tools/fetch_broad_daily_universe.py
       - name: Screen market-neutral cross-sectional families
@@ -70,9 +74,30 @@ jobs:
           print(json.dumps({
               "support": report["support"],
               "selected_profile": report["selected_profile"],
+              "selected_oos": report["selected_oos"],
+              "selected_full_recent": report["selected_full_recent"],
+              "target": report["target"],
+          }, ensure_ascii=False, indent=2))
+          PY
+      - name: Screen capital-efficient strongest-pair rotation
+        run: |
+          python tools/evaluate_broad_pair_rotation.py
+          python - <<'PY'
+          import json
+          report = json.load(open("runtime/broad_pair_rotation_report.json", encoding="utf-8"))
+          assert report["max_active_pairs"] == 1
+          assert report["selected_leverage"] <= report["max_gross_leverage"]
+          assert report["historical_l1_available"] is False
+          assert report["pristine_final_oos"] is False
+          assert "target_met" in report["target"]
+          print(json.dumps({
+              "support": report["support"],
+              "selected_profile": report["selected_profile"],
               "selected_prior_pairs": report["selected_prior_pairs"],
               "selected_current_pairs": report["selected_current_pairs"],
               "selected_prior_forward_train": report["selected_prior_forward_train"],
+              "selected_oos_unlevered": report["selected_oos_unlevered"],
+              "selected_full_recent_unlevered": report["selected_full_recent_unlevered"],
               "selected_leverage": report["selected_leverage"],
               "selected_oos": report["selected_oos"],
               "selected_full_recent": report["selected_full_recent"],
@@ -89,4 +114,5 @@ jobs:
             runtime/broad_daily_universe_failures.txt
             runtime/broad_relative_family_report.json
             runtime/broad_pair_regime_report.json
+            runtime/broad_pair_rotation_report.json
           retention-days: 14
