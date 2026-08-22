@@ -27,3 +27,34 @@ def test_risk_breach_halts_future_reopening():
     assert result.daily.loc[pd.Timestamp("2026-08-21"),"risk_reason"] == "daily loss limit reached"
     assert result.daily.loc[pd.Timestamp("2026-08-24"),"gross_notional"] == 0
     assert result.first_divergence == "daily loss limit reached"
+
+
+def test_overnight_gap_loss_counts_against_day_start_loss_gate():
+    raw = pd.DataFrame([
+        {"date":"2026-08-20","product":"A","exchange":"DCE","symbol":"A2609","delivery":"2026-12-15","open":100,"close":100,"volume":5000,"hold":30000},
+        {"date":"2026-08-21","product":"A","exchange":"DCE","symbol":"A2609","delivery":"2026-12-15","open":100,"close":100,"volume":5000,"hold":30000},
+        {"date":"2026-08-24","product":"A","exchange":"DCE","symbol":"A2609","delivery":"2026-12-15","open":94,"close":94,"volume":5000,"hold":30000},
+    ])
+    weights = pd.DataFrame({"A":[1.0,1.0]}, index=pd.to_datetime(["2026-08-21","2026-08-24"]))
+    sim = DirectionalProductionAcceptance(ProductionMechanicsConfig(initial_capital=100000,max_daily_loss_ratio=.05,max_total_drawdown_ratio=.30,max_margin_ratio=.90,min_available_ratio=0))
+    result = sim.simulate(raw, weights, cost_bps=0)
+    day = result.daily.loc[pd.Timestamp("2026-08-24")]
+    assert day["risk_reason"] == "daily loss limit reached"
+    assert day["halted"]
+    assert day["gross_notional"] == 0
+
+
+def test_unavailable_nonzero_target_freezes_existing_product_lots():
+    raw = pd.DataFrame([
+        {"date":"2026-08-20","product":"A","exchange":"DCE","symbol":"A2609","delivery":"2026-12-15","open":100,"close":100,"volume":5000,"hold":30000},
+        # D activity drops below eligibility, but the existing D+1 contract still has prices.
+        {"date":"2026-08-21","product":"A","exchange":"DCE","symbol":"A2609","delivery":"2026-12-15","open":100,"close":100,"volume":10,"hold":1000},
+        {"date":"2026-08-24","product":"A","exchange":"DCE","symbol":"A2609","delivery":"2026-12-15","open":100,"close":101,"volume":5000,"hold":30000},
+    ])
+    weights = pd.DataFrame({"A":[1.0,1.0]}, index=pd.to_datetime(["2026-08-21","2026-08-24"]))
+    sim = DirectionalProductionAcceptance(ProductionMechanicsConfig(initial_capital=100000,max_daily_loss_ratio=.50,max_total_drawdown_ratio=.80,max_margin_ratio=.90,min_available_ratio=0))
+    result = sim.simulate(raw, weights, cost_bps=0)
+    day = result.daily.loc[pd.Timestamp("2026-08-24")]
+    assert day["turnover_notional"] == 0
+    assert day["gross_notional"] > 0
+    assert not day["halted"]
