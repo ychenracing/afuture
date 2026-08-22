@@ -2,24 +2,26 @@ from pathlib import Path
 import importlib.util
 import sys
 
-import numpy as np
 import pandas as pd
 
 TOOLS = Path(__file__).resolve().parent
 FETCH_PATH = TOOLS / "fetch_return_target_specific_daily.py"
-EVAL_PATH = TOOLS / "evaluate_return_target_specific.py"
-assert FETCH_PATH.exists()
-assert EVAL_PATH.exists()
+BASE_PATH = TOOLS / "evaluate_return_target_specific.py"
+FINAL_PATH = TOOLS / "evaluate_execution_aligned_target.py"
+assert FETCH_PATH.exists() and BASE_PATH.exists() and FINAL_PATH.exists()
 
-fetch_spec = importlib.util.spec_from_file_location("return_target_fetch", FETCH_PATH)
-fetcher = importlib.util.module_from_spec(fetch_spec)
-sys.modules[fetch_spec.name] = fetcher
-fetch_spec.loader.exec_module(fetcher)
 
-eval_spec = importlib.util.spec_from_file_location("return_target_specific", EVAL_PATH)
-evaluator = importlib.util.module_from_spec(eval_spec)
-sys.modules[eval_spec.name] = evaluator
-eval_spec.loader.exec_module(evaluator)
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+fetcher = _load("return_target_fetch", FETCH_PATH)
+base = _load("return_target_specific", BASE_PATH)
+evaluator = _load("execution_aligned_target", FINAL_PATH)
 
 assert set(fetcher.PRODUCTS) == set(evaluator.REQUIRED_PRODUCTS)
 assert len(fetcher.PRODUCTS) == 50
@@ -41,7 +43,7 @@ assert ("AG", "SHFE", "AG2209") in symbols
 assert ("BC", "INE", "BC2209") in symbols
 assert fetcher.delivery_date("AG2609") == pd.Timestamp("2026-09-15")
 
-# Concrete roll causality: t->t+1 return is always on the exact contract selected at t.
+# Concrete roll causality: t->t+1 return remains on the exact contract selected at t.
 dates = pd.to_datetime(["2025-01-02", "2025-01-03", "2025-01-06"])
 rows = []
 for product in ("A", "M"):
@@ -56,70 +58,41 @@ for product in ("A", "M"):
     ):
         rows.extend(
             [
-                {
-                    "date": day,
-                    "product": product,
-                    "exchange": "DCE",
-                    "symbol": f"{product}2509",
-                    "delivery": "2025-09-15",
-                    "open": p1 * 0.99,
-                    "close": p1,
-                    "volume": 1000.0,
-                    "hold": oi1,
-                },
-                {
-                    "date": day,
-                    "product": product,
-                    "exchange": "DCE",
-                    "symbol": f"{product}2601",
-                    "delivery": "2026-01-15",
-                    "open": p2 * 0.99,
-                    "close": p2,
-                    "volume": 900.0,
-                    "hold": oi2,
-                },
+                {"date": day, "product": product, "exchange": "DCE", "symbol": f"{product}2509", "delivery": "2025-09-15", "open": p1 * 0.99, "close": p1, "volume": 1000.0, "hold": oi1},
+                {"date": day, "product": product, "exchange": "DCE", "symbol": f"{product}2601", "delivery": "2026-01-15", "open": p2 * 0.99, "close": p2, "volume": 900.0, "hold": oi2},
             ]
         )
 
-original_products = evaluator.REQUIRED_PRODUCTS
-original_min_days = evaluator.MIN_PRODUCT_DAYS
+original_products = base.REQUIRED_PRODUCTS
+original_min_days = base.MIN_PRODUCT_DAYS
 try:
-    evaluator.REQUIRED_PRODUCTS = ("A", "M")
-    evaluator.MIN_PRODUCT_DAYS = 3
+    base.REQUIRED_PRODUCTS = ("A", "M")
+    base.MIN_PRODUCT_DAYS = 3
     close_returns, gap_returns, intraday_returns, selected, quality = (
-        evaluator.build_roll_safe_execution_returns(pd.DataFrame(rows))
+        base.build_roll_safe_execution_returns(pd.DataFrame(rows))
     )
 finally:
-    evaluator.REQUIRED_PRODUCTS = original_products
-    evaluator.MIN_PRODUCT_DAYS = original_min_days
+    base.REQUIRED_PRODUCTS = original_products
+    base.MIN_PRODUCT_DAYS = original_min_days
 
-assert selected.loc[selected["product"] == "A", "symbol"].tolist() == [
-    "A2509",
-    "A2601",
-    "A2601",
-]
+assert selected.loc[selected["product"] == "A", "symbol"].tolist() == ["A2509", "A2601", "A2601"]
 assert abs(close_returns.loc[dates[1], "A"] - 0.10) < 1e-12
 assert quality["A"]["rolls"] == 1
-assert int(selected["days_to_delivery"].min()) >= evaluator.MIN_DAYS_TO_DELIVERY
+assert int(selected["days_to_delivery"].min()) >= base.MIN_DAYS_TO_DELIVERY
 
-# Next-open execution semantics: old holdings earn close->open gap; new target earns
-# open->close; cost is charged once on final product weight turnover at the open.
+# Next-open execution semantics and turnover charging.
 idx = pd.date_range("2025-02-03", periods=3, freq="B")
 weights = pd.DataFrame({"A": [0.0, 1.0, -1.0]}, index=idx)
 gap = pd.DataFrame({"A": [0.0, 0.10, 0.20]}, index=idx)
 intraday = pd.DataFrame({"A": [0.0, 0.03, 0.04]}, index=idx)
-path = evaluator.apply_next_open_product_weights(
-    gap, intraday, weights, cost_bps=0.0
-)
+path = base.apply_next_open_product_weights(gap, intraday, weights, cost_bps=0.0)
 assert abs(path.iloc[1] - 0.03) < 1e-12
 assert abs(path.iloc[2] - (0.20 - 0.04)) < 1e-12
-costed = evaluator.apply_next_open_product_weights(
-    gap, intraday, weights, cost_bps=10.0
-)
+costed = base.apply_next_open_product_weights(gap, intraday, weights, cost_bps=10.0)
 assert abs((path.iloc[1] - costed.iloc[1]) - 0.001) < 1e-12
 assert abs((path.iloc[2] - costed.iloc[2]) - 0.002) < 1e-12
 
-# Continuous execution proxy is causal and uses open/close timing rather than same-day close.
+# Continuous meta evidence uses completed close->open/open->close history.
 proxy_raw = pd.DataFrame(
     [
         {"date": idx[0], "product": "A", "open": 100.0, "close": 100.0},
@@ -127,15 +100,11 @@ proxy_raw = pd.DataFrame(
         {"date": idx[2], "product": "A", "open": 135.96, "close": 141.3984},
     ]
 )
-proxy_gap, proxy_intraday = evaluator.build_continuous_execution_proxy(
-    proxy_raw, products=("A",)
-)
+proxy_gap, proxy_intraday = evaluator.build_continuous_execution_proxy(proxy_raw, products=("A",))
 assert abs(proxy_gap.loc[idx[1], "A"] - 0.10) < 1e-12
 assert abs(proxy_intraday.loc[idx[1], "A"] - 0.03) < 1e-12
 assert abs(proxy_gap.loc[idx[2], "A"] - 0.20) < 1e-12
 assert abs(proxy_intraday.loc[idx[2], "A"] - 0.04) < 1e-12
-
-assert hasattr(evaluator, "generate_execution_signal_weights")
 assert evaluator.PRISTINE_FINAL_OOS is False
 
-print("return-target execution-aware specific-contract tests passed")
+print("return-target execution-aligned specific-contract tests passed")
