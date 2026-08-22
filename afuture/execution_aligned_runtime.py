@@ -4,10 +4,21 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime
+from pathlib import Path
 
 import pandas as pd
 
-from .directional_runtime import DirectionalPortfolioManager, _CHINA_TZ
+from .directional import build_rebalance_plan, build_target_lots
+from .directional_activity import (
+    DirectionalActivityStore,
+    DirectionalActivityTracker,
+    select_contracts_from_activity,
+)
+from .directional_runtime import (
+    DirectionalActionResult,
+    DirectionalPortfolioManager,
+    _CHINA_TZ,
+)
 from .execution_aligned_policy import ExecutionAlignedAggressivePolicy
 
 
@@ -86,9 +97,20 @@ class SinaContinuousOHLCProvider:
 
 
 class ExecutionAlignedDirectionalPortfolioManager(DirectionalPortfolioManager):
-    """Reuse the existing execution lifecycle while supplying OHLC-aware target weights."""
+    """Production manager using completed-day activity and OHLC-aware target weights."""
 
-    def __init__(self, config, broker, risk_manager, *, signal_provider=None, policy=None, **kwargs):
+    def __init__(
+        self,
+        config,
+        broker,
+        risk_manager,
+        *,
+        signal_provider=None,
+        policy=None,
+        activity_store_path: str | Path | None = None,
+        activity_tracker: DirectionalActivityTracker | None = None,
+        **kwargs,
+    ):
         if policy is None:
             configured = tuple(sorted({str(item).upper() for item in config.products}))
             if configured != FROZEN_PRODUCTS:
@@ -105,6 +127,27 @@ class ExecutionAlignedDirectionalPortfolioManager(DirectionalPortfolioManager):
             **kwargs,
         )
         self._execution_signal_history: ExecutionAlignedSignalHistory | None = None
+        if activity_tracker is not None:
+            self.activity_tracker = activity_tracker
+        elif activity_store_path is not None:
+            self.activity_tracker = DirectionalActivityTracker(
+                DirectionalActivityStore(activity_store_path)
+            )
+        else:
+            self.activity_tracker = None
+        self._catalog_by_symbol = {}
+
+    def bootstrap(self, now: datetime) -> None:
+        super().bootstrap(now)
+        self._catalog_by_symbol = {item.symbol: item for item in self._catalog}
+
+    def observe(self, tick) -> None:
+        super().observe(tick)
+        if self.activity_tracker is None:
+            return
+        contract = self._catalog_by_symbol.get(tick.symbol)
+        if contract is not None:
+            self.activity_tracker.observe(tick, contract)
 
     @staticmethod
     def _normalize_frame(frame: pd.DataFrame, max_date: date) -> pd.DataFrame:
@@ -215,3 +258,108 @@ class ExecutionAlignedDirectionalPortfolioManager(DirectionalPortfolioManager):
         return {
             str(key).upper(): float(value) for key, value in weights.items()
         }
+
+    def maybe_rebalance(self, now: datetime) -> DirectionalActionResult:
+        if not self._initialized:
+            return DirectionalActionResult("reject", "directional manager is not initialized")
+        if not self.broker.is_ready():
+            return DirectionalActionResult("reject", "broker is not ready")
+        if not self._inside_rebalance_window(now):
+            return DirectionalActionResult("hold", "outside directional rebalance window")
+        if self.broker.get_active_orders():
+            return DirectionalActionResult("wait", "active orders must settle before rebalance")
+
+        positions = self.broker.get_positions()
+        snapshot = self.activity_tracker.completed_snapshot if self.activity_tracker else None
+        if self.activity_tracker is not None and snapshot is None:
+            action = "risk_off" if any(not item.empty for item in positions) else "reject"
+            return DirectionalActionResult(action, "completed directional activity is unavailable")
+        required_signal_day = snapshot.trading_date if snapshot is not None else None
+        try:
+            signal = self._load_signal(now, required_signal_day=required_signal_day)
+            target_weights = self._next_target_weights(signal)
+        except Exception as exc:
+            action = "risk_off" if any(not item.empty for item in positions) else "reject"
+            return DirectionalActionResult(action, f"directional signal unavailable: {exc}")
+
+        local_date = self._local(now).date()
+        if snapshot is not None:
+            selected = select_contracts_from_activity(
+                self.config, self._catalog, snapshot, local_date
+            )
+        else:
+            selected = self.selector.select(self._catalog, self._ticks, local_date)
+
+        required_products = {
+            product.upper()
+            for product, weight in target_weights.items()
+            if abs(float(weight)) > 1e-15
+        }
+        # A selected contract still needs a current executable quote. Missing new risk is
+        # isolated to that product rather than blocking deterministic reductions elsewhere.
+        available_products = {
+            product
+            for product in required_products
+            if product in selected and selected[product].symbol in self._ticks
+        }
+        unavailable_products = required_products - available_products
+
+        symbols = {item.symbol for item in positions if not item.empty} | {
+            selected[product].symbol for product in available_products
+        }
+        try:
+            specs = self._ensure_specs(symbols)
+        except Exception as exc:
+            return DirectionalActionResult(
+                "reject", f"directional metadata unavailable: {exc}"
+            )
+
+        product_ticks = {
+            product: self._ticks[selected[product].symbol]
+            for product in available_products
+        }
+        account = self.broker.get_account()
+        target_lots = build_target_lots(
+            account,
+            {product: target_weights[product] for product in available_products},
+            product_ticks,
+            specs,
+            max_contract_volume=min(
+                self.config.max_contract_volume,
+                self.risk_manager.config.max_contract_volume,
+            ),
+        )
+
+        symbol_product = {item.symbol: item.product.upper() for item in self._catalog}
+        for position in positions:
+            if position.empty:
+                continue
+            product = symbol_product.get(position.symbol)
+            if product in unavailable_products:
+                # Freeze unavailable target risk at its current lots. No add/roll is allowed,
+                # but this missing product cannot block reductions in other products.
+                target_lots[position.symbol] = position.net_volume
+
+        plan = build_rebalance_plan(positions, target_lots)
+        if plan.reductions:
+            return self._submit_reductions(
+                positions,
+                plan.reductions,
+                now,
+                reference="directional:rebalance",
+            )
+        if plan.openings:
+            return self._submit_openings(
+                positions,
+                plan.openings,
+                {product: selected[product] for product in available_products},
+                specs,
+                now,
+            )
+        if unavailable_products:
+            return DirectionalActionResult(
+                "reject" if not any(not item.empty for item in positions) else "hold",
+                "directional target unavailable for products: "
+                + ",".join(sorted(unavailable_products)),
+            )
+        return DirectionalActionResult("hold", "directional portfolio is at target")

@@ -4,6 +4,10 @@ import pandas as pd
 
 from afuture.directional import DirectionalConfig
 from afuture.directional_runtime import DirectionalPortfolioManager
+from afuture.execution_aligned_runtime import (
+    ExecutionAlignedDirectionalPortfolioManager,
+    ExecutionAlignedSignalHistory,
+)
 from afuture.models import (
     AccountSnapshot,
     ContractInfo,
@@ -58,6 +62,29 @@ class _Policy:
 
     def target_weights(self, close):
         assert not close.empty
+        return dict(self.weights)
+
+
+class _ExecutionProvider:
+    def __init__(self, products):
+        dates = pd.date_range(end="2026-08-21", periods=180, freq="B")
+        close = pd.DataFrame(
+            {product: range(100, 280) for product in products}, index=dates, dtype=float
+        )
+        self.history = ExecutionAlignedSignalHistory(
+            close.shift(1).fillna(close.iloc[0]), close
+        )
+
+    def load(self, products):
+        return self.history
+
+
+class _ExecutionPolicy:
+    def __init__(self, weights):
+        self.weights = dict(weights)
+
+    def target_weights(self, open_prices, close):
+        assert open_prices.index.equals(close.index)
         return dict(self.weights)
 
 
@@ -124,6 +151,19 @@ class _Broker:
         pass
 
 
+def _risk():
+    return RiskManager(
+        RiskConfig(
+            max_margin_ratio=0.50,
+            min_available_ratio=0.20,
+            max_contract_volume=5,
+            min_depth_multiple=2.0,
+            open_cooldown_minutes=0,
+            close_blackout_minutes=0,
+        )
+    )
+
+
 def _manager(broker, *, products=("A",), weights=None):
     config = DirectionalConfig(
         enabled=True,
@@ -134,22 +174,33 @@ def _manager(broker, *, products=("A",), weights=None):
         rebalance_window="21:00-21:10",
         signal_max_age_hours=120.0,
     )
-    risk = RiskManager(
-        RiskConfig(
-            max_margin_ratio=0.50,
-            min_available_ratio=0.20,
-            max_contract_volume=5,
-            min_depth_multiple=2.0,
-            open_cooldown_minutes=0,
-            close_blackout_minutes=0,
-        )
-    )
     return DirectionalPortfolioManager(
         config,
         broker,
-        risk,
+        _risk(),
         signal_provider=_Provider(products),
         policy=_Policy(weights),
+        aggressive_ticks=1,
+    )
+
+
+def _execution_manager(broker, *, products, weights):
+    config = DirectionalConfig(
+        enabled=True,
+        products=products,
+        exchanges=("DCE",),
+        max_gross_leverage=2.0,
+        max_contract_volume=5,
+        rebalance_window="21:00-21:10",
+        signal_max_age_hours=120.0,
+    )
+    return ExecutionAlignedDirectionalPortfolioManager(
+        config,
+        broker,
+        _risk(),
+        signal_provider=_ExecutionProvider(products),
+        policy=_ExecutionPolicy(weights),
+        activity_tracker=None,
         aggressive_ticks=1,
     )
 
@@ -184,7 +235,7 @@ def test_manager_subscribes_universe_and_reduces_before_opening_new_main_contrac
 
 def test_missing_new_target_cannot_block_unrelated_reduction():
     broker = _Broker()
-    manager = _manager(broker, products=("A", "M"), weights={"M": 1.0})
+    manager = _execution_manager(broker, products=("A", "M"), weights={"M": 1.0})
     manager.bootstrap(NOW)
     for tick in broker.ticks.values():
         manager.observe(tick)
@@ -196,14 +247,13 @@ def test_missing_new_target_cannot_block_unrelated_reduction():
 
 
 def test_missing_target_with_existing_same_product_freezes_it_while_reducing_other_risk():
-    broker = _Broker()
+    broker = _Broker(include_m=True)
     broker.positions = [
         ContractPosition("A2609", "DCE", long_today=2),
         ContractPosition("M2609", "DCE", long_today=3),
     ]
-    broker.specs["M2609"] = ContractSpec("M2609", "DCE", 10, 1, 0.1, 0.1)
-    # M is intentionally absent from catalog/ticks, so no new/roll M risk is available.
-    manager = _manager(broker, products=("A", "M"), weights={"M": 1.0})
+    broker.ticks.pop("M2609")
+    manager = _execution_manager(broker, products=("A", "M"), weights={"M": 1.0})
     manager.bootstrap(NOW)
     for tick in broker.ticks.values():
         manager.observe(tick)

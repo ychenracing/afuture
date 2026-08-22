@@ -7,6 +7,14 @@ from .engine import TradingEngine
 from .models import RuntimeMode, Tick
 
 
+_ACCOUNT_RISK_REASONS = {
+    "daily loss limit reached",
+    "drawdown limit reached",
+    "margin ratio limit reached",
+    "available cash reserve too low",
+}
+
+
 class DirectionalTradingEngine(TradingEngine):
     """Reuse the production engine while delegating directional portfolio lifecycle."""
 
@@ -52,6 +60,18 @@ class DirectionalTradingEngine(TradingEngine):
             result = self.directional_manager.maybe_rebalance(
                 self._reference_now()
             )
+            if result.action == "risk_off":
+                self._record(
+                    "directional_rebalance",
+                    {
+                        "action": result.action,
+                        "reason": result.reason,
+                        "order_ids": list(result.order_ids),
+                    },
+                )
+                if self.directional_manager.has_risk():
+                    self.enter_reduce_only(result.reason or "directional risk-off")
+                return
             if result.action not in {"hold", "wait"}:
                 self._record(
                     "directional_rebalance",
@@ -63,6 +83,19 @@ class DirectionalTradingEngine(TradingEngine):
                 )
         except Exception as exc:
             self.emergency_stop(f"directional rebalance failed: {exc}")
+
+    def emergency_stop(self, reason: str) -> None:
+        # Calendar-spread behavior stays in TradingEngine. Only account-risk breaches in
+        # account-exclusive directional mode transition through REDUCE_ONLY so existing
+        # directional exposure is actively removed instead of being stranded by HALTED.
+        if (
+            reason in _ACCOUNT_RISK_REASONS
+            and hasattr(self, "directional_manager")
+            and self.directional_manager.has_risk()
+        ):
+            self.enter_reduce_only(reason)
+            return
+        super().emergency_stop(reason)
 
     def stop(self) -> None:
         try:
