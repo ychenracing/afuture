@@ -38,9 +38,13 @@ def _tick(symbol: str, oi: float, *, depth: float = 1000.0) -> Tick:
 
 
 class _Provider:
-    def __init__(self):
+    def __init__(self, products=("A",)):
         dates = pd.date_range(end="2026-08-21", periods=180, freq="B")
-        self.frame = pd.DataFrame({"A": range(100, 280)}, index=dates, dtype=float)
+        self.frame = pd.DataFrame(
+            {product: range(100, 280) for product in products},
+            index=dates,
+            dtype=float,
+        )
         self.calls = 0
 
     def load(self, products):
@@ -49,22 +53,28 @@ class _Provider:
 
 
 class _Policy:
+    def __init__(self, weights=None):
+        self.weights = weights or {"A": 1.0}
+
     def target_weights(self, close):
         assert not close.empty
-        return {"A": 1.0}
+        return dict(self.weights)
 
 
 class _Broker:
     metadata_query_blocks = False
 
-    def __init__(self, *, depth=1000.0):
+    def __init__(self, *, depth=1000.0, include_m=False):
         self.catalog = [
             ContractInfo("A2609", "DCE", "A", "2026-09-15"),
             ContractInfo("A2611", "DCE", "A", "2026-11-15"),
         ]
+        if include_m:
+            self.catalog.append(ContractInfo("M2609", "DCE", "M", "2026-09-15"))
+        symbols = [item.symbol for item in self.catalog]
         self.specs = {
             symbol: ContractSpec(symbol, "DCE", 10, 1, 0.1, 0.1)
-            for symbol in ("A2609", "A2611")
+            for symbol in symbols
         }
         self.positions = [ContractPosition("A2609", "DCE", long_today=2)]
         self.orders = []
@@ -73,6 +83,8 @@ class _Broker:
             "A2609": _tick("A2609", 10000, depth=depth),
             "A2611": _tick("A2611", 20000, depth=depth),
         }
+        if include_m:
+            self.ticks["M2609"] = _tick("M2609", 20000, depth=depth)
         self.account = AccountSnapshot(
             balance=100000,
             equity=100000,
@@ -112,10 +124,10 @@ class _Broker:
         pass
 
 
-def _manager(broker):
+def _manager(broker, *, products=("A",), weights=None):
     config = DirectionalConfig(
         enabled=True,
-        products=("A",),
+        products=products,
         exchanges=("DCE",),
         max_gross_leverage=2.0,
         max_contract_volume=5,
@@ -136,8 +148,8 @@ def _manager(broker):
         config,
         broker,
         risk,
-        signal_provider=_Provider(),
-        policy=_Policy(),
+        signal_provider=_Provider(products),
+        policy=_Policy(weights),
         aggressive_ticks=1,
     )
 
@@ -150,8 +162,6 @@ def test_manager_subscribes_universe_and_reduces_before_opening_new_main_contrac
     for tick in broker.ticks.values():
         manager.observe(tick)
 
-    # Global stale-quote monitoring tracks only live risk, not every observed catalog
-    # contract. Candidate opens still have explicit quote/depth checks in maybe_rebalance.
     assert manager.required_symbols() == {"A2609"}
 
     result = manager.maybe_rebalance(NOW)
@@ -170,6 +180,37 @@ def test_manager_subscribes_universe_and_reduces_before_opening_new_main_contrac
     assert all(order.offset is Offset.OPEN for order in broker.orders)
     assert broker.orders[0].symbol == "A2611"
     assert broker.orders[0].volume == 5
+
+
+def test_missing_new_target_cannot_block_unrelated_reduction():
+    broker = _Broker()
+    manager = _manager(broker, products=("A", "M"), weights={"M": 1.0})
+    manager.bootstrap(NOW)
+    for tick in broker.ticks.values():
+        manager.observe(tick)
+
+    result = manager.maybe_rebalance(NOW)
+    assert result.action == "reduce"
+    assert [order.symbol for order in broker.orders] == ["A2609"]
+    assert all(order.offset is not Offset.OPEN for order in broker.orders)
+
+
+def test_missing_target_with_existing_same_product_freezes_it_while_reducing_other_risk():
+    broker = _Broker()
+    broker.positions = [
+        ContractPosition("A2609", "DCE", long_today=2),
+        ContractPosition("M2609", "DCE", long_today=3),
+    ]
+    broker.specs["M2609"] = ContractSpec("M2609", "DCE", 10, 1, 0.1, 0.1)
+    # M is intentionally absent from catalog/ticks, so no new/roll M risk is available.
+    manager = _manager(broker, products=("A", "M"), weights={"M": 1.0})
+    manager.bootstrap(NOW)
+    for tick in broker.ticks.values():
+        manager.observe(tick)
+
+    result = manager.maybe_rebalance(NOW)
+    assert result.action == "reduce"
+    assert [order.symbol for order in broker.orders] == ["A2609"]
 
 
 def test_manager_fails_closed_when_opening_quote_depth_is_insufficient():
