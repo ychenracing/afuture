@@ -1,10 +1,16 @@
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from afuture.models import AccountState, ContractInfo, ContractSpec, Position, Tick
+from afuture.models import (
+    AccountSnapshot,
+    ContractInfo,
+    ContractPosition,
+    ContractSpec,
+    Tick,
+)
 from afuture.directional import (
     DirectionalConfig,
     DirectionalContractSelector,
@@ -68,7 +74,7 @@ def test_contract_selector_uses_point_in_time_oi_and_delivery_blackout():
         DirectionalConfig(enabled=True, products=("A",), min_days_to_expiry=20)
     )
     catalog = [
-        ContractInfo("A2609", "DCE", "A", "2026-09-15"),  # only 22 days
+        ContractInfo("A2609", "DCE", "A", "2026-09-15"),
         ContractInfo("A2611", "DCE", "A", "2026-11-15"),
         ContractInfo("A2701", "DCE", "A", "2027-01-15"),
     ]
@@ -78,7 +84,6 @@ def test_contract_selector_uses_point_in_time_oi_and_delivery_blackout():
         "A2701": _tick("A2701", 12000),
     }
     selected = selector.select(catalog, ticks, today)
-    # 2609 is still eligible at 22 days and wins by OI.
     assert selected["A"].symbol == "A2609"
 
     selector = DirectionalContractSelector(
@@ -89,8 +94,9 @@ def test_contract_selector_uses_point_in_time_oi_and_delivery_blackout():
 
 
 def test_target_lots_respects_weight_notional_and_contract_cap():
-    account = AccountState(
+    account = AccountSnapshot(
         balance=500000,
+        equity=500000,
         available=400000,
         margin=0,
         realized_pnl=0,
@@ -125,8 +131,8 @@ def test_target_lots_respects_weight_notional_and_contract_cap():
 
 def test_rebalance_plan_closes_old_or_excess_risk_before_opening():
     positions = [
-        Position("A2609", "DCE", long_today=5),
-        Position("M2609", "DCE", short_today=8),
+        ContractPosition("A2609", "DCE", long_today=5),
+        ContractPosition("M2609", "DCE", short_today=8),
     ]
     plan = build_rebalance_plan(
         positions,
@@ -136,7 +142,6 @@ def test_rebalance_plan_closes_old_or_excess_risk_before_opening():
         "A2609": -5,
         "M2609": 5,
     }
-    # No opening order may be emitted by the same phase while any reduction remains.
     assert plan.openings == {}
 
     flat_plan = build_rebalance_plan([], {"A2611": 6, "M2609": -3})
