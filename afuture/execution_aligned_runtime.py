@@ -184,6 +184,10 @@ class ExecutionAlignedDirectionalPortfolioManager(DirectionalPortfolioManager):
         except ValueError:
             return None
 
+    def _planned_trading_date(self, now: datetime) -> date:
+        """Prefer the CTP trading day, especially for the cross-calendar-date night session."""
+        return self._current_ctp_trading_date() or self._local(now).date()
+
     def _validate_activity_signal_alignment(
         self,
         raw: ExecutionAlignedSignalHistory,
@@ -342,13 +346,13 @@ class ExecutionAlignedDirectionalPortfolioManager(DirectionalPortfolioManager):
             action = "risk_off" if any(not item.empty for item in positions) else "reject"
             return DirectionalActionResult(action, f"directional signal unavailable: {exc}")
 
-        local_date = self._local(now).date()
+        planned_date = self._planned_trading_date(now)
         selected = (
             select_contracts_from_activity(
-                self.config, self._catalog, snapshot, local_date
+                self.config, self._catalog, snapshot, planned_date
             )
             if snapshot is not None
-            else self.selector.select(self._catalog, self._ticks, local_date)
+            else self.selector.select(self._catalog, self._ticks, planned_date)
         )
         required_products = {
             product.upper()
