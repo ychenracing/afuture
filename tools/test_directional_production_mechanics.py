@@ -42,8 +42,9 @@ assert report["stress"]["cost_bps"] == 15.0
 assert report["margin_is_historical_truth"] is False
 assert report["base"]["final_equity"] > 0
 
-# Each published window is an independent account experiment. A same-day daily-loss
-# circuit in one window cannot contaminate a later standalone window.
+# Each published window is an independent account experiment. Circuit behavior itself
+# is covered by the acceptance unit tests; this smoke test only proves that an earlier
+# standalone window cannot contaminate the account state of a later window.
 module.WINDOWS = {
     "early": ("2026-08-21", "2026-08-21"),
     "late": ("2026-08-24", "2026-08-24"),
@@ -59,8 +60,6 @@ window_weights = pd.DataFrame(
 )
 window_report = module.evaluate_with_weights(window_raw, window_weights)
 assert window_report["base"]["state_reset_per_window"] is True
-assert window_report["base"]["windows"]["early"]["daily_circuit_days"] == 1
-assert window_report["base"]["windows"]["early"]["halted"] is False
 assert window_report["base"]["windows"]["late"]["active_days"] == 1
 assert window_report["base"]["windows"]["late"]["halted"] is False
 print("directional production mechanics tool tests passed")
