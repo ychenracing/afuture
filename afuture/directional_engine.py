@@ -8,6 +8,7 @@ from .models import Order, RuntimeMode, Tick, Trade
 
 
 _ACCOUNT_RISK_REASONS = {
+    "equity is not positive",
     "daily loss limit reached",
     "drawdown limit reached",
     "margin ratio limit reached",
@@ -89,7 +90,7 @@ class DirectionalTradingEngine(TradingEngine):
         super().emergency_stop(reason)
 
     def _capture_quality_trade(self, trade: Trade) -> None:
-        # Directional expectations are registered at submission time.  They are enough to
+        # Directional expectations are registered at submission time. They are enough to
         # identify the fill; querying Broker.get_order() here creates an unnecessary
         # adapter dependency and can race order-cache propagation.
         expected = self.directional_manager.directional_order_expectation(
