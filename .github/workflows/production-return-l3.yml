@@ -13,6 +13,10 @@ on:
       - tools/evaluate_directional_production_mechanics.py
       - .github/workflows/production-return-l3.yml
 
+concurrency:
+  group: production-return-l3-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 permissions:
   actions: read
   contents: read
