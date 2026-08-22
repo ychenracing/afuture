@@ -1,0 +1,68 @@
+name: research-structural
+
+# Targeted structural L4. Isolated from broad, two-year calendar-spread and intraday
+# workflows so strategy iteration never re-runs unrelated expensive evidence.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "tools/fetch_structural_specific_daily.py"
+      - "tools/evaluate_structural_rotation_specific.py"
+      - "tools/test_structural_rotation_specific.py"
+      - ".github/workflows/research-structural.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: research-structural-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  structural-specific:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install akshare pandas
+      - name: Verify roll, cost, margin and leverage causality
+        run: python tools/test_structural_rotation_specific.py
+      - name: Fetch structural concrete daily contracts
+        run: python tools/fetch_structural_specific_daily.py
+      - name: Validate structural rotation on roll-safe contracts
+        run: |
+          python tools/evaluate_structural_rotation_specific.py
+          python - <<'PY'
+          import json
+          report = json.load(open("runtime/structural_specific_report.json", encoding="utf-8"))
+          assert report["specific_contracts"] is True
+          assert report["roll_safe"] is True
+          assert report["historical_l1_available"] is False
+          assert report["max_active_structures"] == 1
+          assert report["stress_cost_bps_one_way"] == 2 * report["base_cost_bps_one_way"]
+          assert report["selected_leverage"] <= report["max_gross_leverage"]
+          assert report["selected_leverage"] * max(report["margin_proxy"].values()) <= report["max_margin_ratio_proxy"]
+          print(json.dumps({
+              "pre_oos_pass": report["pre_oos_pass"],
+              "selected_leverage": report["selected_leverage"],
+              "stress_oos": report["stress_oos"],
+              "stress_full_recent": report["stress_full_recent"],
+              "extreme_full_recent": report["extreme_full_recent"],
+              "target": report["target"],
+          }, ensure_ascii=False, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: structural-roll-safe-evidence
+          path: |
+            runtime/structural_specific_daily_contracts.csv
+            runtime/structural_specific_daily_summary.csv
+            runtime/structural_specific_daily_failures.txt
+            runtime/structural_specific_selection.csv
+            runtime/structural_specific_report.json
+          retention-days: 14
