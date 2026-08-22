@@ -89,31 +89,46 @@ class DirectionalTradingEngine(TradingEngine):
         super().emergency_stop(reason)
 
     def _capture_quality_trade(self, trade: Trade) -> None:
-        order = self.broker.get_order(trade.order_id)
-        if (
-            order is not None
-            and str(order.request.reference).startswith("directional:")
-        ):
-            if self.quality is not None:
-                commission, source = self._quality_commission(trade)
-                self.directional_manager.note_directional_quality_fill(
-                    trade,
-                    commission=commission,
-                    commission_source=source,
-                )
+        # Directional expectations are registered at submission time.  They are enough to
+        # identify the fill; querying Broker.get_order() here creates an unnecessary
+        # adapter dependency and can race order-cache propagation.
+        expected = self.directional_manager.directional_order_expectation(
+            trade.order_id
+        )
+        if expected is not None:
+            commission, source = self._quality_commission(trade)
+            self.directional_manager.note_directional_quality_fill(
+                trade,
+                commission=commission,
+                commission_source=source,
+            )
             return
         super()._capture_quality_trade(trade)
+
+    def _handle_trade_event(self, trade) -> None:
+        expected = (
+            self.directional_manager.directional_order_expectation(trade.order_id)
+            if isinstance(trade, Trade)
+            else None
+        )
+        # Base handler owns validation, expected-position mutation, persistence and pair
+        # quality. Directional observability is layered around it, never instead of it.
+        super()._handle_trade_event(trade)
+        if expected is not None and not self.halted:
+            self.directional_manager._finalize_quality_cycle_if_settled(
+                self._reference_now()
+            )
 
     def _handle_order_event(self, order) -> None:
         super()._handle_order_event(order)
         if (
             isinstance(order, Order)
-            and str(order.request.reference).startswith("directional:")
+            and self.directional_manager.directional_order_expectation(order.order_id)
+            is not None
         ):
             self.directional_manager.note_directional_quality_order(order)
-            self.directional_manager._finalize_quality_cycle_if_settled(
-                self._reference_now()
-            )
+            # Do not finalize here. Some gateways publish terminal order status before the
+            # corresponding trade callback; finalizing would discard the fill expectation.
 
     def stop(self) -> None:
         try:
