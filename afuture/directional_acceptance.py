@@ -14,6 +14,7 @@ from typing import Mapping
 import pandas as pd
 
 from .directional import RebalancePlan
+from .directional_risk import DirectionalRiskGovernor
 
 
 PRODUCT_MULTIPLIERS: dict[str, float] = {
@@ -37,7 +38,7 @@ class ProductionMechanicsConfig:
     margin_estimate_buffer: float = 1.25
     max_margin_ratio: float = 0.35
     min_available_ratio: float = 0.25
-    max_contract_volume: int = 100
+    max_contract_volume: int = 35
     max_daily_loss_ratio: float = 0.05
     max_total_drawdown_ratio: float = 0.30
     min_days_to_delivery: int = 20
@@ -70,12 +71,23 @@ class ProductionSimulationResult:
     first_divergence: str = ""
 
 
+@dataclass(frozen=True)
+class PreparedDirectionalContracts:
+    """Immutable-by-convention indexes shared across independent account simulations."""
+
+    frame: pd.DataFrame
+    by_day_symbol: Mapping[tuple[pd.Timestamp, str], pd.Series]
+    activity_by_day: Mapping[pd.Timestamp, pd.DataFrame]
+    available_activity_days: pd.DatetimeIndex
+
+
 class DirectionalProductionAcceptance:
     """Pure deterministic mechanics used by tests and the final L4 proxy tool."""
 
     def __init__(self, config: ProductionMechanicsConfig | None = None) -> None:
         self.config = config or ProductionMechanicsConfig()
         self.config.validate()
+        self.risk_governor = DirectionalRiskGovernor()
 
     @staticmethod
     def _product(symbol: str) -> str:
@@ -192,14 +204,17 @@ class DirectionalProductionAcceptance:
         drawdown = max(0.0, high_watermark - equity) / high_watermark
         margin_ratio = max(0.0, float(margin)) / equity
         available_ratio = (equity - max(0.0, float(margin))) / equity
-        if daily_loss + 1e-12 >= self.config.max_daily_loss_ratio:
-            return "daily loss limit reached"
+        # Hard account solvency/risk gates outrank the recoverable daily circuit.
+        # Otherwise a large one-day loss could mask a simultaneous total-drawdown or
+        # margin breach and incorrectly make the account eligible to auto-recover.
         if drawdown + 1e-12 >= self.config.max_total_drawdown_ratio:
             return "drawdown limit reached"
         if margin_ratio > self.config.max_margin_ratio:
             return "margin ratio limit reached"
         if available_ratio < self.config.min_available_ratio:
             return "available cash reserve too low"
+        if daily_loss + 1e-12 >= self.config.max_daily_loss_ratio:
+            return "daily loss limit reached"
         return ""
 
     @staticmethod
@@ -225,26 +240,39 @@ class DirectionalProductionAcceptance:
             (frame["open"] > 0) & (frame["close"] > 0)
         ].copy()
 
-    def select_contracts_for_day(
-        self, raw: pd.DataFrame, target_day: pd.Timestamp
-    ) -> dict[str, str]:
+    def prepare_contracts(self, raw: pd.DataFrame) -> PreparedDirectionalContracts:
         frame = self._normalize_contracts(raw)
+        by_day_symbol = {
+            (pd.Timestamp(day).normalize(), str(symbol)): group.iloc[-1]
+            for (day, symbol), group in frame.groupby(
+                ["date", "symbol"], sort=False
+            )
+        }
+        activity_by_day = {
+            pd.Timestamp(day).normalize(): group
+            for day, group in frame.groupby("date", sort=False)
+        }
+        return PreparedDirectionalContracts(
+            frame=frame,
+            by_day_symbol=by_day_symbol,
+            activity_by_day=activity_by_day,
+            available_activity_days=pd.DatetimeIndex(sorted(activity_by_day)),
+        )
+
+    def _select_contracts_from_snapshot(
+        self, snapshot: pd.DataFrame, target_day: pd.Timestamp
+    ) -> dict[str, str]:
         day = pd.Timestamp(target_day).normalize()
-        prior_dates = frame.loc[frame["date"] < day, "date"]
-        if prior_dates.empty:
-            return {}
-        completed = pd.Timestamp(prior_dates.max()).normalize()
-        snapshot = frame[frame["date"] == completed].copy()
-        snapshot = snapshot[
+        eligible = snapshot[
             (snapshot["delivery"] - day).dt.days
             >= self.config.min_days_to_delivery
         ]
-        snapshot = snapshot[
-            (snapshot["volume"] >= self.config.min_volume)
-            & (snapshot["hold"] >= self.config.min_open_interest)
+        eligible = eligible[
+            (eligible["volume"] >= self.config.min_volume)
+            & (eligible["hold"] >= self.config.min_open_interest)
         ]
         result: dict[str, str] = {}
-        for product, rows in snapshot.groupby("product"):
+        for product, rows in eligible.groupby("product"):
             rows = rows.sort_values(
                 ["hold", "volume", "delivery", "symbol"],
                 ascending=[False, False, True, True],
@@ -252,6 +280,24 @@ class DirectionalProductionAcceptance:
             if not rows.empty:
                 result[str(product)] = str(rows.iloc[0]["symbol"])
         return result
+
+    def _select_contracts_from_normalized(
+        self, frame: pd.DataFrame, target_day: pd.Timestamp
+    ) -> dict[str, str]:
+        day = pd.Timestamp(target_day).normalize()
+        prior_dates = frame.loc[frame["date"] < day, "date"]
+        if prior_dates.empty:
+            return {}
+        completed = pd.Timestamp(prior_dates.max()).normalize()
+        snapshot = frame[frame["date"] == completed]
+        return self._select_contracts_from_snapshot(snapshot, day)
+
+    def select_contracts_for_day(
+        self, raw: pd.DataFrame, target_day: pd.Timestamp
+    ) -> dict[str, str]:
+        return self._select_contracts_from_normalized(
+            self._normalize_contracts(raw), target_day
+        )
 
     def _margin(
         self,
@@ -298,8 +344,9 @@ class DirectionalProductionAcceptance:
         weights: pd.DataFrame,
         *,
         cost_bps: float,
+        prepared: PreparedDirectionalContracts | None = None,
     ) -> ProductionSimulationResult:
-        frame = self._normalize_contracts(raw)
+        context = prepared or self.prepare_contracts(raw)
         weight_frame = weights.copy()
         weight_frame.index = pd.to_datetime(
             weight_frame.index, errors="coerce"
@@ -315,16 +362,14 @@ class DirectionalProductionAcceptance:
         ):
             raise ValueError("production mechanics weights exceed 2x gross")
 
-        by_day_symbol = {
-            (pd.Timestamp(day).normalize(), str(symbol)): group.iloc[-1]
-            for (day, symbol), group in frame.groupby(
-                ["date", "symbol"], sort=False
-            )
-        }
+        by_day_symbol = context.by_day_symbol
+        activity_by_day = context.activity_by_day
+        available_activity_days = context.available_activity_days
         equity = float(self.config.initial_capital)
         high_watermark = equity
         lots: dict[str, int] = {}
         previous_close: dict[str, float] = {}
+        completed_returns: list[float] = []
         halted = False
         first_divergence = ""
         output_rows: list[dict] = []
@@ -337,6 +382,8 @@ class DirectionalProductionAcceptance:
             turnover_notional = 0.0
             risk_reason = ""
             margin_reject = ""
+            daily_circuit = False
+            risk_scale = self.risk_governor.scale(completed_returns)
 
             if halted:
                 output_rows.append(
@@ -349,6 +396,8 @@ class DirectionalProductionAcceptance:
                         "margin": 0.0,
                         "risk_reason": first_divergence,
                         "margin_reject": "",
+                        "daily_circuit": False,
+                        "risk_scale": risk_scale,
                         "halted": True,
                     }
                 )
@@ -383,6 +432,8 @@ class DirectionalProductionAcceptance:
                         "margin": 0.0,
                         "risk_reason": risk_reason,
                         "margin_reject": "",
+                        "daily_circuit": False,
+                        "risk_scale": risk_scale,
                         "halted": True,
                     }
                 )
@@ -398,17 +449,32 @@ class DirectionalProductionAcceptance:
                 high_watermark=high_watermark,
                 margin=current_margin,
             )
-            if risk_reason and lots:
+            if risk_reason:
                 first_divergence = first_divergence or risk_reason
-                closing = {symbol: -volume for symbol, volume in lots.items()}
-                close_turnover = self._turnover(closing, open_prices)
-                turnover_notional += close_turnover
-                equity -= close_turnover * cost_rate
-                lots.clear()
-                halted = True
+                if lots:
+                    closing = {symbol: -volume for symbol, volume in lots.items()}
+                    close_turnover = self._turnover(closing, open_prices)
+                    turnover_notional += close_turnover
+                    equity -= close_turnover * cost_rate
+                    lots.clear()
+                if risk_reason == "daily loss limit reached":
+                    daily_circuit = True
+                else:
+                    halted = True
 
-            if not halted:
-                selected = self.select_contracts_for_day(frame, day)
+            if not halted and not daily_circuit:
+                activity_position = int(
+                    available_activity_days.searchsorted(day, side="left")
+                ) - 1
+                if activity_position < 0:
+                    selected = {}
+                else:
+                    completed_activity_day = pd.Timestamp(
+                        available_activity_days[activity_position]
+                    ).normalize()
+                    selected = self._select_contracts_from_snapshot(
+                        activity_by_day[completed_activity_day], day
+                    )
                 product_open: dict[str, float] = {}
                 selected_symbols: dict[str, str] = {}
                 for product, symbol in selected.items():
@@ -421,7 +487,7 @@ class DirectionalProductionAcceptance:
                     close_prices[symbol] = float(row["close"])
 
                 product_weights = {
-                    str(product).upper(): float(value)
+                    str(product).upper(): float(value) * risk_scale
                     for product, value in weight_row.items()
                 }
                 target = self.target_lots(
@@ -491,13 +557,18 @@ class DirectionalProductionAcceptance:
                     high_watermark=high_watermark,
                     margin=close_margin,
                 )
-                if risk_reason and lots:
+                if risk_reason:
                     first_divergence = first_divergence or risk_reason
-                    close_turnover = self._turnover(lots, close_prices)
-                    turnover_notional += close_turnover
-                    equity -= close_turnover * cost_rate
-                    lots.clear()
-                    halted = True
+                    if lots:
+                        closing = {symbol: -volume for symbol, volume in lots.items()}
+                        close_turnover = self._turnover(closing, close_prices)
+                        turnover_notional += close_turnover
+                        equity -= close_turnover * cost_rate
+                        lots.clear()
+                    if risk_reason == "daily loss limit reached":
+                        daily_circuit = True
+                    else:
+                        halted = True
 
             valuation_prices = close_prices if close_prices else open_prices
             margin = self._margin(lots, valuation_prices) if lots else 0.0
@@ -514,16 +585,21 @@ class DirectionalProductionAcceptance:
                 for symbol in lots
                 if symbol in close_prices
             }
+            daily_return = equity / previous_equity - 1.0
+            completed_returns.append(float(daily_return))
+            completed_returns = completed_returns[-2:]
             output_rows.append(
                 {
                     "date": day,
                     "equity": equity,
-                    "daily_return": equity / previous_equity - 1.0,
+                    "daily_return": daily_return,
                     "turnover_notional": turnover_notional,
                     "gross_notional": gross_notional,
                     "margin": margin,
                     "risk_reason": risk_reason,
                     "margin_reject": margin_reject,
+                    "daily_circuit": daily_circuit,
+                    "risk_scale": risk_scale,
                     "halted": halted,
                 }
             )
@@ -534,7 +610,8 @@ class DirectionalProductionAcceptance:
                 columns=[
                     "equity", "daily_return", "turnover_notional",
                     "gross_notional", "margin", "risk_reason",
-                    "margin_reject", "halted",
+                    "margin_reject", "daily_circuit", "risk_scale",
+                    "halted",
                 ]
             )
         else:

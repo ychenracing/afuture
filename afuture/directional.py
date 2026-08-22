@@ -32,7 +32,7 @@ class DirectionalConfig:
     min_days_to_expiry: int = 20
     min_volume: float = 1000.0
     min_open_interest: float = 5000.0
-    max_contract_volume: int = 100
+    max_contract_volume: int = 35
     rebalance_window: str = "21:00-21:10"
     signal_max_age_hours: float = 36.0
     account_exclusive: bool = True
