@@ -1,186 +1,194 @@
 # 架构与数据流
 
-## 目标
+## 1. 总体原则
 
-`afuture` 只保留一套正式交易链。Auto、研究、Shadow 和实盘复用相同的策略、风险和执行边界；旁路研究只负责证据，不获得第二套下单权限。
+`afuture` 只保留一套账户/订单/成交/持仓真相和一套统一风险治理，但现在支持两种**账户互斥**的策略模式：
 
-当前生产执行链只支持**同品种相邻月份跨期套利**。BU/FU、PP/V 等跨品种关系仅存在于研究层，不具备生产下单权限。
+- `calendar / auto`：同品种相邻月份跨期套利；
+- `directional`：冻结的 50 品种 execution-aligned 方向组合。
 
-```text
-                 Contract Catalog / Tick
-                         │
-                         ▼
-                  AutoPairManager
-       ┌─────────────┬───┴─────────────┐
-       │             │                 │
-       ▼             ▼                 ▼
- warm samples   candidate evidence   metadata prefetch
-       │             │                 │
-       └─────────────┴──────┬──────────┘
-                            ▼
-                    TradingEngine
-                            │
-                  CalendarSpreadStrategy
-                            │
-          PortfolioRisk + RiskManager
-                            │
-                       PairExecutor
-                            │
-             ┌──────────────┼──────────────┐
-             ▼              ▼              ▼
-          SimBroker     ShadowBroker     CtpBroker
-                                       (真实订单)
+配置加载阶段禁止 directional 与 static pairs/Auto 同时启用。两种模式最终都由 Broker 提供账户真相，由 `RiskManager`、TradingEngine 状态机、Kill Switch、Shadow 和审计边界治理。
 
-旁路研究：DataQuality → AutoPortfolioRunner → AutoPortfolioAcceptanceGate
-旁路证据：candidate / decision / round_trip → ExecutionQualityRecorder
-```
-
-## Auto 的职责边界
-
-`AutoPairManager` 只回答“哪个同品种相邻月组合可以获得开仓资格”：
-
-1. CTP/历史合约目录；
-2. 品种/交易所允许范围；
-3. 到期过滤；
-4. 每品种前几个有效月份；
-5. 相邻月组合；
-6. sampled bid/ask、volume、Open Interest、depth；
-7. executable Z-score、半衰期、平稳性；
-8. 后台预取真实 CTP 保证金/手续费；
-9. Net Edge；
-10. 少量排名入选组合。
-
-它不直接发订单，也不复制策略和风控。研究中出现的跨品种经济关系不会自动转化为 `AutoPairManager` 候选。
-
-## 管理权与开仓权
-
-动态组合存在两个不同概念：
-
-- **managed**：系统必须继续拥有并管理已有仓位；
-- **open-eligible**：当前 Auto hard gates 仍允许该组合增加新风险。
-
-已有仓位失去 Auto 资格时：
+## 2. Calendar Spread / Auto 数据流
 
 ```text
-managed = true
-open_eligible = false
-```
-
-因此组合可以继续正常/紧急退出，但不能在下一次扫描前重新开仓。平仓且无活动订单后立即 unregister。
-
-## 元数据不阻塞 Tick 主循环
-
-CTP 保证金/手续费查询可能需要等待响应。生产 Auto 扫描采用：
-
-```text
-统计/可成交阈值预筛
+CTP Catalog / Tick
         ↓
-metadata request queued
+AutoPairManager
+expiry → front-3 → adjacent months
         ↓
-当前 Tick 跳过该候选
+activity / sync / stationarity / half-life / Net Edge
         ↓
-后台单线程完成 CTP query
+CalendarSpreadStrategy
         ↓
-下一次 scan 使用缓存
+PortfolioRisk + RiskManager
+        ↓
+PairExecutor
+        ↓
+SimBroker / ShadowBroker / CtpBroker
 ```
 
-恢复已有动态仓位属于启动安全门，可以同步等待元数据；正常 Tick 关键路径不等待。交易日变化会使缓存失效并重新获取。
+`AutoPairManager` 只决定哪些同品种相邻月份组合具有开仓资格，不直接发订单。已有仓位失去资格时继续保持 managed，但立即失去 open-eligible 权限，直到退出后退役。
 
-## Warm History
-
-Auto 原始 Tick 先按 `sample_seconds` 桶化。只把有限的 `lookback + buffer` 样本写入：
+## 3. Execution-Aligned Directional 数据流
 
 ```text
-runtime/market_samples/
+Sina/AKShare 连续日线 OHLC
+        ↓
+ExecutionAlignedAggressivePolicy
+冻结 96-template pool
+        ↓
+前一收盘信号 + 已完成 intraday proxy meta score
+        ↓
+目标产品权重，gross <= 2.0x
+        ↓
+CTP Catalog + 实时 Tick
+        ↓
+DirectionalContractSelector
+point-in-time OI/volume + 20 天 expiry filter
+        ↓
+build_target_lots / build_rebalance_plan
+        ↓
+先减仓，再允许开仓
+        ↓
+RiskManager single-contract + batch account gates
+        ↓
+FAK → CtpBroker
 ```
 
-重启后先 warm-load，再继续收实时样本。不会将高频原始 Tick 或长期历史塞入主状态 JSON。
+### 冻结经济参数
 
-## 可成交价差
+生产 copy 固定：
 
-历史统计中心可以使用 mid spread，但交易动作必须使用方向性可成交价差：
+- 50 个品种 Universe，按代码字母序规范化；
+- specific-contract 历史选择后的 96 个模板；
+- family：breakout / tsmom / momentum / moving-average / reversal / acceleration；
+- meta lookback = 10；
+- meta rebalance = 5；
+- meta count = 3；
+- meta score source = 已完成的连续合约 `open→close` 日内代理；
+- gross target ≤ 2.0x。
+
+生产代码不在运行时重新做历史参数搜索。
+
+## 4. 因果时间边界
+
+Directional 的目标权重遵守：
 
 ```text
-LONG entry  = near.ask - far.bid
-SHORT entry = near.bid - far.ask
-LONG exit   = near.bid - far.ask
-SHORT exit  = near.ask - far.bid
+截至 t 日收盘可见数据
+        ↓
+计算 t+1 目标产品权重
+        ↓
+下一可交易时段使用当前 CTP 合约/盘口执行
 ```
 
-`PairExecutor` 再次计算 Net Edge，防止研究信号绕过真实成本门。
+历史 L4 对执行做更严格的分解：旧权重承担 `previous close → next open` gap，新目标权重承担 `next open → close`；换月收益始终来自上一决策日已选择的同一具体合约。
 
-## 风险与状态真相
+Final OOS 已被多轮观察，统一标记 `pristine_final_oos=false`。
 
-`RiskManager` 控制账户、动态手数、市场微观结构和保证金；`PortfolioRiskAnalyzer` 控制 risk group 和滚动相关性。
+## 5. 合约选择边界
 
-本地期望持仓只由本进程确认的成交推进，柜台完整持仓快照只用于对账。未知成交、未知活动订单或持仓漂移不会被自动接纳。
+### Calendar Spread
 
-异常状态：
+- CTP/历史 point-in-time catalog；
+- 到期过滤；
+- front-3；
+- 相邻月份；
+- 双腿同步盘口和活动度。
+
+### Directional
+
+- 配置只允许冻结的 50 品种；
+- 从 CTP catalog 中保留已挂牌、允许交易所、未进入交割黑窗的合约；
+- 使用当前实时 Tick 的 Open Interest、成交量选择具体合约；
+- 没有 fresh/eligible contract 时 fail closed，不为该次 rebalance 新增风险。
+
+L4 的 specific-contract 数据也使用 point-in-time OI/volume 和 20 天黑窗，避免连续合约换月跳空伪造收益。
+
+## 6. 风险权限
+
+`RiskManager` 仍是新增风险最终权限拥有者。
+
+Calendar pair 额外有：
+
+- `max_open_pairs`；
+- 双腿同步；
+- 双腿 depth；
+- pair calendar/session；
+- PairExecutor Net Edge。
+
+Directional 单合约新增风险依次经过：
+
+1. fresh quote；
+2. session；
+3. bid/ask width；
+4. top-of-book depth；
+5. limit-distance；
+6. 单合约手数上限；
+7. 账户日亏损/总回撤；
+8. 合计保证金率；
+9. 最小可用资金率；
+10. 报单频率。
+
+2.0x gross 只是策略目标上限，不会放宽任何账户风险门。
+
+## 7. 减仓优先与状态机
+
+Directional 调仓不会在同一阶段一边平旧合约一边加新风险：
+
+```text
+存在 reductions
+    ↓
+只发送 reducing FAK
+    ↓
+等待 Broker 确认后的下一周期
+    ↓
+无 reductions 才允许 openings
+```
+
+TradingEngine 继续维护：
 
 ```text
 RUNNING
-  ├─ 普通严重异常 → HALTED
-  └─ 裸腿/紧急退出失败 → REDUCE_ONLY → HALTED → 人工复核
+  ├─ 严重异常 → HALTED
+  └─ 需要退出的风险 → REDUCE_ONLY → HALTED
 ```
 
-Kill Switch、高水位、动态 pair 和策略状态都持久化；state envelope 带 schema / sequence / SHA-256 checksum。
+`DirectionalTradingEngine` 只扩展策略生命周期；状态文件、Kill Switch、账户检查、对账和 Broker 事件处理仍复用基础 `TradingEngine`。
 
-## Shadow 的安全边界
+## 8. Broker 真相
 
-`ShadowBroker` 组合：
+本地策略不自行推进“已成交仓位”。真实账户中的：
+
+- account；
+- active order；
+- trade；
+- position；
+
+全部以 Broker/CTP 回报为准。Directional manager 每次调仓都读取 Broker 当前持仓再计算 delta。
+
+## 9. Shadow
+
+`ShadowBroker` 仍然使用：
 
 ```text
-真实 CTP：catalog / tick / trading_day / metadata / health
-本地 SimBroker：account / position / order / trade
+真实 CTP：catalog / tick / trading_day / metadata / signal market context
+本地 SimBroker：account / order / trade / position
 ```
 
-`ShadowBroker.send_order()` 只调用 `SimBroker.send_order()`，从实现边界上禁止真实报单。每次 Shadow 会话使用独立虚拟账户和独立状态文件。
+Directional Shadow 与 Calendar Shadow 通过同一个 CLI runtime factory 进入对应 account-exclusive engine，但不会发真实 CTP 订单。
 
-## 证据链
+## 10. 研究与生产分离
 
-### Data Quality
+研究脚本可以搜索和比较更多模板；生产 policy 只包含冻结结果。最终高收益证据分三层：
 
-`data-check` 在研究前验证原始 CSV 顺序、断档、活动度、合约覆盖和每日 Auto 候选。
+1. broad L3：连续合约发现高收益 family；
+2. specific-contract L4：真实换月和 next-open 执行；
+3. production policy：把最终冻结公式复制为独立模块，避免后续研究改动静默改变实盘行为。
 
-### Auto Research
+最终 historical L4：2024-08-21~2026-08-20，5bp 单边，年化约 107.46%、最大回撤约 27.41%、gross ≤2x；但该结果具有显式选择偏差，Final OOS 并未独立通过。
 
-`accept-auto` 运行最终同品种 Auto 生产链，用于生产链本身的 Walk-forward/OOS/Stress 验证。
+## 11. 不增加的系统层
 
-跨品种经济关系研究属于旁路信号证据：先 broad L3，再 specific-contract roll-safe L4；即使信号存活，也必须另行完成生产执行设计、真实 L1 Shadow 和测试柜台证据，不能直接获得下单权限。
-
-### Robustness
-
-同品种 Auto 验收包含：
-
-- leave-one-product-out；
-- single-product attribution；
-- remove-best-OOS-period；
-- depth haircut；
-- latency / market impact；
-- data gap；
-- cross-leg quote skew；
-- volume/OI missing。
-
-### Execution Quality
-
-统一 JSONL 区分：
-
-- `candidate`：Auto 选择证据；
-- `decision`：风险与执行决定；
-- `round_trip`：预期与实际成交质量。
-
-这样 first divergence 可以定位到 selector / risk / execution，而不是只看到最终账户收益变化。
-
-## 当前研究治理状态
-
-2026-08-22 的最终研究收口已确认：
-
-- corrected M/OI 没有通过经济晋级门；
-- BU/FU specific-contract 研究信号存活，但远未达到 100% 年化且没有生产执行证据；
-- Final OOS 已被多轮研究观察，属于 non-pristine；
-- 失败的 cross-sectional、intraday 和 structural 实验代码已从长期维护面移除；
-- `research-2y`、`research-broad`、`research-specific-pairs` 都是手动 milestone 证据门，不是内循环 CI。
-
-## 不增加的系统层
-
-个人系统当前不需要数据库、消息队列、Web 服务、微服务或第二交易框架。当前瓶颈是未来新 OOS 与真实执行 Net Edge，而不是系统功能数量。
+项目仍不需要数据库、消息队列、Web 服务、微服务或另一套账户状态机。当前优先级是收益来源、真实执行质量和未来新数据，而不是系统体量。
