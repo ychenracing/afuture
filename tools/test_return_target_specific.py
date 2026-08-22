@@ -115,8 +115,55 @@ assert gross.max() <= 2.0 + 1e-12
 assert abs(replay.loc[dates[1]]) < 1e-12  # both legs move +10%
 assert abs(replay.loc[dates[2]]) < 1e-12
 
-# L4 config is frozen. It may recompute signals on roll-safe data but cannot reselect
-# a new pool from L4 returns to make the target easier.
+# The production-reproducible L4 path must separate the public continuous signal feed
+# from concrete-contract realized returns. Signal t-1 determines exposure for return t;
+# changing return t cannot retroactively alter that day's exposure.
+assert hasattr(evaluator, "simulate_frozen_continuous_signals")
+long_dates = pd.date_range("2024-01-01", periods=150, freq="B")
+signal_returns = pd.DataFrame(
+    {
+        "A": [0.012 if i % 5 else -0.004 for i in range(150)],
+        "M": [-0.010 if i % 7 else 0.005 for i in range(150)],
+    },
+    index=long_dates,
+)
+realized = pd.DataFrame(
+    {
+        "A": [0.01] * 150,
+        "M": [-0.01] * 150,
+    },
+    index=long_dates,
+)
+mini_template = evaluator.aggressive.DirectionalTemplate(
+    family="momentum",
+    slow=20,
+    fast=0,
+    max_products=1,
+    rebalance=1,
+    gross_leverage=2.0,
+)
+stream, audit = evaluator.simulate_frozen_continuous_signals(
+    signal_returns,
+    realized,
+    mini_template,
+    cost_bps=0.0,
+    return_audit=True,
+)
+changed_realized = realized.copy()
+changed_realized.iloc[80] = changed_realized.iloc[80] * -100.0
+stream_changed, audit_changed = evaluator.simulate_frozen_continuous_signals(
+    signal_returns,
+    changed_realized,
+    mini_template,
+    cost_bps=0.0,
+    return_audit=True,
+)
+assert audit.loc[long_dates[80]].to_dict() == audit_changed.loc[long_dates[80]].to_dict()
+assert stream.loc[long_dates[80]] != stream_changed.loc[long_dates[80]]
+assert float(audit.abs().sum(axis=1).max()) <= evaluator.MAX_GROSS_LEVERAGE + 1e-12
+
+# L4 config is frozen. It may recompute the frozen pool on the original continuous
+# signal feed, but it cannot reselect a new pool from L4 concrete-contract PnL.
 assert evaluator.FROZEN_SELECTION["selection_bias"] == "full_recent_target_fit"
 assert evaluator.PRISTINE_FINAL_OOS is False
 
