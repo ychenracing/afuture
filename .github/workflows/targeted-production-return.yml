@@ -24,3 +24,4 @@ jobs:
           python -m pytest -q
           tests/test_directional_risk_governor.py
           tests/test_directional_daily_recovery.py
+          tests/test_directional_acceptance_simulation.py
