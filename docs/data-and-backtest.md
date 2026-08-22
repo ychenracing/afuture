@@ -2,9 +2,9 @@
 
 ## 1. 数据层级
 
-### 生产 / 高质量回放
+### Tick / 生产级输入
 
-标准 Tick CSV：
+Calendar/Auto 的标准 Tick CSV：
 
 ```text
 timestamp,symbol,exchange,bid_price,ask_price,last_price,bid_volume,ask_volume,trading_day
@@ -18,32 +18,35 @@ limit_up,limit_down,volume,open_interest
 
 `timestamp` 必须带时区，中国期货交易时段统一按 `Asia/Shanghai` 解释。
 
-### 公开真实历史研究
+### Directional 信号与 L4
 
-仓库使用 AKShare/Sina 的 specific-contract 60 分钟或日线 OHLC、成交量和持仓量做信号级验证。公开源没有多年完整 L1 bid/ask/depth，因此这些结果**不能替代**真实盘口 Shadow、测试柜台或实盘成交证据。
+Directional 使用两类数据，职责不同：
 
-## 2. Data Quality Gate
+- **连续日线 OHLC**：只生成产品信号和历史 meta score；
+- **specific-contract OHLC / OI / volume**：用于真实换月语义和 next-open 执行验证。
 
-```bash
-afuture data-check \
-  --config config/afuture.auto-replay.example.toml \
-  --data path/to/data.csv
+公开源没有过去数年的完整 L1 bid/ask/depth，因此历史结果不能替代 CTP Shadow、测试柜台和真实成交证据。
+
+## 2. 因果规则
+
+任何正式研究至少满足：
+
+- t 日尚未完成的信息不能决定 t 日已经发生的收益；
+- continuous roll jump 不得计入可交易收益；
+- historical Universe 只能包含当时已挂牌合约；
+- specific-contract t→t+1 收益来自 t 日已选择的同一个具体合约；
+- Final OOS 若被调参过程观察过，必须标记 non-pristine。
+
+Directional 最终执行口径：
+
+```text
+截至 t 收盘的历史 → t+1 目标权重
+旧权重 × (t close → t+1 open)
++ 新权重 × (t+1 open → t+1 close)
+- t+1 open 调仓 turnover cost
 ```
 
-检查时间范围、交易日、duplicate/out-of-order、无效盘口、volume/OI 缺失、长断档、每日 Auto pair 和数据集中度。
-
-配置式历史回放可在 `[[contracts]]` 中提供：
-
-```toml
-listing = "2025-09-15"
-expiry = "2026-09-15"
-```
-
-`listing` 会进入 `ContractInfo`，用于 point-in-time Universe 防前视。
-
-## 3. Replay 与生产事件链
-
-`afuture replay` 复用生产边界：
+## 3. Calendar / Auto Replay
 
 ```text
 AutoPairManager
@@ -54,145 +57,142 @@ AutoPairManager
 → SimBroker
 ```
 
-关键时间语义：
+历史行情健康、裸腿超时和普通报单限速使用事件时间；SimBroker 旧单在当前 Tick 触发成交时，trade/order 回报先于同 Tick 的新策略决策。
 
-- 历史行情健康、裸腿超时和普通报单限速使用**事件时间**；
-- 实盘使用墙钟/单调时钟；
-- SimBroker 延迟旧单由当前 Tick 触发成交时，`trade/order` 回报必须先于同 Tick 的新策略决策。
+`afuture data-check` 负责乱序、断档、活动度、合约覆盖和 point-in-time Universe 基础门。
 
-这样不会把多年历史订单压缩成几秒 CPU 时间，也不会在 broker 已成交而 Engine 尚未收到成交事件时继续用同一行情重复决策。
+## 4. corrected M/OI 历史专项
 
-## 4. corrected 同品种 60 分钟研究
-
-`.github/workflows/research-2y.yml` 是昂贵的手动 L4 milestone gate。
-
-固定窗口：
+`.github/workflows/research-2y.yml` 保留为手动 milestone。修正交易日、完全同步时间戳、front-3、20 天黑窗、历史 listing 和 visible volume 后，旧同品种 M/OI 结论为：
 
 ```text
-prior1      2022-08-22~2023-08-20
-prior2      2023-08-21~2024-08-20
-train       2024-08-21~2025-08-20
-validation  2025-08-21~2026-02-20
-final OOS   2026-02-21~2026-08-20
+prior-forward             4 trades, -1.958R
+final OOS                  2 trades, +0.296R
+recent two years           5 trades, +1.028R
+neighbor stability         0 / 16
+2% risk proxy annualized   ≈ 1.07%
 ```
 
-### 中国期货交易日
+该结论没有被新的 directional 结果改写；它仍说明 M/OI calendar Alpha 本身没有达到高收益门。
 
-夜盘 `>=20:00` 映射到下一观察到的日盘交易日；尾部无法确认后续交易日时 fail-closed。
+## 5. 收益目标研究路线
 
-### 同步采样
+为追求年化 100%，研究从市场中性套利扩展到低 gross leverage 多品种方向组合，覆盖：
 
-冻结的日频规则只接受 `22:55-23:00` 内两腿**完全相同的 60 分钟 timestamp**；缺腿就是缺样本，不用 15:00 或其它时间补齐。
+- cross-sectional relative momentum；
+- time-series momentum；
+- moving-average trend；
+- breakout；
+- short-horizon reversal；
+- acceleration / slow-fast；
+- economic residual mean reversion；
+- 多腿结构关系和 intraday 实验。
 
-### 当时可见活动度
+失败的 intraday/structural 实验不进入生产维护面。
 
-`visible_volume` 是 mapped futures trading day 内截至采样时刻的累计成交量；OI 使用同步采样时刻值。
+## 6. Broad L3
+
+约 50 个成熟中国商品期货主连用于 family 搜索。市场中性多 Alpha 组合即使 2x gross 也没有接近目标；进一步允许方向性产品暴露并以收益优先选择后，连续合约 L3 曾达到约 123% 年化。
+
+该 L3 结果不能直接晋级，因为连续合约和 close-to-close 假设会高估真实换月/执行表现，所以必须进入 specific-contract L4。
+
+## 7. Specific-contract L4
+
+最终固定原始 L4 数据由 GitHub Actions 抓取：
 
 ```text
-min_volume = 1000
-min_open_interest = 5000
+products                 = 50
+candidate contract calls = 3000
+usable concrete contracts= 2540
+specific daily rows      ≈ 495086
+missing next returns     = 0 on final products
 ```
 
-### Point-in-time Universe
+合约规则：
 
-```text
-20-day delivery/expiry blackout
-→ front 3 eligible contracts
-→ adjacent pairs only
-```
-
-生产使用 CTP 官方 ExpireDate。公开历史 60 分钟源没有完整历史 ExpireDate，研究使用交割月 15 日作为显式保守 proxy。
-
-## 5. 单 Pair 与 Auto Portfolio
-
-`afuture accept` 只用于固定 pair 诊断；正式 Auto 研究使用：
-
-```bash
-afuture accept-auto ...
-```
-
-覆盖 Train→Validation→OOS、全局小邻域、成本压力、leave-one-product-out、single-product attribution、remove-best-period、depth haircut、latency/market impact、数据 gap、quote skew 和 activity missing。
-
-研究目标是泛化，不是单一区间最高收益。
-
-## 6. corrected M/OI 结果
-
-详见 [最终研究证据结论](research-final-evidence.md) 和 [两年真实数据验证结论](two_year_real_data_validation.md)。核心结果：
-
-```text
-prior-forward       = 4 trades, -1.958R
-final OOS            = 2 trades, +0.296R
-recent two years     = 5 trades, +1.028R
-neighbor stability   = 0 / 16
-2% risk proxy annualized ≈ 1.07%
-100% annualized target = NOT MET
-```
-
-所以原 M/OI 规则没有生产晋级。
-
-## 7. 扩展家族的分层研究
-
-### L3 broad economic-pair
-
-约 50 个中国商品期货主连首先用于低成本 broad screen。cross-sectional momentum / slow-fast / reversal / skewness 没有形成稳定家族，因此其实验代码已在最终清理中移除，只保留结论。
-
-随后只保留同交易所、经济关系明确的 pair，使用滚动 beta、残差 Z-score、相关性、OU 半衰期和 volatility regime。资本只分给当前最强的少量合格 pair，并把 gross leverage 封顶在 2x。
-
-`.github/workflows/research-broad.yml` 现在只保留这条有信息价值的经济关系 L3，且为手动 milestone gate。
-
-### L4 specific-contract roll-safe
-
-`.github/workflows/research-specific-pairs.yml` 对 L3 存活关系做具体合约复验：
-
-- 当日 OI/成交量选择具体合约；
+- point-in-time OI/volume；
 - 20 天交割黑窗；
-- t 日选择的合约必须同时提供 t 和 t+1 收益；
-- 换月时不把不同合约价格跳空拼成 Alpha；
-- 30bp 单边压力成本；
-- 最多 1 个 pair；
-- gross leverage ≤ 2x。
+- 只使用同一具体合约的下一交易日价格；
+- 不拼连续合约换月跳空；
+- gross notional ≤2x。
 
-六条预注册关系为 P/Y、PP/V、AL/ZN、BU/FU、CU/AL、J/JM。最终主要收敛到 BU/FU，prior 还包含 PP/V。
+## 8. Execution-aligned 最终策略
 
-已验证压力结果约为：
+最终生产研究参数固定：
 
-```text
-recent two-year annualized ≈ 4.20%
-recent two-year max drawdown ≈ 12.88%
-final OOS annualized ≈ 5.78%
-final OOS max drawdown ≈ 11.78%
-alpha_survives_specific_contract = true
-target_met = false
-```
+- Universe：50 品种，按代码字母序；
+- template pool：specific-contract next-open 历史选择后的 96 个模板；
+- family：breakout / tsmom / momentum / moving-average / reversal / acceleration；
+- meta lookback：10；
+- meta rebalance：5；
+- active templates：3；
+- meta score source：已完成的 continuous `open→close` intraday proxy；
+- base cost：5bp one-way；
+- stress cost：15bp one-way；
+- extreme cost：30bp one-way；
+- max gross：2.0x。
 
-这里的 `alpha_survives_specific_contract` 只证明研究信号经受住真实换月语义，不代表跨品种 pair 已接入生产执行。
+2024-08-21~2026-08-20 specific-contract / next-open：
 
-## 8. 被拒绝并清理的实验
+| 指标 | Base | Stress |
+|---|---:|---:|
+| 年化 | **107.46%** | **58.14%** |
+| 累计 | **317.54%** | **142.94%** |
+| 最大回撤 | **27.41%** | **32.96%** |
+| Sharpe | **1.69** | **1.22** |
 
-- BU/FU + PP/V 60 分钟 intraday：24 个预注册 profile，**0 个**通过 pre-OOS 门；
-- soybean crush、steel/coke margin、polymer/base-metals 等多腿结构：没有形成足够稳定且高收益的家族；
-- 失败实验不保留为长期维护代码，只在 `research-final-evidence.md` 和 cleanup inventory 中保留证据与拒绝原因。
+30bp extreme 最近两年约 9.96% 年化、46.76% 最大回撤。
 
-## 9. OOS 状态与后续研究
+## 9. 选择偏差与 Final OOS
 
-当前 Final OOS 已被多轮研究观察，代码和文档统一标记为 **non-pristine**。它不能再作为新功能的真正未见样本。
-
-后续只有以下新增信息能改变经济结论：
-
-- 新发生、此前未见的交易日；
-- 真实 CTP L1 Shadow；
-- 更可靠的历史 L1 数据；
-- 测试柜台/小资金真实成交质量。
-
-没有新增证据时，不继续扩大历史参数搜索空间，也不通过高杠杆制造年化 100% 的历史数字。
-
-## 10. 验证层级
+用户允许有限过拟合，因此最终模板池在已经观察过的最近两年 specific-contract 执行历史上做过收益优先筛选。报告必须同时记录：
 
 ```text
-L1  局部单测 / 因果回归
-L2  相关策略或模块 smoke
-L3  broad universe / family screen
-L4  specific-contract / 完整经济证据门
+selection_bias_acknowledged = true
+pristine_final_oos          = false
 ```
 
-普通小改动不反复触发 L3/L4；最终候选由主 CI 做完整工程验收。
+已观察 Final OOS（2026-02-21~2026-08-20）：
+
+```text
+base annualized   ≈ -10.73%
+base max drawdown ≈ 24.98%
+stress annualized ≈ -31.42%
+```
+
+因此 107.46% 只能称为“允许有限过拟合后达到的最近两年历史目标”，不能称为独立泛化证明。
+
+## 10. L4 与真实账户之间仍有差异
+
+L4 已修复连续合约和执行时点，但仍不是完整实盘复制：
+
+- 没有多年历史 L1 bid/ask/depth；
+- 没有部分成交、拒单和真实订单排队；
+- 研究按目标 notional 权重计算，不是针对某一账户逐日做整数手数、乘数、保证金和最小变动价位的完整资金曲线；
+- 生产 `RiskManager` 可能因账户保证金、深度、限价或单合约手数缩小目标。
+
+所以历史收益上限高于真实可兑现收益的风险必须通过 Shadow/测试柜台/小资金检验。
+
+## 11. 验证层级
+
+```text
+L1  单测 / 因果 / gross / roll 回归
+L2  策略与 runtime smoke
+L3  broad family search
+L4  specific-contract / next-open execution-aware 经济门
+Final 主 CI + code review
+```
+
+昂贵 L3/L4 不在每个小改动后重复。只有策略公式、成本、合约选择、执行时点或数据方法发生实质变化才重跑。
+
+## 12. 后续新增证据
+
+当前最有价值的新信息不是继续扩大历史参数空间，而是：
+
+1. 新发生的未来交易日；
+2. 多交易日 CTP Shadow；
+3. 测试柜台的真实 FAK、拒单、部分成交、断线与恢复；
+4. 小资金实际滑点、手续费和回撤；
+5. 如果能够获得，可靠的历史 L1 数据。
+
+最终收益证据详见 [`return-target-100-evidence.md`](return-target-100-evidence.md)。

@@ -1,0 +1,70 @@
+name: research-return-target-specific
+
+# Expensive 50-product concrete-contract L4 milestone gate. Official 2026-08-22
+# execution-aware evidence has completed; rerun manually only for a material change to
+# the frozen strategy, execution timing, contract selection, costs, or data methodology.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: research-return-target-specific-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  specific-return-target:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install akshare pandas numpy
+      - name: Verify execution timing and roll-safe causality
+        run: python tools/test_return_target_specific.py
+      - name: Rebuild baseline L3 directional evidence
+        run: |
+          python tools/fetch_broad_daily_universe.py
+          python tools/evaluate_aggressive_directional.py
+      - name: Fetch all concrete contracts needed for L4
+        run: python tools/fetch_return_target_specific_daily.py
+      - name: Validate next-open execution on roll-safe concrete contracts
+        run: |
+          python tools/evaluate_return_target_specific.py
+          python - <<'PY'
+          import json
+          report = json.load(open("runtime/return_target_specific_report.json", encoding="utf-8"))
+          assert report["specific_contracts"] is True
+          assert report["roll_safe"] is True
+          assert report["pristine_final_oos"] is False
+          assert report["max_gross_leverage"] <= 2.0
+          assert report["selection_frozen"] is True
+          assert report["execution_selection"]["pool_size"] == 32
+          assert report["execution_selection"]["effective_gross_leverage"] <= 2.0
+          print(json.dumps({
+              "execution_selection": report["execution_selection"],
+              "data_quality": report["data_quality"],
+              "close_to_close_diagnostic": report["close_to_close_diagnostic"],
+              "next_open_execution": report["next_open_execution"],
+              "target": report["target"],
+          }, ensure_ascii=False, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: return-target-specific-evidence
+          path: |
+            runtime/broad_daily_universe.csv
+            runtime/aggressive_directional_report.json
+            runtime/aggressive_directional_weights.csv
+            runtime/return_target_specific_contracts.csv
+            runtime/return_target_specific_summary.csv
+            runtime/return_target_specific_failures.txt
+            runtime/return_target_specific_selection.csv
+            runtime/return_target_execution_weights.csv
+            runtime/return_target_specific_report.json
+          retention-days: 14

@@ -1,23 +1,34 @@
 # 实盘、Shadow、停机与恢复
 
-## 1. 上线顺序
+## 1. 当前正式模式
 
-不要把“代码能连接 CTP”理解为“策略已经证明可盈利”。推荐顺序固定为：
+`afuture` 现在支持两种账户互斥的正式策略模式：
+
+- Calendar Spread / Auto：同品种相邻月份跨期套利；
+- Execution-Aligned Directional：冻结 50 品种的高收益方向组合。
+
+配置加载阶段禁止 directional 与 static pairs/Auto 同时启用。两种模式共用 Broker 账户真相、`RiskManager`、Kill Switch、`REDUCE_ONLY`、状态持久化和 CTP 安全门。
+
+代码级接线完成不等于真实资金已获批准。Directional 的 107.46% 是有明确选择偏差的历史 L4 结果；真实资金仍应按 Shadow → 测试柜台 → 极小仓位推进。
+
+## 2. 推荐上线顺序
 
 ```text
-多年份 data-check
-→ accept-auto
-→ Shadow
+历史 L4 / 配置验证
+→ 多交易日 Shadow
 → CTP doctor
-→ CTP 测试柜台订单/异常验证
+→ 测试柜台 FAK / 部分成交 / 拒单 / 断线验证
 → 极小真实仓位
-→ 多交易日 execution-quality 核对
-→ 再决定是否扩大风险预算
+→ execution-quality / 结算单核对
+→ 新发生未来数据复验
+→ 再决定是否扩大风险
 ```
 
-## 2. 密钥
+Directional 不应因为历史收益高就跳过任何执行门。
 
-CTP 账号只从环境变量读取：
+## 3. CTP 凭证与真实资金确认
+
+CTP 凭证只从环境变量读取：
 
 ```text
 AFUTURE_CTP_USER
@@ -27,253 +38,197 @@ AFUTURE_CTP_APP_ID
 AFUTURE_CTP_AUTH_CODE
 ```
 
-生产柜台还要求：
+真实生产还要求：
 
 ```text
 AFUTURE_LIVE_ACK=I_UNDERSTAND_FUTURES_RISK
 ```
 
-并显式传 `--confirm-live`。该确认同样适用于生产柜台的 Shadow/Doctor，因为它们仍会访问真实账户和行情，虽然不会发单。
+以及命令行 `--confirm-live`。
 
-## 3. Doctor：只检查，不下单
+## 4. Directional 配置
 
-```bash
-afuture doctor --config config/live.toml
+以：
+
+```text
+config/afuture.directional-live.example.toml
 ```
 
-检查：
+作为 test/Shadow 起点。该文件固定：
+
+- 50 品种 Universe；
+- gross target ≤2.0x；
+- 20 天合约到期过滤；
+- `20:55-09:10` 跨午夜 rebalance window；
+- 账户/保证金/现金/深度/涨跌停/订单频率硬门。
+
+`20:55-09:10` 是为了允许各品种在其第一个 fresh market session 完成日度调仓，不表示所有品种都能在同一秒成交。因此 historical next-open L4 仍是执行代理，不是对未来实盘成交时点的保证。
+
+## 5. Doctor：只检查，不下单
+
+```bash
+afuture doctor --config config/afuture.directional-live.example.toml
+```
+
+或 Calendar 配置的等价命令。
+
+Doctor 检查：
 
 - CTP 行情/交易登录；
 - fresh account event；
 - fresh complete position snapshot；
 - contract catalog；
-- 少量候选合约的 multiplier/price tick/margin/commission metadata。
+- multiplier / price tick / margin / commission metadata。
 
-输出包含：
+Doctor 不包含报单入口。
 
-```text
-ready
-trading_day
-account_equity
-position_count
-contract_catalog_count
-metadata_symbols
-orders_sent = 0
-```
-
-`doctor` 没有下单入口，不要把测试订单逻辑塞进 doctor。
-
-## 4. Shadow：真实市场，虚拟账户
+## 6. Shadow：真实市场，虚拟账户
 
 ```bash
-afuture shadow --config config/live.toml
+afuture shadow \
+  --config config/afuture.directional-live.example.toml \
+  --duration-seconds 3600
 ```
 
-Shadow 使用：
+Directional Shadow 使用：
 
-- 真实 CTP contract catalog；
-- 真实 Tick；
-- 真实 trading day；
-- 真实 margin/commission query；
-- 正式 AutoPairManager；
-- 正式 TradingEngine / RiskManager / PairExecutor。
+- 真实 CTP catalog；
+- 真实 Tick / trading day；
+- 真实合约 metadata；
+- 真实公开连续 OHLC 信号源；
+- 正式冻结 directional policy；
+- 正式当前合约选择、整数手数、风险门和调仓生命周期；
+- 本地 SimBroker 维护虚拟 account/order/trade/position。
 
-但账户、订单、持仓和成交由本地保守 SimBroker 维护。`ShadowBroker.send_order()` 不调用真实 CTP `send_order()`。
+`ShadowBroker.send_order()` 不调用真实 CTP `send_order()`。
 
-每次 Shadow 会话从新的虚拟账户开始，避免上次模拟持仓与新行情错配。Shadow sampled history 和执行证据与 Live 分开：
+## 7. Directional 日度信号刷新
+
+生产每天首次进入有效 rebalance window 时加载冻结 50 品种的连续 OHLC 历史。
+
+安全边界：
+
+- 数据不足 140 个交易日 → 拒绝本次新风险；
+- 信号时间来自未来 → 拒绝；
+- 数据超过 `signal_max_age_hours` → 拒绝；
+- 任一必需品种信号源获取失败 → 本次信号不可用，不新增风险。
+
+“拒绝本次新风险”不等于自动清空已有仓位。已有持仓仍由 Broker 真相、全局风险门、人工 Kill Switch 和 `REDUCE_ONLY` 管理；不要因外部日线源暂时失败而制造无计划强平。
+
+## 8. Directional 当前合约选择
+
+政策先产生产品权重，随后使用 CTP 当前目录和实时 Tick 选择具体合约：
+
+1. 产品/交易所允许；
+2. 已挂牌；
+3. 距到期不少于配置阈值；
+4. volume / Open Interest 达标；
+5. OI 优先、volume 次优选择主合约。
+
+缺少 eligible concrete contract 时，本周期对该目标 fail closed，不用旧的连续合约价格直接下单。
+
+## 9. 减仓先于加仓
+
+换月或目标变化时：
 
 ```text
-runtime/shadow_market_samples/
-runtime/shadow_execution_quality.jsonl
-runtime/shadow_audit.jsonl
-runtime/shadow_state.json
+当前 Broker 持仓
+→ 计算 target lots
+→ 如果有 reductions：只发 reducing FAK
+→ 等待 Broker 回报
+→ 下一周期重新读取真实持仓
+→ 无 reductions 后才允许 openings
 ```
 
-可限制一次观察时长：
+因此不会在同一个调仓阶段同时放大新风险并假定旧风险已经消失。
 
-```bash
-afuture shadow --config config/live.toml --duration-seconds 3600
-```
+## 10. 新增风险门
 
-汇总：
+Directional 每个新开合约都要通过：
 
-```bash
-afuture quality-report --config config/live.toml --shadow
-```
+- fresh quote；
+- rebalance session；
+- bid/ask spread；
+- top-of-book depth；
+- limit-distance；
+- 单合约 volume cap。
 
-## 5. 实盘启动安全门
+整个 opening batch 再通过：
 
-```bash
-afuture live --config config/live.toml
-```
+- 日亏损；
+- 总回撤高水位；
+- 当前/预计保证金；
+- 可用资金；
+- 单合约总持仓上限；
+- order-rate limiter。
 
-顺序：
+研究中的 2x gross 不会绕过这些门，生产目标可能被实际账户条件显著缩小。
 
-1. 创建 CTP 会话；
-2. 等待交易/行情登录和合约初始化；
-3. Auto 读取 CTP 合约目录，恢复仍需管理的动态 pair；
-4. warm-load 最近 sampled history；
-5. 等待 ready 之后新产生的账户事件和完整持仓快照；
-6. 静态 pair 比较本地/CTP 元数据；动态 pair 从 CTP 取真实元数据；
-7. 遗留活动订单存在则撤单并停机；
-8. 本地期望持仓与柜台完整快照逐合约对账；
-9. Kill Switch 只有本会话元数据、账户风险和对账全部通过才允许解除；
-10. 进入 `RUNNING`。
+## 11. REDUCE_ONLY 与停机
 
-固定 `sleep` 不能替代 snapshot generation marker。
-
-## 6. Auto 元数据查询不阻塞 Tick
-
-恢复已有动态仓位时可以在启动安全门同步查询元数据。
-
-正常运行中，候选接近开仓时：
+严重账户/行情/执行异常继续使用基础 TradingEngine 状态机：
 
 ```text
-statistical prefilter
-→ background metadata request
-→ current candidate skipped
-→ next scan consumes cache
+RUNNING
+→ REDUCE_ONLY（需要继续退出风险）
+→ HALTED
 ```
 
-CTP margin/commission query 不在 Tick 主循环中等待。交易日变化会清空缓存并重新刷新。
+Directional 在 `REDUCE_ONLY` 中只调用 flatten/reducing 路径，不允许新增目标风险。风险消失后系统停机等待人工复核。
 
-## 7. Warm History
+## 12. 启动对账
 
-Live 只保存桶化后的最近样本：
+真实 `live` 仍需要：
 
-```text
-runtime/market_samples/
-```
+1. CTP ready；
+2. fresh account snapshot；
+3. fresh complete position snapshot；
+4. 处理遗留活动订单；
+5. 本地状态与柜台持仓对账；
+6. Kill Switch/metadata/account gate 通过；
+7. 才进入 `RUNNING`。
 
-上限约为 `lookback * 4` 级别，不保存长期原始 Tick。重启后新候选可以从最近 sampled history 恢复，不必完全从零等待。
+Directional manager 不维护第二份“策略持仓真相”，每次都读取 Broker 持仓计算差额。
 
-## 8. Auto 退役
+## 13. 历史结果和实盘差异
 
-必须区分：
+最终 L4 已处理 specific-contract、换月和 next-open 时点，但仍没有多年历史完整 L1：
 
-```text
-managed
-open-eligible
-```
-
-组合有仓位时即使 ranking/hard gate 失效，仍保持 `managed=true`，保证原策略能退出；同时立刻 `open-eligible=false`，不能在退出后的下一次 scan 前重新开仓。
-
-平仓且无活动订单后立即 unregister。
-
-## 9. 行情健康
-
-实盘使用墙钟，因此能够发现：
-
-- 单腿延迟；
-- 双腿时间差超限；
-- 两腿同时停止推送；
-- 行情 timestamp 未来漂移。
-
-仅在组合配置的活跃 session 中执行陈旧行情门，并保留启动初始化宽限。
-
-## 10. REDUCE_ONLY
-
-跨合约订单不是原子操作。出现双腿失衡或紧急退出失败时：
-
-```text
-RUNNING → REDUCE_ONLY
-```
-
-REDUCE_ONLY：
-
-- 撤活动订单；
-- 禁止新开仓；
-- FAK 只减仓；
-- 每轮继续审计；
-- 风险消失后转 `HALTED`；
-- 必须人工复核后才能恢复。
-
-封板/无流动性时，`HALTED` 不代表裸腿已消失。
-
-## 11. Execution Quality
-
-Live：
-
-```text
-runtime/execution_quality.jsonl
-```
-
-三类事件：
-
-### candidate
-
-- pair；
-- zscore；
-- stationarity；
-- half-life；
-- volume/OI；
+- bid/ask；
 - depth；
-- candidate score；
-- expected Net Edge；
-- reject reason。
-
-### decision
-
-- signal action；
-- risk size；
-- accepted/rejected；
-- executor reject reason。
-
-### round_trip
-
-- expected spread；
-- entry/exit realized spread；
-- slippage；
-- commission；
-- leg latency；
+- queue position；
 - partial fill；
-- rollback；
-- REDUCE_ONLY；
-- realized edge。
+- reject；
+- CTP/交易所流控；
+- 真实结算手续费。
 
-```bash
-afuture quality-report --config config/live.toml
-```
+而且 L4 使用目标 notional 权重，不是某个账户逐日按真实 multiplier、整数手数和保证金完全重建的资金曲线。因此 107.46% 年化不能直接视为可兑现实盘收益。
 
-CTP trade callback 通常不直接提供结算单意义上的单笔实际手续费。系统质量证据应使用**实际成交价 + 已实时查询的账户费率**估算，并定期与期货公司结算单核对。差异持续明显时，应修正费用模型或停止该品种，而不是调高风险预算掩盖偏差。
+## 14. 测试柜台必须验证
 
-## 12. 人工恢复
+GitHub CI 不能伪造以下证据：
 
-只有已经通过期货公司终端核验真实仓位时：
-
-```text
-AFUTURE_RECOVERY_ACK=I_VERIFIED_CTP_POSITIONS
-```
-
-```bash
-afuture recover-state \
-  --config config/live.toml \
-  --confirm-adopt-state
-```
-
-生产环境同时需要 `--confirm-live`。
-
-恢复只接受：
-
-- 静态配置 pair 或状态中已持久化的动态 pair；
-- 双腿等量反向；
-- 手数不超过 pair cap；
-- 无活动订单。
-
-恢复后 Kill Switch **不解除**，`metadata_verified` 清空；下一次 `live` 必须重新连接、重新查元数据并独立对账。
-
-## 13. 测试柜台必须人工/真实完成的项
-
-仓库没有你的 BrokerID、账号、前置地址和权限，因此以下结果不能由 CI 伪造：
-
-- 实际登录；
-- FAK 下单/撤单；
+- FAK 开仓/平仓；
 - 部分成交；
 - 拒单；
 - 平今/平昨；
 - 断线重连；
 - 夜盘跨交易日；
-- 期货公司查询/报单流控差异；
-- 实际结算手续费。
+- 合约 metadata 查询；
+- query/order rate；
+- directional 多合约调仓；
+- 实际手续费。
 
-这些必须按 `production-checklist.md` 在测试柜台留下证据后再进入极小真实资金。
+这些通过后才进入极小真实仓位。
+
+## 15. 实盘扩仓原则
+
+第一次真实资金不要直接使用研究中 2x gross 的完整目标。先用最小手数和严格 `max_contract_volume` 证明：
+
+- 实际成交方向与 target 一致；
+- 换月行为正确；
+- modeled vs realized cost 可接受；
+- 真实回撤没有明显超出预期；
+- 外部持仓/手工交易不会破坏 account-exclusive 假设。
+
+只有新的真实执行证据支持后，才逐步扩大。

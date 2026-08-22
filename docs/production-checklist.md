@@ -1,126 +1,154 @@
 # 生产上线检查表
 
-这份表是**真实资金上线门**，不是代码完成清单。没有外部账户、真实 L1/成交与未来未见数据时，项目 CI 不能代替其中的人工证据。
+这份表是**真实资金上线门**，不是代码完成清单。GitHub CI 和历史回测不能代替真实 L1、测试柜台和未来未见数据。
 
-> 当前状态：**没有任何 Alpha 已获得生产晋级**。corrected M/OI 没通过经济门；BU/FU 等跨品种关系仅有研究级 specific-contract 证据，尚未接入生产执行，也没有真实 L1 Shadow/测试柜台证据。以下检查表用于未来某个策略真正取得新 OOS 证据后的上线流程，不能被解释为当前可以直接放大风险。
+> 当前状态：Execution-Aligned Directional 已完成代码级生产接线，并在允许有限历史过拟合的 specific-contract / next-open L4 上达到最近两年 **107.46% 年化 / 27.41% 最大回撤 / gross ≤2x**。但 Final OOS 已观察且为负，真实 L1/测试柜台/小资金证据尚未完成。因此“历史收益目标已达到”不等于“可以直接按研究风险满仓实盘”。
 
-## A. 数据与 Auto Portfolio 研究
+## A. 历史证据与选择偏差
 
-- [ ] 使用新的、此前未用于调参的 OOS/未来数据；当前 2026-02-21~2026-08-20 窗口已经被多轮研究观察，不能再次称为 pristine holdout。
-- [ ] 数据至少覆盖足够的不同市场状态、多个交割月份和换月周期。
-- [ ] bid/ask/depth/volume/OI/trading_day 基本完整，或对缺失字段的代理边界有显式说明。
-- [ ] `afuture data-check` 无 hard failure。
-- [ ] 原始 CSV 无未解释乱序。
-- [ ] 每个计划交易日都有真实双腿候选数据，而不是只有静态 catalog。
-- [ ] 单一品种没有无意中垄断绝大多数样本。
-- [ ] 若生产仍使用同品种 Auto，`afuture accept-auto` 使用最终 Auto Portfolio，而不是只看固定 pair。
-- [ ] 参数只由 Train+Validation 选择，真正未见 OOS 不参与调参。
-- [ ] Aggregate OOS Return > 0。
-- [ ] Positive OOS Fold Ratio 达到事前预注册门。
-- [ ] Worst OOS Drawdown 不超过事前预注册门。
-- [ ] OOS 交易样本量足够，不由极少数交易支撑结论。
-- [ ] 1.5x / 2x cost stress 没有不可接受崩塌。
-- [ ] Leave-one-product-out / attribution / remove-best-period 不显示单一历史赢家依赖。
-- [ ] Depth haircut / latency / market impact / data-gap / quote-skew / activity-missing stress 可接受。
+- [x] specific-contract 数据不使用连续合约换月跳空作为收益。
+- [x] t→t+1 收益来自 t 日已选同一具体合约。
+- [x] 20 天交割黑窗。
+- [x] gross target ≤2.0x。
+- [x] 5bp base 最近两年年化 ≥100%。
+- [x] base 最近两年最大回撤 <30%。
+- [x] 15bp stress 最近两年仍为正。
+- [x] 明确记录 `pristine_final_oos=false`。
+- [x] 明确记录模板池存在历史选择偏差。
+- [ ] 新发生、此前未参与任何选择的未来数据继续验证方向和回撤。
+- [ ] 如果未来结果持续显著恶化，降低或关闭 directional，而不是继续在同一历史上追参数。
 
-## B. Shadow Observation
+## B. Directional 配置冻结
 
-- [ ] `afuture shadow` 已连续运行多个真实交易日。
-- [ ] Shadow 使用真实 CTP contract catalog。
-- [ ] Shadow 使用真实账户 margin/commission metadata。
-- [ ] 已人工确认 Shadow 没有真实订单/真实成交。
-- [ ] `shadow_execution_quality.jsonl` 有 candidate / decision / round_trip 证据。
-- [ ] 实时盘口中的 candidate 数量与历史研究假设大体一致。
-- [ ] 大多数可交易机会的实际 bid/ask 没有把 Net Edge 完全吃掉。
-- [ ] Shadow modeled slippage 在可接受范围。
-- [ ] Shadow 没有频繁 metadata timeout / stale quote / cross-leg skew 停机。
+- [ ] 使用 `config/afuture.directional-live.example.toml` 的 50 品种 Universe，未擅自删改品种来追最近收益。
+- [ ] `directional.max_gross_leverage <= 2.0`。
+- [ ] directional 与 static pairs / Auto 不同时启用。
+- [ ] 没有其他程序或手工交易与 directional 共用同一账户，或已建立可靠的外部持仓隔离流程。
+- [ ] `signal_max_age_hours` 能覆盖正常周末/节假日，同时能发现真正陈旧数据。
+- [ ] 目标交易所和品种均已开通交易权限。
+- [ ] 夜盘/日盘实际时段与 `rebalance_window` 经过测试柜台验证。
 
-## C. CTP Doctor
+## C. Directional 信号源
+
+- [ ] 50 个连续 OHLC 品种在 Shadow 中连续多日获取成功。
+- [ ] 信号数据日期与中国交易日语义人工抽查一致。
+- [ ] 周末/节假日没有被误判未来数据或异常陈旧。
+- [ ] 单个/多个信号源失败时不会产生新风险。
+- [ ] 信号恢复后不会因为缺口生成明显异常权重。
+- [ ] meta 轮动与离线冻结 policy 输出做过同日对比。
+
+## D. CTP Contract Selector
+
+- [ ] CTP catalog 覆盖冻结 50 品种。
+- [ ] 实时 OI/volume 能为当前目标品种选出合约。
+- [ ] 距到期过滤符合实际最后交易日规则。
+- [ ] 选出的 symbol multiplier / price tick / margin 正确。
+- [ ] 合约换月日先减旧风险，再在下一周期开新合约。
+- [ ] 无 eligible contract 时 fail closed，不以连续合约代码报单。
+- [ ] 低流动性品种的 volume/OI 门按真实盘口重新审查。
+
+## E. Shadow Observation
+
+- [ ] `afuture shadow --config config/afuture.directional-live.example.toml` 连续运行多个真实交易日。
+- [ ] Shadow 使用真实 CTP catalog / tick / metadata。
+- [ ] 已人工确认 Shadow 不调用真实 CTP send_order。
+- [ ] 每日 target products / selected contracts / target lots 可解释。
+- [ ] 实际盘口 depth 能覆盖计划手数。
+- [ ] 模拟 bid/ask/slippage 没有吞掉大部分历史 Alpha。
+- [ ] 没有频繁 stale quote、metadata、signal feed 导致的运行中断。
+- [ ] 换月和目标反转没有出现同周期先加后减风险。
+
+## F. CTP Doctor
 
 - [ ] `afuture doctor` 登录通过。
 - [ ] Fresh account snapshot 到达。
 - [ ] Fresh complete position snapshot 到达。
-- [ ] Contract catalog 非空且品种/月份合理。
-- [ ] 少量目标合约 multiplier / price tick 查询正确。
-- [ ] margin / commission query 返回合理。
-- [ ] Doctor 输出 `orders_sent = 0`。
+- [ ] Contract catalog 非空。
+- [ ] 目标合约 multiplier / price tick 正确。
+- [ ] margin / commission query 合理。
+- [ ] Doctor 输出/人工确认没有任何报单。
 
-## D. 测试柜台真实订单验证
+## G. 测试柜台真实订单
 
-这些项目不能由 GitHub CI 模拟成“已通过”。
+以下项目不能由 CI 伪造：
 
-- [ ] 测试柜台 FAK 开仓报单成功。
-- [ ] 撤单成功。
-- [ ] 部分成交场景已验证。
-- [ ] 第二腿拒单/失败后第一腿撤单/回滚行为已验证。
-- [ ] 裸腿能进入 `REDUCE_ONLY`。
-- [ ] REDUCE_ONLY 只减仓，不会继续新增风险。
-- [ ] 平今/平昨拆单与柜台一致。
-- [ ] 未知活动订单触发停机。
-- [ ] 未知成交触发停机。
-- [ ] 持仓漂移触发停机。
-- [ ] 断线触发停机。
-- [ ] 快照陈旧触发停机。
-- [ ] 新交易日 margin/commission cache 重新刷新。
-- [ ] 动态 pair 重启恢复后仍能正确管理原仓位。
-- [ ] CTP query/order rate 没有触发期货公司异常限制。
+- [ ] 单方向 FAK 开仓成功。
+- [ ] FAK 未成交/部分成交状态正确。
+- [ ] 平仓成功，平今/平昨与柜台一致。
+- [ ] 多产品 opening batch 的真实 order-rate 合理。
+- [ ] 任一开仓拒单后系统下一周期按 Broker 真实持仓重新计算目标。
+- [ ] 换月 reduction 完成前不会开新合约风险。
+- [ ] 活动订单存在时 rebalance 等待。
+- [ ] 未知订单/成交/持仓漂移触发安全停机。
+- [ ] 断线、行情陈旧、快照陈旧触发正确状态。
+- [ ] `REDUCE_ONLY` 只减仓。
+- [ ] 交易所/期货公司查询与报单流控没有被程序打爆。
 
-## E. 自动发现生命周期
+## H. Directional 风险参数
 
-- [ ] `auto.products` 只包含愿意真实交易且账户已开通、已有新证据支持的品种。
-- [ ] 不使用 `products=["*"]` 作为第一阶段生产配置。
-- [ ] 到期过滤得到的月份符合真实最后交易日。
-- [ ] 新进入前排月份会自动订阅。
-- [ ] 已持仓 pair 排名下降不会被强制轮换平仓。
-- [ ] 已持仓但失去 hard gate 的 pair 立刻失去**新开仓**权限。
-- [ ] 该 pair 平仓后立即退役，不等待下一次 scan 再决定。
-- [ ] Warm sampled history 在重启后恢复。
-- [ ] 正常 Tick 主循环不会同步等待 CTP margin/commission query。
+- [ ] `max_margin_ratio` 按真实账户校准，不能因为研究 gross=2x 就放宽账户保证金门。
+- [ ] `min_available_ratio` 留有足够现金缓冲。
+- [ ] `max_daily_loss_ratio` 已接受并理解。
+- [ ] `max_total_drawdown_ratio` 不高于愿意实际承受的账户回撤。
+- [ ] 第一阶段 `max_contract_volume` 显著低于研究上限，优先从 1 手或最小合理手数开始。
+- [ ] top-of-book depth multiple 足够保守。
+- [ ] bid/ask ticks 和 limit-distance 在目标品种上合理。
+- [ ] 没有通过提高 leverage 超过 2x 来修复实盘收益差距。
 
-## F. 风险配置
+## I. Integer Lots / Account Sizing Gap
 
-- [ ] 最大保证金率按真实账户和目标策略重新设置。
-- [ ] 最小可用资金率按真实账户重新设置。
-- [ ] 日亏损门已接受并理解。
-- [ ] 总回撤 Kill Switch 已接受并理解。
-- [ ] 单 pair risk budget 已按真实品种波动与真实执行质量校准。
-- [ ] `max_active_pairs` 第一阶段保持 1。
-- [ ] 单合约手数第一阶段保持 1 手或交易所允许的最小风险规模。
-- [ ] 只启用已经有 Shadow/测试柜台证据覆盖的 session；没有夜盘证据时不启用夜盘真实开仓。
-- [ ] bid/ask、depth、limit-distance、cross-leg skew 门在目标品种上合理。
-- [ ] 不通过提高杠杆/风险预算把未达标的历史收益放大成目标收益。
+历史 L4 是目标 notional 权重，不是某个真实账户完整逐日整数手数资金曲线。上线前必须：
 
-## G. Execution Quality
+- [ ] 用真实账户 equity、每个合约 multiplier 和当前价格检查目标手数。
+- [ ] 小资金账户不会因整数手数导致单品种权重严重失真。
+- [ ] 单合约 cap 不会让实际组合长期只剩一两个品种。
+- [ ] 保证金门缩量后的实际 gross 与预期一致。
+- [ ] 如果账户规模不足以复制多品种权重，先降低目标复杂度/风险，而不是放宽风控。
 
-- [ ] Live `execution_quality.jsonl` 正常写入。
-- [ ] candidate reject reason 可解释。
-- [ ] modeled vs realized entry spread 已核对。
-- [ ] median slippage 不高于预算。
-- [ ] p95 slippage 有明确上界。
-- [ ] realized commission 已与期货公司结算单抽样核对。
-- [ ] realized Net Edge 没有长期明显低于 expected Net Edge。
-- [ ] rollback 次数可接受。
-- [ ] REDUCE_ONLY 次数接近 0，任何一次都有人复盘。
+## J. Calendar / Auto 模式（若单独启用）
 
-## H. 极小真实资金
+Directional 与 Calendar/Auto 账户互斥。若另用独立账户运行原套利模式：
 
-- [ ] 第一阶段只交易 1 个 active pair。
-- [ ] 每腿从 1 手或交易所允许的最小风险规模开始。
-- [ ] 连续多个交易日无状态/持仓/对账事故。
-- [ ] 实际手续费和滑点与 Shadow 预期同量级。
-- [ ] 没有因为手工交易或其他程序造成外部持仓漂移。
-- [ ] 扩大前重新执行 quality report 和账户风险复核。
+- [ ] `afuture data-check` 无 hard failure。
+- [ ] `accept-auto` 使用最终 Auto Portfolio。
+- [ ] Auto 到期/front-3/adjacent-month 生命周期正确。
+- [ ] warm history 正常恢复。
+- [ ] metadata prefetch 不阻塞 Tick。
+- [ ] managed 与 open-eligible 分离。
+- [ ] 双腿部分成交/回滚/REDUCE_ONLY 在测试柜台验证。
 
-## I. Feature Freeze
+旧 corrected M/OI 本身未通过高收益经济门，不应因为 directional 达标而被错误提升风险。
 
-只有以下全部满足后才扩大资金；同时停止继续添加策略功能：
+## K. Execution Quality 与结算单
 
-- [ ] 新的未见 OOS 稳定。
-- [ ] Robustness 稳定。
+- [ ] Live 审计正常写入。
+- [ ] 每日 target weight → target lot → actual position 可追溯。
+- [ ] 实际成交价相对决策盘口滑点可统计。
+- [ ] 真实手续费与期货公司结算单抽样一致。
+- [ ] 真实 rebalance turnover 没有明显高于历史假设。
+- [ ] 真实 gross、保证金、可用资金变化可解释。
+- [ ] REDUCE_ONLY / rollback / reject 次数可接受并逐次复盘。
+
+## L. 极小真实资金
+
+- [ ] 第一阶段只用愿意完全损失也不影响整体资金的测试规模。
+- [ ] 单合约从 1 手或最小合理风险开始。
+- [ ] 连续多个交易日无状态/订单/持仓事故。
+- [ ] 换月真实行为正确。
+- [ ] 实际交易成本没有明显超过 15bp 压力场景所隐含的容忍度。
+- [ ] 实际回撤在预注册缩小风险门内。
+- [ ] 扩大资金前重新做账户级 stress 和 quality review。
+
+## M. 扩大风险前的最终门
+
+只有以下全部满足后才考虑扩大：
+
+- [ ] 新发生未来数据没有持续推翻 Alpha。
 - [ ] Shadow 稳定。
 - [ ] 测试柜台稳定。
 - [ ] 极小真实仓位稳定。
-- [ ] Execution Quality 没有吞掉大部分 Alpha。
-- [ ] 实盘回撤符合预注册风险门。
+- [ ] 真实 execution cost 可接受。
+- [ ] Integer lot / multiplier / margin 后的实际组合没有严重漂移。
+- [ ] 实盘回撤符合账户风险预算。
 
-达到 Freeze 后，不再为了提高历史收益增加 ML、AI 选标、新策略类型、全市场 Universe 或在线调参。后续以维护、新数据复验和 CTP/交易所变化适配为主。
+达到上述门后，以真实证据逐步调整风险；不要把 107.46% 历史年化当成必须在每个未来年度兑现的固定指标。
