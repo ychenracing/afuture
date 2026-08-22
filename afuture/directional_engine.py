@@ -1,10 +1,10 @@
-"""Minimal TradingEngine extension for the account-exclusive directional portfolio."""
+"""TradingEngine extension for the account-exclusive directional portfolio."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
 from .engine import TradingEngine
-from .models import RuntimeMode, Tick
+from .models import Order, RuntimeMode, Tick, Trade
 
 
 _ACCOUNT_RISK_REASONS = {
@@ -25,19 +25,13 @@ class DirectionalTradingEngine(TradingEngine):
 
     def initialize_after_ready(self) -> None:
         super().initialize_after_ready()
-        if (
-            not self._initialized
-            or self.halted
-            or self._directional_initialized
-        ):
+        if not self._initialized or self.halted or self._directional_initialized:
             return
         try:
             self.directional_manager.bootstrap(self._reference_now())
             self._directional_initialized = True
         except Exception as exc:
-            self.emergency_stop(
-                f"directional initialization failed: {exc}"
-            )
+            self.emergency_stop(f"directional initialization failed: {exc}")
 
     def on_tick(self, tick: Tick) -> None:
         try:
@@ -85,9 +79,6 @@ class DirectionalTradingEngine(TradingEngine):
             self.emergency_stop(f"directional rebalance failed: {exc}")
 
     def emergency_stop(self, reason: str) -> None:
-        # Calendar-spread behavior stays in TradingEngine. Only account-risk breaches in
-        # account-exclusive directional mode transition through REDUCE_ONLY so existing
-        # directional exposure is actively removed instead of being stranded by HALTED.
         if (
             reason in _ACCOUNT_RISK_REASONS
             and hasattr(self, "directional_manager")
@@ -96,6 +87,33 @@ class DirectionalTradingEngine(TradingEngine):
             self.enter_reduce_only(reason)
             return
         super().emergency_stop(reason)
+
+    def _capture_quality_trade(self, trade: Trade) -> None:
+        order = self.broker.get_order(trade.order_id)
+        if (
+            order is not None
+            and str(order.request.reference).startswith("directional:")
+        ):
+            if self.quality is not None:
+                commission, source = self._quality_commission(trade)
+                self.directional_manager.note_directional_quality_fill(
+                    trade,
+                    commission=commission,
+                    commission_source=source,
+                )
+            return
+        super()._capture_quality_trade(trade)
+
+    def _handle_order_event(self, order) -> None:
+        super()._handle_order_event(order)
+        if (
+            isinstance(order, Order)
+            and str(order.request.reference).startswith("directional:")
+        ):
+            self.directional_manager.note_directional_quality_order(order)
+            self.directional_manager._finalize_quality_cycle_if_settled(
+                self._reference_now()
+            )
 
     def stop(self) -> None:
         try:
@@ -118,9 +136,7 @@ class DirectionalTradingEngine(TradingEngine):
         if self.historical_mode:
             max_quote_age = 0.0
         else:
-            max_quote_age = self._max_quote_age(
-                required, reference, quotes_ready
-            )
+            max_quote_age = self._max_quote_age(required, reference, quotes_ready)
             if max_quote_age is None:
                 return "market quote timestamp is in the future"
         try:
@@ -144,9 +160,7 @@ class DirectionalTradingEngine(TradingEngine):
     def _reduce_only_cycle(self) -> None:
         if self.directional_manager.has_risk():
             try:
-                result = self.directional_manager.flatten(
-                    self._reference_now()
-                )
+                result = self.directional_manager.flatten(self._reference_now())
                 if result.action == "reject" and result.reason:
                     suffix = f"directional flatten failed: {result.reason}"
                     self.state.reduce_reason = (
