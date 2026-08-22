@@ -274,7 +274,7 @@ def evaluate(raw: pd.DataFrame) -> dict:
         "historical_l1_available": False,
         "specific_contracts": True,
         "roll_safe": True,
-        "pristine_final_oos": True,
+        "pristine_final_oos": False,
         "stress_cost_bps_one_way": base.STRESS_COST_BPS,
         "min_days_to_delivery": MIN_DAYS_TO_DELIVERY,
         "max_active_pairs": MAX_ACTIVE_PAIRS,
