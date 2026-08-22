@@ -1,14 +1,14 @@
-"""Frozen roll-safe L4 for the aggressive 100% return-target candidate.
+"""Roll-safe L4 for the selection-biased 100% return target.
 
-L3 intentionally fit the already-observed recent window and found a 2x-gross directional
-portfolio above 100% annualized return. This module does not reselect that candidate.
-It freezes the exact L3 template pool/meta parameters, rebuilds daily returns from
-concrete contracts selected point-in-time, and evaluates both:
+The aggressive L3 policy intentionally uses AKShare/Sina continuous daily commodity
+series as its signal feed and fits a frozen 24-template/meta configuration on the already
+observed recent window. L4 keeps that signal policy unchanged but maps its daily exposure
+to point-in-time concrete contracts. PnL t-1→t is always earned on the exact concrete
+contract selected at t-1, so contract rolls cannot become synthetic profit.
 
-1. the exact L3 daily product weights applied to roll-safe returns (roll-artifact audit);
-2. the exact frozen signal/meta configuration recomputed on the roll-safe return panel.
-
-No L4 metric is allowed to choose a new pool or increase leverage.
+Signal and realized-return data stay separate: public continuous data decides exposure;
+concrete CTP-tradable contracts produce roll-safe realized return. L4 never reselects the
+frozen template pool or raises gross leverage above 2x.
 """
 from __future__ import annotations
 
@@ -67,10 +67,8 @@ FROZEN_SELECTION = {
 }
 
 
-def build_roll_safe_returns(
-    raw: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, dict]]:
-    """Build t-1→t returns on the exact contract selected at t-1."""
+def build_roll_safe_returns(raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, dict]]:
+    """Build t-1→t return from the exact eligible contract selected at t-1."""
     frame = raw.copy()
     frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
     frame["delivery"] = pd.to_datetime(frame["delivery"], errors="coerce")
@@ -78,9 +76,7 @@ def build_roll_safe_returns(
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     frame["product"] = frame["product"].astype(str).str.upper()
     frame["symbol"] = frame["symbol"].astype(str).str.upper()
-    frame = frame.dropna(
-        subset=["date", "delivery", "product", "symbol", "close", "hold"]
-    )
+    frame = frame.dropna(subset=["date", "delivery", "product", "symbol", "close", "hold"])
     frame = frame[(frame["close"] > 0) & (frame["hold"] >= 0)]
     frame["volume"] = frame["volume"].fillna(0.0)
     frame.drop_duplicates(["product", "symbol", "date"], keep="last", inplace=True)
@@ -89,18 +85,16 @@ def build_roll_safe_returns(
     return_series: dict[str, pd.Series] = {}
     selection_rows: list[dict] = []
     quality: dict[str, dict] = {}
-
     for product in REQUIRED_PRODUCTS:
         product_frame = frame[frame["product"] == product].copy()
         if product_frame.empty:
-            raise ValueError(f"return-target L4 missing specific-contract product: {product}")
+            raise ValueError(f"return-target L4 missing product: {product}")
         by_symbol = {
             str(symbol): group.set_index("date").sort_index()
             for symbol, group in product_frame.groupby("symbol")
         }
         dates = pd.DatetimeIndex(sorted(product_frame["date"].unique()))
         choices: dict[pd.Timestamp, str] = {}
-
         for trading_day, day_rows in product_frame.groupby("date"):
             trading_day = pd.Timestamp(trading_day)
             eligible = day_rows[
@@ -133,10 +127,7 @@ def build_roll_safe_returns(
         selected = pd.Series(choices, dtype=object).sort_index()
         valid_days = int(selected.index.nunique())
         if valid_days < MIN_PRODUCT_DAYS:
-            raise ValueError(
-                f"return-target specific coverage too short for {product}: {valid_days}"
-            )
-
+            raise ValueError(f"return-target specific coverage too short for {product}: {valid_days}")
         returns = pd.Series(np.nan, index=dates, dtype=float)
         previous_date: pd.Timestamp | None = None
         previous_symbol: str | None = None
@@ -147,11 +138,7 @@ def build_roll_safe_returns(
             if previous_date is not None and previous_symbol is not None:
                 symbol_frame = by_symbol.get(previous_symbol)
                 realized = np.nan
-                if (
-                    symbol_frame is not None
-                    and previous_date in symbol_frame.index
-                    and trading_day in symbol_frame.index
-                ):
+                if symbol_frame is not None and previous_date in symbol_frame.index and trading_day in symbol_frame.index:
                     previous_close = float(symbol_frame.loc[previous_date, "close"])
                     current_close = float(symbol_frame.loc[trading_day, "close"])
                     if previous_close > 0 and current_close > 0:
@@ -161,15 +148,10 @@ def build_roll_safe_returns(
                 else:
                     missing_next += 1
             current_symbol = choices.get(trading_day)
-            if (
-                previous_symbol is not None
-                and current_symbol is not None
-                and current_symbol != previous_symbol
-            ):
+            if previous_symbol is not None and current_symbol is not None and current_symbol != previous_symbol:
                 rolls += 1
             previous_date = trading_day
             previous_symbol = current_symbol
-
         return_series[product] = returns
         quality[product] = {
             "selected_days": valid_days,
@@ -188,41 +170,143 @@ def build_roll_safe_returns(
     return panel, selections, quality
 
 
-def replay_frozen_weights(
-    returns: pd.DataFrame,
-    weights: pd.DataFrame,
-    *,
-    cost_bps: float,
-) -> tuple[pd.Series, pd.Series]:
-    """Apply exact L3 daily weights to roll-safe returns and charge weight turnover."""
+def replay_frozen_weights(returns: pd.DataFrame, weights: pd.DataFrame, *, cost_bps: float) -> tuple[pd.Series, pd.Series]:
+    """Apply exact L3 daily weights to roll-safe realized returns."""
     raw = weights.copy()
     raw["date"] = pd.to_datetime(raw["date"], errors="coerce")
     raw["product"] = raw["product"].astype(str).str.upper()
     raw["weight"] = pd.to_numeric(raw["weight"], errors="coerce")
     raw.dropna(subset=["date", "product", "weight"], inplace=True)
-    matrix = raw.pivot_table(
-        index="date", columns="product", values="weight", aggfunc="sum", fill_value=0.0
-    )
-    matrix = matrix.reindex(index=returns.index, columns=returns.columns, fill_value=0.0)
-    matrix = matrix.fillna(0.0).astype(float)
+    matrix = raw.pivot_table(index="date", columns="product", values="weight", aggfunc="sum", fill_value=0.0)
+    matrix = matrix.reindex(index=returns.index, columns=returns.columns, fill_value=0.0).fillna(0.0)
     gross = matrix.abs().sum(axis=1)
     if bool((gross > MAX_GROSS_LEVERAGE + 1e-10).any()):
-        offending = float(gross.max())
-        raise ValueError(f"frozen L3 weights exceed 2x gross cap: {offending}")
+        raise ValueError(f"frozen L3 weights exceed 2x gross cap: {float(gross.max())}")
     realized = returns.reindex_like(matrix).fillna(0.0)
     pnl = (matrix * realized).sum(axis=1)
     turnover = matrix.diff().abs().sum(axis=1)
     if len(matrix):
         turnover.iloc[0] = float(matrix.iloc[0].abs().sum())
-    pnl = pnl - turnover * float(cost_bps) / 10000.0
+    pnl -= turnover * float(cost_bps) / 10000.0
     return pnl.astype(float), gross.astype(float)
 
 
+def simulate_frozen_continuous_signals(
+    signal_returns: pd.DataFrame,
+    realized_returns: pd.DataFrame,
+    template: aggressive.DirectionalTemplate,
+    *,
+    cost_bps: float,
+    return_audit: bool = False,
+):
+    """Use lagged continuous signals but earn only concrete-contract realized PnL."""
+    signal = signal_returns.astype(float).replace([np.inf, -np.inf], np.nan)
+    realized = realized_returns.reindex(index=signal.index, columns=signal.columns).astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    scores = aggressive.signal_scores(signal, template).to_numpy(float)
+    values = realized.to_numpy(float)
+    weights = np.zeros(values.shape[1], dtype=float)
+    pnl = np.zeros(len(signal), dtype=float)
+    turnover = np.zeros(len(signal), dtype=float)
+    audit = np.zeros_like(values, dtype=float) if return_audit else None
+    step = max(int(template.rebalance), 1)
+    for position in range(1, len(signal)):
+        if position % step == 0:
+            lagged = scores[position - 1]
+            valid = np.flatnonzero(np.isfinite(lagged) & (np.abs(lagged) > 1e-12))
+            next_weights = np.zeros(values.shape[1], dtype=float)
+            if valid.size:
+                order = valid[np.argsort(-np.abs(lagged[valid]), kind="stable")]
+                selected = order[: min(int(template.max_products), len(order))]
+                if selected.size:
+                    each = min(float(template.gross_leverage), MAX_GROSS_LEVERAGE) / float(selected.size)
+                    next_weights[selected] = np.sign(lagged[selected]) * each
+            turnover[position] = float(np.abs(next_weights - weights).sum())
+            weights = next_weights
+        pnl[position] = float(weights @ values[position])
+        if audit is not None:
+            audit[position] = weights
+    pnl -= turnover * float(cost_bps) / 10000.0
+    series = pd.Series(pnl, index=signal.index, dtype=float)
+    if not return_audit:
+        return series
+    audit_frame = pd.DataFrame(audit, index=signal.index, columns=signal.columns)
+    if float(audit_frame.abs().sum(axis=1).max()) > MAX_GROSS_LEVERAGE + 1e-10:
+        raise AssertionError("continuous-signal audit exceeds gross leverage cap")
+    return series, audit_frame
+
+
+def _meta_rotate_external_scores(
+    score_streams: dict[str, pd.Series],
+    realized_streams: dict[str, pd.Series],
+    *,
+    meta_lookback: int,
+    rebalance: int,
+    count: int,
+    switch_cost_bps: float,
+) -> pd.Series:
+    """Rank templates on continuous theoretical PnL, realize selected concrete PnL."""
+    score_frame = pd.DataFrame(score_streams).sort_index().fillna(0.0)
+    realized_frame = pd.DataFrame(realized_streams).reindex(index=score_frame.index, columns=score_frame.columns).fillna(0.0)
+    scores = aggressive._trailing_score(score_frame, meta_lookback)
+    realized_values = realized_frame.to_numpy(float)
+    output = np.zeros(len(score_frame), dtype=float)
+    selected: list[int] = []
+    step = max(int(rebalance), 1)
+    for position in range(len(score_frame)):
+        if position >= meta_lookback and (not selected or position % step == 0):
+            row = scores[position]
+            valid = np.flatnonzero(np.isfinite(row))
+            next_selected = [int(index) for index in valid[np.argsort(-row[valid], kind="stable")][:count]] if valid.size else []
+            if next_selected != selected:
+                churn = len(set(selected).symmetric_difference(next_selected)) / max(count, 1)
+                output[position] -= churn * switch_cost_bps / 10000.0
+            selected = next_selected
+        if selected:
+            output[position] += float(realized_values[position, selected].mean())
+    return pd.Series(output, index=score_frame.index, dtype=float)
+
+
+def _frozen_templates() -> dict[str, aggressive.DirectionalTemplate]:
+    lookup = {aggressive.template_id(template): template for template in aggressive.directional_templates()}
+    missing = [template_id for template_id in FROZEN_SELECTION["pool_ids"] if template_id not in lookup]
+    if missing:
+        raise ValueError(f"frozen L3 templates no longer exist: {missing}")
+    return {template_id: lookup[template_id] for template_id in FROZEN_SELECTION["pool_ids"]}
+
+
+def recompute_continuous_signal_roll_safe(
+    continuous_raw: pd.DataFrame,
+    realized_returns: pd.DataFrame,
+    *,
+    cost_bps: float,
+) -> pd.Series:
+    """Recompute frozen L3 continuous signal/meta policy but realize concrete PnL."""
+    signal_returns, _ = aggressive.build_return_panel(continuous_raw)
+    signal_returns.columns = [str(column).upper() for column in signal_returns.columns]
+    common_products = [product for product in REQUIRED_PRODUCTS if product in signal_returns.columns]
+    if len(common_products) != len(REQUIRED_PRODUCTS):
+        missing = sorted(set(REQUIRED_PRODUCTS) - set(common_products))
+        raise ValueError(f"continuous signal feed missing products: {missing}")
+    signal_returns = signal_returns[common_products]
+    realized = realized_returns.reindex(index=signal_returns.index, columns=common_products)
+    theoretical: dict[str, pd.Series] = {}
+    concrete: dict[str, pd.Series] = {}
+    for template_id, template in _frozen_templates().items():
+        theoretical_gross, theoretical_turnover, _ = aggressive._simulate_arrays(signal_returns, template, record_weights=False)
+        theoretical[template_id] = aggressive.apply_cost(theoretical_gross, theoretical_turnover, cost_bps)
+        concrete[template_id] = simulate_frozen_continuous_signals(signal_returns, realized, template, cost_bps=cost_bps)
+    return _meta_rotate_external_scores(
+        theoretical,
+        concrete,
+        meta_lookback=int(FROZEN_SELECTION["meta_lookback"]),
+        rebalance=int(FROZEN_SELECTION["rebalance"]),
+        count=int(FROZEN_SELECTION["count"]),
+        switch_cost_bps=cost_bps,
+    )
+
+
 def _window_metrics(series: pd.Series) -> dict[str, dict]:
-    return {
-        name: aggressive._window_metrics(series, name)
-        for name in WINDOWS
-    }
+    return {name: aggressive._window_metrics(series, name) for name in WINDOWS}
 
 
 def _target_pass(base_metrics: dict, stress_metrics: dict) -> bool:
@@ -238,108 +322,51 @@ def _validate_frozen_l3_report(report: dict) -> None:
     selection = report.get("selection", {})
     for key in ("selection_bias", "pool_size", "meta_lookback", "rebalance", "count"):
         if selection.get(key) != FROZEN_SELECTION[key]:
-            raise ValueError(
-                f"L3 frozen selection drifted for {key}: {selection.get(key)!r} != {FROZEN_SELECTION[key]!r}"
-            )
+            raise ValueError(f"L3 frozen selection drifted for {key}: {selection.get(key)!r} != {FROZEN_SELECTION[key]!r}")
     if list(selection.get("pool_ids", [])) != list(FROZEN_SELECTION["pool_ids"]):
         raise ValueError("L3 frozen template pool drifted; refusing L4 reselection")
     if float(selection.get("effective_gross_leverage", 0.0)) > MAX_GROSS_LEVERAGE:
         raise ValueError("L3 selection exceeds L4 gross leverage cap")
 
 
-def recompute_frozen_configuration(
-    returns: pd.DataFrame,
-    *,
-    cost_bps: float,
-) -> pd.Series:
-    """Recompute only the already-frozen pool/meta policy on roll-safe returns."""
-    template_lookup = {
-        aggressive.template_id(template): template
-        for template in aggressive.directional_templates()
-    }
-    pool_ids = list(FROZEN_SELECTION["pool_ids"])
-    missing = [name for name in pool_ids if name not in template_lookup]
-    if missing:
-        raise ValueError(f"frozen L3 templates no longer exist: {missing}")
-
-    streams: dict[str, pd.Series] = {}
-    # Missing same-contract returns are explicitly zero-realized days for the research
-    # signal path, while data quality separately reports every gap. This avoids a single
-    # missing quote invalidating a 120-day rolling feature for months.
-    signal_returns = returns.fillna(0.0)
-    for name in pool_ids:
-        gross_pnl, turnover, _ = aggressive._simulate_arrays(
-            signal_returns,
-            template_lookup[name],
-            record_weights=False,
-        )
-        streams[name] = aggressive.apply_cost(gross_pnl, turnover, cost_bps)
-    series, _ = aggressive._meta_rotate(
-        streams,
-        meta_lookback=int(FROZEN_SELECTION["meta_lookback"]),
-        rebalance=int(FROZEN_SELECTION["rebalance"]),
-        count=int(FROZEN_SELECTION["count"]),
-        switch_cost_bps=cost_bps,
-    )
-    return series
-
-
 def evaluate(
     specific_raw: pd.DataFrame,
+    continuous_raw: pd.DataFrame,
     frozen_weights: pd.DataFrame,
     l3_report: dict,
 ) -> dict:
     _validate_frozen_l3_report(l3_report)
     returns, selections, data_quality = build_roll_safe_returns(specific_raw)
+    frozen_paths: dict[str, dict] = {}
+    continuous_paths: dict[str, dict] = {}
+    for label, cost in (("base", BASE_COST_BPS), ("stress", STRESS_COST_BPS), ("extreme", EXTREME_COST_BPS)):
+        frozen_series, _ = replay_frozen_weights(returns, frozen_weights, cost_bps=cost)
+        frozen_paths[label] = _window_metrics(frozen_series)
+        continuous_series = recompute_continuous_signal_roll_safe(continuous_raw, returns, cost_bps=cost)
+        continuous_paths[label] = _window_metrics(continuous_series)
 
-    frozen_paths = {}
-    frozen_gross = None
-    for label, cost in (
-        ("base", BASE_COST_BPS),
-        ("stress", STRESS_COST_BPS),
-        ("extreme", EXTREME_COST_BPS),
-    ):
-        series, gross = replay_frozen_weights(returns, frozen_weights, cost_bps=cost)
-        frozen_paths[label] = _window_metrics(series)
-        if frozen_gross is None:
-            frozen_gross = gross
-
-    recomputed_paths = {}
-    for label, cost in (
-        ("base", BASE_COST_BPS),
-        ("stress", STRESS_COST_BPS),
-        ("extreme", EXTREME_COST_BPS),
-    ):
-        series = recompute_frozen_configuration(returns, cost_bps=cost)
-        recomputed_paths[label] = _window_metrics(series)
-
-    quality_reasons = []
+    quality_reasons: list[str] = []
     for product, item in sorted(data_quality.items()):
         if item["selected_days"] < MIN_PRODUCT_DAYS:
             quality_reasons.append(f"{product} selected-day coverage below {MIN_PRODUCT_DAYS}")
         if item["missing_next_ratio"] >= 0.05:
             quality_reasons.append(f"{product} missing same-contract next return >=5%")
-
-    frozen_pass = _target_pass(
-        frozen_paths["base"]["full_recent"],
-        frozen_paths["stress"]["full_recent"],
-    )
-    recomputed_pass = _target_pass(
-        recomputed_paths["base"]["full_recent"],
-        recomputed_paths["stress"]["full_recent"],
-    )
+    frozen_pass = _target_pass(frozen_paths["base"]["full_recent"], frozen_paths["stress"]["full_recent"])
+    continuous_pass = _target_pass(continuous_paths["base"]["full_recent"], continuous_paths["stress"]["full_recent"])
     reasons: list[str] = list(quality_reasons)
     if not frozen_pass:
-        reasons.append("exact L3 daily weights do not retain the 100% roll-safe target")
-    if not recomputed_pass:
-        reasons.append("frozen L3 signal/meta configuration does not retain the 100% roll-safe target")
+        reasons.append("exact L3 daily weights do not retain the roll-safe 100% target")
+    if not continuous_pass:
+        reasons.append("continuous-signal/concrete-PnL recomputation does not retain the 100% target")
 
     report = {
-        "source": "AKShare/Sina concrete futures daily bars",
-        "role": "selection-biased but roll-safe L4 validation of frozen aggressive directional target",
+        "source": "AKShare/Sina continuous daily signal feed + concrete futures daily realized PnL",
+        "role": "selection-biased, causally reproducible L4 mapping from continuous signals to roll-safe concrete-contract execution",
         "specific_contracts": True,
         "roll_safe": True,
         "selection_frozen": True,
+        "signal_source": "AKShare/Sina continuous daily commodity series",
+        "realized_pnl_source": "same concrete contract selected at prior close",
         "historical_l1_available": False,
         "pristine_final_oos": PRISTINE_FINAL_OOS,
         "max_gross_leverage": MAX_GROSS_LEVERAGE,
@@ -347,19 +374,18 @@ def evaluate(
         "frozen_selection": FROZEN_SELECTION,
         "data_quality": data_quality,
         "frozen_weight_replay": frozen_paths,
-        "recomputed_roll_safe": recomputed_paths,
+        "continuous_signal_roll_safe": continuous_paths,
         "target": {
             "annualized_return": 1.0,
             "max_drawdown": -0.30,
             "stress_must_be_positive": True,
             "gross_leverage_cap": MAX_GROSS_LEVERAGE,
             "frozen_weight_target_met": frozen_pass,
-            "recomputed_target_met": recomputed_pass,
-            "target_met": bool(frozen_pass and recomputed_pass and not quality_reasons),
+            "continuous_signal_target_met": continuous_pass,
+            "target_met": bool(frozen_pass and continuous_pass and not quality_reasons),
             "reasons": reasons,
         },
     }
-
     output = Path("runtime")
     output.mkdir(parents=True, exist_ok=True)
     selections.to_csv(output / "return_target_specific_selection.csv", index=False)
@@ -369,32 +395,27 @@ def evaluate(
 def main() -> None:
     runtime = Path("runtime")
     specific_path = runtime / "return_target_specific_contracts.csv"
+    continuous_path = runtime / "broad_daily_universe.csv"
     weights_path = runtime / "aggressive_directional_weights.csv"
     l3_path = runtime / "aggressive_directional_report.json"
-    if not specific_path.exists() or not weights_path.exists() or not l3_path.exists():
-        raise SystemExit("L4 inputs missing; rebuild frozen L3 evidence and specific contracts first")
+    required = (specific_path, continuous_path, weights_path, l3_path)
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        raise SystemExit(f"L4 inputs missing: {missing}")
     report = evaluate(
         pd.read_csv(specific_path),
+        pd.read_csv(continuous_path),
         pd.read_csv(weights_path),
         json.loads(l3_path.read_text(encoding="utf-8")),
     )
     output = runtime / "return_target_specific_report.json"
-    output.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    print(
-        json.dumps(
-            {
-                "data_quality": report["data_quality"],
-                "frozen_weight_replay": report["frozen_weight_replay"],
-                "recomputed_roll_safe": report["recomputed_roll_safe"],
-                "target": report["target"],
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
+    output.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    print(json.dumps({
+        "data_quality": report["data_quality"],
+        "frozen_weight_replay": report["frozen_weight_replay"],
+        "continuous_signal_roll_safe": report["continuous_signal_roll_safe"],
+        "target": report["target"],
+    }, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
