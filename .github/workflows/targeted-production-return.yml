@@ -35,6 +35,7 @@ jobs:
           tests/test_directional_review_regressions.py
           tests/test_directional_trading_day_selection.py
       - run: python -m compileall -q afuture
+      - run: python tools/test_directional_production_mechanics.py
       - name: Validate directional live example
         env:
           AFUTURE_CTP_USER: test-user

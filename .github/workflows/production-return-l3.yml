@@ -1,9 +1,9 @@
 name: production-return-l3
 
 on:
-  push:
+  pull_request:
     branches:
-      - codex/afuture-production-return-100-20260823
+      - main
     paths:
       - afuture/directional.py
       - afuture/directional_acceptance.py
@@ -19,6 +19,7 @@ permissions:
 
 jobs:
   frozen-production-evidence:
+    if: github.head_ref == 'codex/afuture-production-return-100-20260823'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
