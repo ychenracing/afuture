@@ -119,67 +119,120 @@ def signal_scores(returns: pd.DataFrame, template: AlphaTemplate) -> pd.DataFram
     raise ValueError(f"unknown alpha family: {template.family}")
 
 
-def _pair_weights(
-    score: pd.Series,
-    volatility: pd.Series,
-    exchange_map: dict[str, str],
+def _exchange_groups(columns: list[str], exchange_map: dict[str, str]) -> list[np.ndarray]:
+    groups: list[np.ndarray] = []
+    for exchange in sorted(set(exchange_map.values())):
+        indices = [index for index, name in enumerate(columns) if exchange_map.get(name) == exchange]
+        if len(indices) >= 2:
+            groups.append(np.asarray(indices, dtype=int))
+    return groups
+
+
+def _weights_from_arrays(
+    score: np.ndarray,
+    volatility: np.ndarray,
+    groups: list[np.ndarray],
     *,
     max_pairs: int,
     gross_leverage: float,
-) -> tuple[pd.Series, list[str]]:
-    columns = [str(column) for column in score.index]
-    weights = pd.Series(0.0, index=columns, dtype=float)
-    available = pd.DataFrame(
-        {
-            "score": pd.Series(score.to_numpy(float), index=columns),
-            "volatility": pd.Series(volatility.to_numpy(float), index=columns),
-        }
-    ).replace([np.inf, -np.inf], np.nan).dropna()
-    available = available[available["volatility"] > 1e-12]
-    if len(available) < 2 or max_pairs <= 0 or gross_leverage <= 0:
+) -> tuple[np.ndarray, list[int]]:
+    weights = np.zeros(len(score), dtype=float)
+    if max_pairs <= 0 or gross_leverage <= 0.0:
         return weights, []
-
-    candidates: list[tuple[float, str, str]] = []
-    for exchange in sorted(set(exchange_map.values())):
-        names = [name for name in available.index if exchange_map.get(name) == exchange]
-        if len(names) < 2:
+    candidates: list[tuple[float, int, int]] = []
+    for group in groups:
+        valid = group[
+            np.isfinite(score[group])
+            & np.isfinite(volatility[group])
+            & (volatility[group] > 1e-12)
+        ]
+        if valid.size < 2:
             continue
-        ranked = available.loc[names].sort_values("score", kind="stable")
-        lows = [str(name) for name in ranked.index]
-        highs = list(reversed(lows))
-        for long_name, short_name in zip(highs, lows):
-            if long_name == short_name:
+        ordered = valid[np.argsort(score[valid], kind="stable")]
+        lows = ordered
+        highs = ordered[::-1]
+        for long_index, short_index in zip(highs, lows):
+            if long_index == short_index:
                 continue
-            spread = float(available.loc[long_name, "score"] - available.loc[short_name, "score"])
+            spread = float(score[long_index] - score[short_index])
             if np.isfinite(spread) and spread > 0.0:
-                candidates.append((spread, long_name, short_name))
-
-    selected: list[tuple[float, str, str]] = []
-    used: set[str] = set()
-    for item in sorted(candidates, key=lambda row: (-row[0], row[1], row[2])):
-        _, long_name, short_name = item
-        if long_name in used or short_name in used:
+                candidates.append((spread, int(long_index), int(short_index)))
+    selected: list[tuple[float, int, int]] = []
+    used: set[int] = set()
+    for candidate in sorted(candidates, key=lambda item: (-item[0], item[1], item[2])):
+        _, long_index, short_index = candidate
+        if long_index in used or short_index in used:
             continue
-        selected.append(item)
-        used.update((long_name, short_name))
+        selected.append(candidate)
+        used.update((long_index, short_index))
         if len(selected) >= max_pairs:
             break
     if not selected:
         return weights, []
-
-    pair_gross = min(gross_leverage, MAX_GROSS_LEVERAGE) / len(selected)
-    legs: list[str] = []
-    for _, long_name, short_name in selected:
-        long_inv = 1.0 / float(available.loc[long_name, "volatility"])
-        short_inv = 1.0 / float(available.loc[short_name, "volatility"])
+    pair_gross = min(float(gross_leverage), MAX_GROSS_LEVERAGE) / len(selected)
+    legs: list[int] = []
+    for _, long_index, short_index in selected:
+        long_inv = 1.0 / float(volatility[long_index])
+        short_inv = 1.0 / float(volatility[short_index])
         scale = pair_gross / (long_inv + short_inv)
-        weights.loc[long_name] = long_inv * scale
-        weights.loc[short_name] = -short_inv * scale
-        legs.extend((long_name, short_name))
-    gross = float(weights.abs().sum())
+        weights[long_index] = long_inv * scale
+        weights[short_index] = -short_inv * scale
+        legs.extend((long_index, short_index))
+    gross = float(np.abs(weights).sum())
     if gross > MAX_GROSS_LEVERAGE + 1e-12:
         weights *= MAX_GROSS_LEVERAGE / gross
     return weights, legs
+
+
+def _simulate_path(
+    returns: pd.DataFrame,
+    exchange_map: dict[str, str],
+    template: AlphaTemplate,
+) -> tuple[pd.Series, pd.Series, list[dict]]:
+    data = returns.astype(float).replace([np.inf, -np.inf], np.nan)
+    data.columns = [str(column) for column in data.columns]
+    columns = list(data.columns)
+    values = np.nan_to_num(data.to_numpy(float), nan=0.0, posinf=0.0, neginf=0.0)
+    score_values = signal_scores(data, template).to_numpy(float)
+    volatility_values = data.rolling(
+        template.vol_window, min_periods=template.vol_window
+    ).std().to_numpy(float)
+    groups = _exchange_groups(columns, exchange_map)
+    weights = np.zeros(len(columns), dtype=float)
+    gross_pnl = np.zeros(len(data), dtype=float)
+    turnover = np.zeros(len(data), dtype=float)
+    audit: list[dict] = []
+    step = max(int(template.rebalance), 1)
+    legs: list[int] = []
+    for index in range(1, len(data)):
+        if index % step == 0:
+            next_weights, legs = _weights_from_arrays(
+                score_values[index - 1],
+                volatility_values[index - 1],
+                groups,
+                max_pairs=template.max_pairs,
+                gross_leverage=template.gross_leverage,
+            )
+            turnover[index] = float(np.abs(next_weights - weights).sum())
+            weights = next_weights
+        gross_pnl[index] = float(weights @ values[index])
+        audit.append(
+            {
+                "date": data.index[index],
+                "gross": float(np.abs(weights).sum()),
+                "turnover": float(turnover[index]),
+                "legs": [columns[leg] for leg in legs],
+            }
+        )
+    return (
+        pd.Series(gross_pnl, index=data.index),
+        pd.Series(turnover, index=data.index),
+        audit,
+    )
+
+
+def _apply_cost(gross_pnl: pd.Series, turnover: pd.Series, cost_bps: float) -> pd.Series:
+    return gross_pnl - turnover * float(cost_bps) / 10000.0
 
 
 def simulate_template(
@@ -189,38 +242,8 @@ def simulate_template(
     *,
     cost_bps: float,
 ) -> tuple[pd.Series, list[dict]]:
-    data = returns.astype(float).replace([np.inf, -np.inf], np.nan)
-    data.columns = [str(column) for column in data.columns]
-    scores = signal_scores(data, template)
-    volatility = data.rolling(template.vol_window, min_periods=template.vol_window).std()
-    previous = pd.Series(0.0, index=data.columns, dtype=float)
-    output = np.zeros(len(data), dtype=float)
-    audit: list[dict] = []
-    for index in range(1, len(data)):
-        legs = [str(name) for name in previous[previous != 0].index]
-        turnover = 0.0
-        if index % template.rebalance == 0:
-            next_weights, legs = _pair_weights(
-                scores.iloc[index - 1],
-                volatility.iloc[index - 1],
-                exchange_map,
-                max_pairs=template.max_pairs,
-                gross_leverage=template.gross_leverage,
-            )
-            turnover = float((next_weights - previous).abs().sum())
-            output[index] -= turnover * cost_bps / 10000.0
-            previous = next_weights
-        realized = data.iloc[index].fillna(0.0)
-        output[index] += float((previous * realized).sum())
-        audit.append(
-            {
-                "date": data.index[index],
-                "gross": float(previous.abs().sum()),
-                "turnover": turnover,
-                "legs": legs,
-            }
-        )
-    return pd.Series(output, index=data.index), audit
+    gross_pnl, turnover, audit = _simulate_path(returns, exchange_map, template)
+    return _apply_cost(gross_pnl, turnover, cost_bps), audit
 
 
 def _metrics_array(values: np.ndarray) -> dict:
@@ -286,7 +309,6 @@ def dynamic_rotate(
     count: int,
     switch_cost_bps: float,
 ) -> tuple[pd.Series, list[dict]]:
-    """Fast trailing-only meta rotation; selection never reads the current/future row."""
     if not streams:
         return pd.Series(dtype=float), []
     frame = pd.DataFrame(streams).sort_index().fillna(0.0)
@@ -374,21 +396,24 @@ def evaluate(raw: pd.DataFrame) -> dict:
 
     templates = primary_templates()
     template_lookup: dict[str, AlphaTemplate] = {}
+    path_cache: dict[str, tuple[pd.Series, pd.Series, list[dict]]] = {}
     base_streams: dict[str, pd.Series] = {}
     stress_streams: dict[str, pd.Series] = {}
     rows: list[dict] = []
     for template in templates:
         name = template_id(template)
         template_lookup[name] = template
-        base, audit = simulate_template(returns, exchanges, template, cost_bps=BASE_COST_BPS)
-        stress, _ = simulate_template(returns, exchanges, template, cost_bps=STRESS_COST_BPS)
+        gross_pnl, turnover, audit = _simulate_path(returns, exchanges, template)
+        path_cache[name] = (gross_pnl, turnover, audit)
+        base = _apply_cost(gross_pnl, turnover, BASE_COST_BPS)
+        stress = _apply_cost(gross_pnl, turnover, STRESS_COST_BPS)
         base_streams[name] = base
         stress_streams[name] = stress
-        turnover = sum(float(item["turnover"]) for item in audit)
+        total_turnover = float(turnover.sum())
         row = {
             "template_id": name,
             "template": asdict(template),
-            "annual_turnover": float(turnover * 252.0 / max(len(base), 1)),
+            "annual_turnover": float(total_turnover * 252.0 / max(len(base), 1)),
             "base": {key: _window_metrics(base, key) for key in WINDOWS},
             "stress": {key: _window_metrics(stress, key) for key in WINDOWS},
         }
@@ -440,11 +465,10 @@ def evaluate(raw: pd.DataFrame) -> dict:
         count=chosen["count"],
         switch_cost_bps=STRESS_COST_BPS,
     )
-    extreme_streams: dict[str, pd.Series] = {}
-    for name in pool_ids:
-        extreme_streams[name], _ = simulate_template(
-            returns, exchanges, template_lookup[name], cost_bps=EXTREME_COST_BPS
-        )
+    extreme_streams = {
+        name: _apply_cost(path_cache[name][0], path_cache[name][1], EXTREME_COST_BPS)
+        for name in pool_ids
+    }
     chosen_extreme, _ = dynamic_rotate(
         extreme_streams,
         meta_lookback=chosen["meta_lookback"],
