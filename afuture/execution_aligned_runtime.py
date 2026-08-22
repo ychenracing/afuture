@@ -173,6 +173,51 @@ class ExecutionAlignedDirectionalPortfolioManager(DirectionalPortfolioManager):
             raise RuntimeError("directional signal history is shorter than 140 days")
         return ExecutionAlignedSignalHistory(open_prices, close)
 
+    def _current_ctp_trading_date(self) -> date | None:
+        if self.activity_tracker is None:
+            return None
+        raw = str(getattr(self.activity_tracker, "current_trading_day", "") or "")
+        if not raw:
+            return None
+        try:
+            return datetime.strptime(raw, "%Y%m%d").date()
+        except ValueError:
+            return None
+
+    def _validate_activity_signal_alignment(
+        self,
+        raw: ExecutionAlignedSignalHistory,
+        required_signal_day: date | None,
+    ) -> None:
+        """Reject an old activity snapshot when OHLC proves a newer day completed.
+
+        The current CTP trading day itself may appear as an unfinished daily bar, so only
+        common OHLC dates strictly before the CTP trading day count as completed evidence.
+        """
+        if required_signal_day is None:
+            return
+        current_trading_date = self._current_ctp_trading_date()
+        if current_trading_date is None:
+            return
+        close_index = pd.DatetimeIndex(
+            pd.to_datetime(raw.close.index, errors="coerce")
+        ).dropna()
+        open_index = pd.DatetimeIndex(
+            pd.to_datetime(raw.open.index, errors="coerce")
+        ).dropna()
+        common = close_index.intersection(open_index)
+        completed = common[common.normalize() < pd.Timestamp(current_trading_date)]
+        if completed.empty:
+            return
+        latest_completed = pd.Timestamp(completed.max()).date()
+        if latest_completed > required_signal_day:
+            raise RuntimeError(
+                "completed directional activity is stale: "
+                f"activity={required_signal_day.isoformat()}, "
+                f"latest_completed_signal={latest_completed.isoformat()}, "
+                f"current_trading_day={current_trading_date.isoformat()}"
+            )
+
     def _validate_signal_history(
         self,
         history: ExecutionAlignedSignalHistory,
@@ -212,19 +257,21 @@ class ExecutionAlignedDirectionalPortfolioManager(DirectionalPortfolioManager):
                 raw = self.signal_provider.load(
                     tuple(item.upper() for item in self.config.products)
                 )
-                if not isinstance(raw, ExecutionAlignedSignalHistory):
-                    raise RuntimeError(
-                        "execution-aligned signal provider must return OHLC history"
-                    )
-                self._execution_signal_history = self._normalize_history(
-                    raw, max_date=max_date
-                )
             except Exception:
                 if self._execution_signal_history is None:
                     raise
                 self._execution_signal_history = self._normalize_history(
                     self._execution_signal_history,
                     max_date=max_date,
+                )
+            else:
+                if not isinstance(raw, ExecutionAlignedSignalHistory):
+                    raise RuntimeError(
+                        "execution-aligned signal provider must return OHLC history"
+                    )
+                self._validate_activity_signal_alignment(raw, required_signal_day)
+                self._execution_signal_history = self._normalize_history(
+                    raw, max_date=max_date
                 )
             self._signal_refresh_date = local.date()
 
