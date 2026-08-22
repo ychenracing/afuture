@@ -4,7 +4,7 @@ import sys
 import pandas as pd
 
 spec = importlib.util.spec_from_file_location(
-    "structural", Path(__file__).with_name("evaluate_structural_rotation_specific.py")
+    "structural", Path(__file__).with_name("evaluate_structural_rotation_rollfix.py")
 )
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
@@ -19,7 +19,8 @@ assert module.STRESS_COST_BPS == 2.0 * module.BASE_COST_BPS
 assert set(module.QUALITY_WEIGHT) == {"steel", "coke", "soy", "bufu"}
 
 # Point-in-time roll test: day-2 return must use the contract selected on day 1 even
-# if day-2 OI has already switched to the next contract.
+# if day-2 OI has already switched to the next contract. The signal-price panel, by
+# contrast, must expose the actual close of the contract selected on each date.
 module.MIN_PRODUCT_DAYS = 3
 rows = []
 dates = [pd.Timestamp("2025-01-02"), pd.Timestamp("2025-01-03"), pd.Timestamp("2025-01-06")]
@@ -50,12 +51,34 @@ for product in module.REQUIRED_PRODUCTS:
             "hold": second_oi,
         })
 raw = pd.DataFrame(rows)
-close, returns, selections, quality = module.build_roll_safe_panel(raw)
-# 2025-01-03 realizes 110/100-1 from the contract selected on 2025-01-02; it must
-# not use 220/200-1 because the day-2 OI switch is only a decision for day 2->3.
+close, returns, actual_close, selected_symbols, selections, quality = module.build_roll_safe_panel(raw)
 assert abs(float(returns.loc[pd.Timestamp("2025-01-03"), "A"]) - 0.10) < 1e-12
+assert float(actual_close.loc[pd.Timestamp("2025-01-02"), "A"]) == 100.0
+assert float(actual_close.loc[pd.Timestamp("2025-01-03"), "A"]) == 220.0
+assert str(selected_symbols.loc[pd.Timestamp("2025-01-02"), "A"]) == "A2505"
+assert str(selected_symbols.loc[pd.Timestamp("2025-01-03"), "A"]) == "A2509"
 assert quality["A"]["rolls"] >= 1
 assert int(selections["days_to_delivery"].min()) >= module.MIN_DAYS_TO_DELIVERY
+
+# Physical-spread formation must restart whenever any leg rolls. A 60-day physical
+# signal becomes eligible only after 60 complete historical samples under one fixed
+# tuple of concrete symbols, then immediately becomes ineligible again on a roll.
+formation = 60
+segment_dates = pd.date_range("2024-01-02", periods=125, freq="B")
+symbols = pd.DataFrame(
+    {
+        "RB": ["RB2405"] * 61 + ["RB2410"] * 64,
+        "I": ["I2405"] * 125,
+        "J": ["J2405"] * 125,
+    },
+    index=segment_dates,
+)
+stable = module._stable_segment_mask(symbols, ["RB", "I", "J"], formation)
+assert stable.iloc[59] is False or bool(stable.iloc[59]) is False
+assert bool(stable.iloc[60]) is True
+assert bool(stable.iloc[61]) is False
+assert bool(stable.iloc[120]) is False
+assert bool(stable.iloc[121]) is True
 
 # Fail closed: a path that loses 5% every next day must not receive any leverage.
 index = pd.date_range("2024-08-21", "2026-02-20", freq="B")
