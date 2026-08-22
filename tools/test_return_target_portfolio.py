@@ -138,7 +138,7 @@ def test_build_panel_infers_exchange_without_future_metadata() -> None:
 
 
 def test_evaluate_reports_explicit_non_pristine_target_and_leverage_cap() -> None:
-    dates = pd.date_range("2022-08-22", "2026-08-20", freq="B")
+    dates = pd.date_range("2025-01-01", periods=320, freq="B")
     even = np.arange(len(dates)) % 2 == 0
     returns = {
         "A": np.where(even, 0.006, 0.004),
