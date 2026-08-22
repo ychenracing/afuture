@@ -22,4 +22,5 @@ jobs:
           tests/test_directional_manager.py
           tests/test_directional_engine.py
           tests/test_directional_quality.py
+          tests/test_directional_acceptance.py
       - run: python -m compileall -q afuture
