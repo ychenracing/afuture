@@ -2,7 +2,9 @@
 
 ## 目标
 
-`afuture` 只保留一套正式交易链。Auto、研究、Shadow 和实盘都复用相同的策略、风险和执行对象；旁路模块只负责证据，不获得第二套下单权限。
+`afuture` 只保留一套正式交易链。Auto、研究、Shadow 和实盘复用相同的策略、风险和执行边界；旁路研究只负责证据，不获得第二套下单权限。
+
+当前生产执行链只支持**同品种相邻月份跨期套利**。BU/FU、PP/V 等跨品种关系仅存在于研究层，不具备生产下单权限。
 
 ```text
                  Contract Catalog / Tick
@@ -38,7 +40,7 @@
 `AutoPairManager` 只回答“哪个同品种相邻月组合可以获得开仓资格”：
 
 1. CTP/历史合约目录；
-2. 品种/交易所白名单；
+2. 品种/交易所允许范围；
 3. 到期过滤；
 4. 每品种前几个有效月份；
 5. 相邻月组合；
@@ -48,7 +50,7 @@
 9. Net Edge；
 10. 少量排名入选组合。
 
-它不直接发订单，也不复制策略和风控。
+它不直接发订单，也不复制策略和风控。研究中出现的跨品种经济关系不会自动转化为 `AutoPairManager` 候选。
 
 ## 管理权与开仓权
 
@@ -82,9 +84,7 @@ metadata request queued
 下一次 scan 使用缓存
 ```
 
-恢复已有动态仓位属于启动安全门，可以同步等待元数据；正常 Tick 关键路径不等待。
-
-交易日变化会使缓存失效并重新获取。
+恢复已有动态仓位属于启动安全门，可以同步等待元数据；正常 Tick 关键路径不等待。交易日变化会使缓存失效并重新获取。
 
 ## Warm History
 
@@ -142,13 +142,15 @@ Kill Switch、高水位、动态 pair 和策略状态都持久化；state envelo
 
 `data-check` 在研究前验证原始 CSV 顺序、断档、活动度、合约覆盖和每日 Auto 候选。
 
-### Final Auto Research
+### Auto Research
 
-`accept-auto` 直接运行最终 Auto 生产链，而不是固定 pair 的替代研究器。参数只由 Train+Validation 的小型全局邻域选择，OOS 只用于验收。
+`accept-auto` 运行最终同品种 Auto 生产链，用于生产链本身的 Walk-forward/OOS/Stress 验证。
+
+跨品种经济关系研究属于旁路信号证据：先 broad L3，再 specific-contract roll-safe L4；即使信号存活，也必须另行完成生产执行设计、真实 L1 Shadow 和测试柜台证据，不能直接获得下单权限。
 
 ### Robustness
 
-除成本压力外还执行：
+同品种 Auto 验收包含：
 
 - leave-one-product-out；
 - single-product attribution；
@@ -169,6 +171,16 @@ Kill Switch、高水位、动态 pair 和策略状态都持久化；state envelo
 
 这样 first divergence 可以定位到 selector / risk / execution，而不是只看到最终账户收益变化。
 
+## 当前研究治理状态
+
+2026-08-22 的最终研究收口已确认：
+
+- corrected M/OI 没有通过经济晋级门；
+- BU/FU specific-contract 研究信号存活，但远未达到 100% 年化且没有生产执行证据；
+- Final OOS 已被多轮研究观察，属于 non-pristine；
+- 失败的 cross-sectional、intraday 和 structural 实验代码已从长期维护面移除；
+- `research-2y`、`research-broad`、`research-specific-pairs` 都是手动 milestone 证据门，不是内循环 CI。
+
 ## 不增加的系统层
 
-个人系统当前不需要数据库、消息队列、Web 服务、微服务或第二交易框架。外部多年份数据可以标准化成 CSV；真实观察使用 Shadow；生产状态仍使用本地 JSON/JSONL。
+个人系统当前不需要数据库、消息队列、Web 服务、微服务或第二交易框架。当前瓶颈是未来新 OOS 与真实执行 Net Edge，而不是系统功能数量。

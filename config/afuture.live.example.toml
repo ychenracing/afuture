@@ -1,4 +1,6 @@
-# CTP 自动跨期套利示例。当前生产白名单来自独立两年真实数据资格门，不自动扩张到全市场。
+# CTP 自动跨期套利测试/Shadow 示例。
+# 2026-08-21 修正交易日、23:00 同步采样、front-3 Universe 和 volume 门后，
+# 两年真实数据经济门拒绝当前策略；因此本文件不再代表“已晋级生产 Alpha”。
 [system]
 mode = "live"
 initial_capital = 500000
@@ -8,21 +10,21 @@ environment = "test"
 td_address = "tcp://YOUR_TRADE_FRONT"
 md_address = "tcp://YOUR_MARKET_FRONT"
 
-# 自动发现负责在已通过资格门的品种中选择相邻月份；策略、风控、下单仍走同一生产链路。
 [auto]
 enabled = true
-# 2024-08-21~2026-02-20 的 Train+Validation 在 2x 成本门下只晋级 M/OI；
-# 2026-02-21~2026-08-20 OOS 不参与品种选择。
+# M/OI 仅保留为研究/Shadow 候选，便于复现实验与采集真实执行质量；
+# corrected evidence 未达到生产晋级门，不能据此直接放大实盘风险。
 products = ["m", "OI"]
 exchanges = ["DCE", "CZCE"]
-max_active_pairs = 2
+max_active_pairs = 1
 max_pairs_per_product = 1
 max_contracts_per_product = 3
 min_days_to_expiry = 20
 scan_interval_seconds = 30
 max_sync_seconds = 2.0
 
-# 两年真实数据中心参数：log-ratio 相对价值 + 极端偏离后等待回归确认。
+# 冻结研究参数：log-ratio 相对价值 + 极端偏离后的回归确认。
+# 参数保留用于可重复研究，不等于已证明盈利。
 lookback = 25
 entry_z = 2.5
 exit_z = 0.75
@@ -36,43 +38,43 @@ max_entry_z_slope = 0.75
 min_stationarity_score = 0.01
 max_half_life = 60
 
-# 研究按自然日最后一根 60 分钟 K 线（通常 23:00）验收；实盘在夜盘结束前取一次盘口。
+# 研究和生产都只在中国期货交易日 22:55-23:00 内取两腿完全相同时间戳的样本；
+# 不允许用日盘或不同时间戳补齐缺腿。
 daily_sample_window = "22:55-23:00"
 sample_seconds = 0
 max_holding_samples = 20
-max_pair_volume = 20
+max_pair_volume = 1
 structural_mean_shift_z = 3.0
 structural_vol_ratio = 2.5
 legging_buffer = 50
 
-# 活动度和执行硬门。历史研究至少要求 OI>=5000；实盘额外保留盘口深度和真实 Net Edge 门。
+# 与 corrected 研究一致的活动度门；实盘还要额外通过真实盘口/Net Edge/元数据门。
 min_volume = 1000
 min_open_interest = 5000
 min_liquidity_score = 0.5
 min_net_edge = 100
 slippage_ticks = 1
 metadata_timeout_seconds = 15
-
-# 日盘用于健康监控，真正的新信号只在 daily_sample_window 采样；M/OI 夜盘均覆盖到 23:00。
 session_windows = ["09:00-10:15", "10:30-11:30", "13:30-15:00", "21:00-23:00"]
 
 [risk]
-# 风险预算由历史 R 风险单位校准；2% 是候选上限，保证金、深度、单合约上限会进一步压缩手数。
-max_margin_ratio = 0.35
+# 未晋级策略只给测试/Shadow 级风险预算。后续只有新的 OOS + Shadow + test-cabinet
+# 证据通过后才允许逐步提高，不允许通过放大风险预算制造“100% 年化”。
+max_margin_ratio = 0.20
 max_daily_loss_ratio = 0.01
 max_total_drawdown_ratio = 0.08
-max_open_pairs = 2
-max_contract_volume = 20
+max_open_pairs = 1
+max_contract_volume = 1
 max_quote_age_seconds = 10
 max_leg_skew_seconds = 2.0
 expiry_blackout_days = 5
-min_available_ratio = 0.55
+min_available_ratio = 0.70
 margin_estimate_buffer = 1.25
 max_orders_per_minute = 20
 min_depth_multiple = 2.0
 max_bid_ask_ticks = 3
 limit_distance_ticks = 3
-risk_budget_ratio = 0.02
+risk_budget_ratio = 0.002
 risk_sigma_multiplier = 2.5
 open_cooldown_minutes = 2
 close_blackout_minutes = 5
@@ -82,7 +84,6 @@ slippage_ticks = 1
 aggressive_ticks = 1
 auto_flatten_imbalance = true
 legging_timeout_seconds = 2.0
-# 实盘不使用以下模拟撮合参数；保留显式值便于复制到压力回放。
 conservative_simulation = true
 latency_ticks = 1
 market_impact_ticks = 1
@@ -97,5 +98,4 @@ journal = "runtime/audit.jsonl"
 alert = "runtime/alerts.jsonl"
 
 [alert]
-# 可选通用 Webhook；留空时仍会写本地 alerts.jsonl。
 webhook = ""

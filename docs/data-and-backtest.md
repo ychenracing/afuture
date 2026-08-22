@@ -1,28 +1,28 @@
 # 数据、回放与研究
 
-## 1. 数据格式
+## 1. 数据层级
 
-CSV 必需列：
+### 生产 / 高质量回放
+
+标准 Tick CSV：
 
 ```text
 timestamp,symbol,exchange,bid_price,ask_price,last_price,bid_volume,ask_volume,trading_day
 ```
 
-正式 Auto 研究强烈要求：
+Auto 研究还应包含：
 
 ```text
 limit_up,limit_down,volume,open_interest
 ```
 
-要求：
+`timestamp` 必须带时区，中国期货交易时段统一按 `Asia/Shanghai` 解释。
 
-- `timestamp` 必须带时区；
-- `trading_day` 使用期货交易日；
-- bid/ask 和一档数量必须有效；
-- volume/OI 不得为负；
-- 同一 Auto Universe 需要同时覆盖多个品种、多个交割月份和换月周期。
+### 公开真实历史研究
 
-## 2. 先做 Data Quality Gate
+仓库使用 AKShare/Sina 的 specific-contract 60 分钟或日线 OHLC、成交量和持仓量做信号级验证。公开源没有多年完整 L1 bid/ask/depth，因此这些结果**不能替代**真实盘口 Shadow、测试柜台或实盘成交证据。
+
+## 2. Data Quality Gate
 
 ```bash
 afuture data-check \
@@ -30,27 +30,20 @@ afuture data-check \
   --data path/to/data.csv
 ```
 
-该命令**不先排序源文件**，因此能够发现数据供应链中的真实乱序。输出包括：
+检查时间范围、交易日、duplicate/out-of-order、无效盘口、volume/OI 缺失、长断档、每日 Auto pair 和数据集中度。
 
-- tick 总数；
-- 合约数；
-- 交易日数；
-- 每日样本数；
-- duplicate；
-- out-of-order；
-- invalid quote；
-- volume/OI 缺失数量和比例；
-- 涨跌停字段缺失；
-- 日内长断档；
-- 每品种合约/交易日/样本覆盖；
-- 单一品种最大样本占比；
-- 每个交易日根据**当天实际出现的合约**能生成多少 Auto pair。
+配置式历史回放可在 `[[contracts]]` 中提供：
 
-一个历史目录里存在两个合约并不够；当天数据必须真的同时出现两腿，否则该交易日 Auto candidate 数为 0 并视为硬失败。
+```toml
+listing = "2025-09-15"
+expiry = "2026-09-15"
+```
 
-## 3. Replay 与真实生产链一致
+`listing` 会进入 `ContractInfo`，用于 point-in-time Universe 防前视。
 
-`afuture replay` 使用：
+## 3. Replay 与生产事件链
+
+`afuture replay` 复用生产边界：
 
 ```text
 AutoPairManager
@@ -61,162 +54,145 @@ AutoPairManager
 → SimBroker
 ```
 
-同一 timestamp 的多腿行情先作为一批注入模拟柜台，再运行一次事件循环。历史健康时钟使用事件时间，实盘使用墙钟。
+关键时间语义：
 
-`SimBroker` 支持：
+- 历史行情健康、裸腿超时和普通报单限速使用**事件时间**；
+- 实盘使用墙钟/单调时钟；
+- SimBroker 延迟旧单由当前 Tick 触发成交时，`trade/order` 回报必须先于同 Tick 的新策略决策。
 
-- FAK/FOK/LIMIT；
-- 一档深度共享与消耗；
-- 部分成交；
-- 手续费；
-- 滑点；
-- latency ticks；
-- market impact；
-- 今昨仓和平仓规则。
+这样不会把多年历史订单压缩成几秒 CPU 时间，也不会在 broker 已成交而 Engine 尚未收到成交事件时继续用同一行情重复决策。
 
-它不能完整模拟交易所队列位置和极端网络条件，因此回放只作为筛选证据。
+## 4. corrected 同品种 60 分钟研究
 
-## 4. 单 Pair 与最终 Auto Portfolio 必须区分
+`.github/workflows/research-2y.yml` 是昂贵的手动 L4 milestone gate。
 
-`afuture accept` 用于固定 pair 的研究诊断。它适合：
+固定窗口：
 
-- 看某个价差是否存在均值回归；
-- first divergence；
-- 验证具体参数行为。
+```text
+prior1      2022-08-22~2023-08-20
+prior2      2023-08-21~2024-08-20
+train       2024-08-21~2025-08-20
+validation  2025-08-21~2026-02-20
+final OOS   2026-02-21~2026-08-20
+```
 
-它**不能**代替最终 Auto 组合晋级，因为最终机器人还有：
+### 中国期货交易日
 
-- 多品种候选竞争；
-- max active pairs；
-- 动态 pair 生命周期；
-- 动态手数；
-- PortfolioRisk；
-- 资金竞争；
-- 换月。
+夜盘 `>=20:00` 映射到下一观察到的日盘交易日；尾部无法确认后续交易日时 fail-closed。
 
-生产晋级应使用：
+### 同步采样
+
+冻结的日频规则只接受 `22:55-23:00` 内两腿**完全相同的 60 分钟 timestamp**；缺腿就是缺样本，不用 15:00 或其它时间补齐。
+
+### 当时可见活动度
+
+`visible_volume` 是 mapped futures trading day 内截至采样时刻的累计成交量；OI 使用同步采样时刻值。
+
+```text
+min_volume = 1000
+min_open_interest = 5000
+```
+
+### Point-in-time Universe
+
+```text
+20-day delivery/expiry blackout
+→ front 3 eligible contracts
+→ adjacent pairs only
+```
+
+生产使用 CTP 官方 ExpireDate。公开历史 60 分钟源没有完整历史 ExpireDate，研究使用交割月 15 日作为显式保守 proxy。
+
+## 5. 单 Pair 与 Auto Portfolio
+
+`afuture accept` 只用于固定 pair 诊断；正式 Auto 研究使用：
 
 ```bash
 afuture accept-auto ...
 ```
 
-## 5. `accept-auto` 时间隔离
+覆盖 Train→Validation→OOS、全局小邻域、成本压力、leave-one-product-out、single-product attribution、remove-best-period、depth haircut、latency/market impact、数据 gap、quote skew 和 activity missing。
 
-严格顺序：
+研究目标是泛化，不是单一区间最高收益。
 
-```text
-Train → Validation → 参数冻结 → OOS
-```
+## 6. corrected M/OI 结果
 
-OOS 绝不参与参数选择。
-
-默认没有高维网格，而是在当前配置周围构造一个小型**全局参数邻域**：
-
-- lookback；
-- entry_z；
-- exit_z；
-- min_net_edge；
-- min_stationarity_score；
-- max_half_life。
-
-不优化：
-
-- risk budget；
-- margin cap；
-- max active pairs；
-- 每个商品独立参数；
-- 生产时在线参数。
-
-这样优先控制自由度，而不是追求历史最高收益。
-
-## 6. 最终 Auto Portfolio Stress
-
-### 成本
+详见 [最终研究证据结论](research-final-evidence.md) 和 [两年真实数据验证结论](two_year_real_data_validation.md)。核心结果：
 
 ```text
-1.0x / 1.5x / 2.0x
+prior-forward       = 4 trades, -1.958R
+final OOS            = 2 trades, +0.296R
+recent two years     = 5 trades, +1.028R
+neighbor stability   = 0 / 16
+2% risk proxy annualized ≈ 1.07%
+100% annualized target = NOT MET
 ```
 
-同时放大手续费/滑点/legging buffer。
+所以原 M/OI 规则没有生产晋级。
 
-### Universe
+## 7. 扩展家族的分层研究
 
-- leave-one-product-out；
-- single-product attribution。
+### L3 broad economic-pair
 
-用于检查收益是否其实由单一历史赢家提供。
+约 50 个中国商品期货主连首先用于低成本 broad screen。cross-sectional momentum / slow-fast / reversal / skewness 没有形成稳定家族，因此其实验代码已在最终清理中移除，只保留结论。
 
-### 时间
+随后只保留同交易所、经济关系明确的 pair，使用滚动 beta、残差 Z-score、相关性、OU 半衰期和 volatility regime。资本只分给当前最强的少量合格 pair，并把 gross leverage 封顶在 2x。
 
-- remove-best-OOS-period。
+`.github/workflows/research-broad.yml` 现在只保留这条有信息价值的经济关系 L3，且为手动 milestone gate。
 
-删除最佳 OOS 段后如果策略严重崩塌，说明结果可能依赖偶然历史窗口。
+### L4 specific-contract roll-safe
 
-### 微观结构
+`.github/workflows/research-specific-pairs.yml` 对 L3 存活关系做具体合约复验：
 
-- top-depth haircut；
-- +1/+2 latency ticks；
-- +1 market-impact tick。
+- 当日 OI/成交量选择具体合约；
+- 20 天交割黑窗；
+- t 日选择的合约必须同时提供 t 和 t+1 收益；
+- 换月时不把不同合约价格跳空拼成 Alpha；
+- 30bp 单边压力成本；
+- 最多 1 个 pair；
+- gross leverage ≤ 2x。
 
-### 数据扰动
+六条预注册关系为 P/Y、PP/V、AL/ZN、BU/FU、CU/AL、J/JM。最终主要收敛到 BU/FU，prior 还包含 PP/V。
 
-- 2% / 5% 确定性 Tick gap；
-- 0.5 / 1 / 2 秒远月 quote skew；
-- 少量 volume/OI missing。
-
-压力场景不是为了准确预测未来，而是检查安全边际。
-
-## 7. 预注册晋级门
-
-默认起点：
-
-| Gate | 默认值 |
-|---|---:|
-| Aggregate OOS Return | > 0 |
-| Positive OOS Fold Ratio | >= 60% |
-| Worst OOS Drawdown | <= 6% |
-| OOS trade sample | 至少有基本交易样本 |
-| Worst cost stress | 不低于 -2% |
-| Leave-one-product-out | 不得灾难性崩塌 |
-| Single-product concentration | 多品种时受限 |
-
-这些门应该在正式最终 OOS 前确定。不能看见不满意的 OOS 后再反向降低门槛。
-
-## 8. 推荐正式数据范围
-
-代码仓库不能凭空产生真实两年数据。正式证据建议由外部数据源提供标准 CSV，至少覆盖约两年并包含：
-
-- 高/低波动；
-- 趋势商品环境；
-- 震荡环境；
-- 多次换月；
-- 不同流动性阶段；
-- 多个白名单品种；
-- bid/ask/depth/volume/OI。
-
-外部数据进入 afuture 后的固定流程：
+已验证压力结果约为：
 
 ```text
-data-check
-→ accept-auto
-→ Shadow
-→ CTP test cabinet
-→ tiny live
+recent two-year annualized ≈ 4.20%
+recent two-year max drawdown ≈ 12.88%
+final OOS annualized ≈ 5.78%
+final OOS max drawdown ≈ 11.78%
+alpha_survives_specific_contract = true
+target_met = false
 ```
 
-不要为了得到更高历史收益在同一 OOS 上反复改白名单和参数。
+这里的 `alpha_survives_specific_contract` 只证明研究信号经受住真实换月语义，不代表跨品种 pair 已接入生产执行。
 
-## 9. 研究结果的正确阅读方式
+## 8. 被拒绝并清理的实验
 
-优先顺序：
+- BU/FU + PP/V 60 分钟 intraday：24 个预注册 profile，**0 个**通过 pre-OOS 门；
+- soybean crush、steel/coke margin、polymer/base-metals 等多腿结构：没有形成足够稳定且高收益的家族；
+- 失败实验不保留为长期维护代码，只在 `research-final-evidence.md` 和 cleanup inventory 中保留证据与拒绝原因。
 
-1. OOS Calmar / Return；
-2. Worst OOS Drawdown；
-3. Positive fold ratio；
-4. 2x cost stress；
-5. Leave-one-product-out；
-6. 单品种贡献集中度；
-7. 交易次数；
-8. 实盘/Shadow execution quality。
+## 9. OOS 状态与后续研究
 
-单个窗口年化收益或 Sharpe 在样本短时很容易失真，不应该成为唯一目标。
+当前 Final OOS 已被多轮研究观察，代码和文档统一标记为 **non-pristine**。它不能再作为新功能的真正未见样本。
+
+后续只有以下新增信息能改变经济结论：
+
+- 新发生、此前未见的交易日；
+- 真实 CTP L1 Shadow；
+- 更可靠的历史 L1 数据；
+- 测试柜台/小资金真实成交质量。
+
+没有新增证据时，不继续扩大历史参数搜索空间，也不通过高杠杆制造年化 100% 的历史数字。
+
+## 10. 验证层级
+
+```text
+L1  局部单测 / 因果回归
+L2  相关策略或模块 smoke
+L3  broad universe / family screen
+L4  specific-contract / 完整经济证据门
+```
+
+普通小改动不反复触发 L3/L4；最终候选由主 CI 做完整工程验收。
