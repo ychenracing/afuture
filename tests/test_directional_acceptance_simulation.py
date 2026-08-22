@@ -50,6 +50,22 @@ def test_total_drawdown_breach_remains_permanent_halt():
     assert result.daily.loc[pd.Timestamp("2026-08-24"),"halted"]
 
 
+def test_total_drawdown_outranks_daily_loss_when_both_are_breached():
+    raw = pd.DataFrame([
+        {"date":"2026-08-20","product":"A","exchange":"DCE","symbol":"A2609","delivery":"2026-12-15","open":100,"close":100,"volume":5000,"hold":30000},
+        {"date":"2026-08-21","product":"A","exchange":"DCE","symbol":"A2609","delivery":"2026-12-15","open":100,"close":60,"volume":5000,"hold":30000},
+        {"date":"2026-08-24","product":"A","exchange":"DCE","symbol":"A2609","delivery":"2026-12-15","open":60,"close":120,"volume":5000,"hold":30000},
+    ])
+    weights = pd.DataFrame({"A":[1.0,1.0]}, index=pd.to_datetime(["2026-08-21","2026-08-24"]))
+    sim = DirectionalProductionAcceptance(ProductionMechanicsConfig(initial_capital=100000,max_contract_volume=100,max_daily_loss_ratio=.05,max_total_drawdown_ratio=.30,max_margin_ratio=.9,min_available_ratio=0))
+    result = sim.simulate(raw, weights, cost_bps=0)
+    first = result.daily.loc[pd.Timestamp("2026-08-21")]
+    assert first["risk_reason"] == "drawdown limit reached"
+    assert first["halted"]
+    assert not first["daily_circuit"]
+    assert result.daily.loc[pd.Timestamp("2026-08-24"),"gross_notional"] == 0
+
+
 def test_overnight_gap_loss_counts_against_day_start_loss_gate():
     raw = pd.DataFrame([
         {"date":"2026-08-20","product":"A","exchange":"DCE","symbol":"A2609","delivery":"2026-12-15","open":100,"close":100,"volume":5000,"hold":30000},
