@@ -2,133 +2,22 @@ name: ci
 
 on:
   push:
-    branches:
-      - codex/afuture-production-reality-closure-20260822
-    paths:
-      - .github/workflows/ci.yml
-
-permissions:
-  actions: read
-  contents: write
+  pull_request:
 
 jobs:
-  capture-final-l4:
+  directional-trading-day-targeted:
     runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-      TARGET_SHA: dab4ea5620abafbfe9352747df46bc736720f012
-      TARGET_BRANCH: codex/afuture-production-reality-closure-20260822
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          ref: codex/afuture-production-reality-closure-20260822
-          fetch-depth: 0
-      - name: Locate, wait for and capture the one-off L4
-        shell: bash
-        run: |
-          set -euo pipefail
-          runs="$(gh run list \
-            --repo "$GITHUB_REPOSITORY" \
-            --workflow research-return-target-specific.yml \
-            --branch "$TARGET_BRANCH" \
-            --event push \
-            --limit 20 \
-            --json databaseId,headSha,status,conclusion,url)"
-          RUN_ID="$(RUNS="$runs" TARGET_SHA="$TARGET_SHA" python - <<'PY'
-          import json, os
-          rows = json.loads(os.environ["RUNS"])
-          target = os.environ["TARGET_SHA"]
-          matches = [row for row in rows if row.get("headSha") == target]
-          print(matches[0]["databaseId"] if matches else "")
-          PY
-          )"
-          if [ -z "$RUN_ID" ]; then
-            echo "Could not locate L4 run for $TARGET_SHA" >&2
-            exit 1
-          fi
-          echo "L4 run id: $RUN_ID"
-
-          set +e
-          gh run watch "$RUN_ID" --repo "$GITHUB_REPOSITORY" --exit-status
-          watch_code=$?
-          set -e
-
-          mkdir -p runtime/l4-capture
-          gh run view "$RUN_ID" \
-            --repo "$GITHUB_REPOSITORY" \
-            --json databaseId,status,conclusion,headSha,event,url \
-            > runtime/l4-run.json
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts" \
-            > runtime/l4-artifacts.json
-          gh run download "$RUN_ID" \
-            --repo "$GITHUB_REPOSITORY" \
-            -n return-target-specific-evidence \
-            -D runtime/l4-capture || true
-
-          python - <<'PY'
-          import json
-          from pathlib import Path
-
-          root = Path("runtime/l4-capture")
-          run = json.loads(Path("runtime/l4-run.json").read_text())
-          artifacts = json.loads(Path("runtime/l4-artifacts.json").read_text())
-          chosen = next(
-              (item for item in artifacts.get("artifacts", [])
-               if item.get("name") == "return-target-specific-evidence"),
-              None,
-          )
-          payload = {
-              "run": run,
-              "artifact": chosen,
-              "float": None,
-              "production_proxy": None,
-          }
-          float_path = root / "execution_aligned_target_report.json"
-          proxy_path = root / "directional_production_mechanics_report.json"
-          if float_path.exists():
-              r = json.loads(float_path.read_text(encoding="utf-8"))
-              payload["float"] = {
-                  "base_full_recent": r["next_open_execution"]["base"]["full_recent"],
-                  "stress_full_recent": r["next_open_execution"]["stress"]["full_recent"],
-                  "extreme_full_recent": r["next_open_execution"]["extreme"]["full_recent"],
-                  "base_oos": r["next_open_execution"]["base"]["oos"],
-                  "stress_oos": r["next_open_execution"]["stress"]["oos"],
-                  "target": r["target"],
-              }
-          if proxy_path.exists():
-              r = json.loads(proxy_path.read_text(encoding="utf-8"))
-              payload["production_proxy"] = {
-                  "state_reset_per_window": r["state_reset_per_window"],
-                  "base_full_recent": r["base"]["windows"]["full_recent"],
-                  "stress_full_recent": r["stress"]["windows"]["full_recent"],
-                  "base_oos": r["base"]["windows"]["oos"],
-                  "stress_oos": r["stress"]["windows"]["oos"],
-                  "base": {
-                      "first_divergence": r["base"]["first_divergence"],
-                      "halted": r["base"]["halted"],
-                      "margin_reject_days": r["base"]["margin_reject_days"],
-                      "max_realized_gross_notional_ratio": r["base"]["max_realized_gross_notional_ratio"],
-                  },
-                  "stress": {
-                      "first_divergence": r["stress"]["first_divergence"],
-                      "halted": r["stress"]["halted"],
-                      "margin_reject_days": r["stress"]["margin_reject_days"],
-                      "max_realized_gross_notional_ratio": r["stress"]["max_realized_gross_notional_ratio"],
-                  },
-                  "production_gap": r["production_gap"],
-              }
-          Path("docs/.directional_l4_capture.json").write_text(
-              json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
-              encoding="utf-8",
-          )
-          PY
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/.directional_l4_capture.json
-          git commit -m "chore: capture final directional L4 evidence" || true
-          git push origin HEAD:"$TARGET_BRANCH"
-
-          # Preserve the L4 failure as evidence in the committed JSON rather than
-          # silently starting a second expensive run.
-          echo "L4 watch exit code: $watch_code"
+          python-version: "3.13"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - name: Directional trading-day regression
+        run: >-
+          python -m pytest -q
+          tests/test_directional_trading_day_selection.py
+          tests/test_execution_aligned_runtime.py
+          tests/test_directional_review_regressions.py
+      - run: python -m compileall -q afuture
