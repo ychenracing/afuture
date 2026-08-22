@@ -37,7 +37,7 @@ jobs:
           python tools/evaluate_aggressive_directional.py
       - name: Fetch all concrete contracts needed for L4
         run: python tools/fetch_return_target_specific_daily.py
-      - name: Validate frozen target on roll-safe concrete contracts
+      - name: Validate continuous signals on roll-safe concrete contracts
         run: |
           python tools/evaluate_return_target_specific.py
           python - <<'PY'
@@ -51,7 +51,7 @@ jobs:
           print(json.dumps({
               "data_quality": report["data_quality"],
               "frozen_weight_replay": report["frozen_weight_replay"],
-              "recomputed_roll_safe": report["recomputed_roll_safe"],
+              "continuous_signal_roll_safe": report["continuous_signal_roll_safe"],
               "target": report["target"],
           }, ensure_ascii=False, indent=2))
           PY
