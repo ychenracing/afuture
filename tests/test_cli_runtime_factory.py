@@ -4,7 +4,10 @@ from afuture.cli import _build_cli_engine
 from afuture.directional import DirectionalConfig
 from afuture.directional_engine import DirectionalTradingEngine
 from afuture.engine import TradingEngine
-from afuture.execution_aligned_runtime import ExecutionAlignedDirectionalPortfolioManager
+from afuture.execution_aligned_runtime import (
+    ExecutionAlignedDirectionalPortfolioManager,
+    FROZEN_PRODUCTS,
+)
 from afuture.risk import RiskConfig
 from afuture.state import StateStore
 
@@ -24,8 +27,8 @@ def _config(enabled: bool):
         metadata_timeout_seconds=10.0,
         directional=DirectionalConfig(
             enabled=enabled,
-            products=("A",) if enabled else (),
-            exchanges=("DCE",),
+            products=FROZEN_PRODUCTS if enabled else (),
+            exchanges=("DCE", "CZCE", "SHFE", "INE"),
             signal_max_age_hours=120.0,
         ),
         pairs=[],
