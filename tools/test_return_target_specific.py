@@ -90,18 +90,26 @@ costed = base.apply_next_open_product_weights(gap, intraday, weights, cost_bps=1
 assert abs((path.iloc[1] - costed.iloc[1]) - 0.001) < 1e-12
 assert abs((path.iloc[2] - costed.iloc[2]) - 0.002) < 1e-12
 
-proxy_raw = pd.DataFrame(
-    [
-        {"date": idx[0], "product": "A", "open": 100.0, "close": 100.0},
-        {"date": idx[1], "product": "A", "open": 110.0, "close": 113.3},
-        {"date": idx[2], "product": "A", "open": 134.827, "close": 140.22008},
-    ]
+# The execution proxy freezes product ordering alphabetically. Stable sort ties in
+# breakout/range signals must not change strategy behavior when callers reorder products.
+proxy_rows = []
+for product, scale in (("M", 2.0), ("A", 1.0)):
+    proxy_rows.extend(
+        [
+            {"date": idx[0], "product": product, "open": 100.0 * scale, "close": 100.0 * scale},
+            {"date": idx[1], "product": product, "open": 110.0 * scale, "close": 113.3 * scale},
+            {"date": idx[2], "product": product, "open": 134.827 * scale, "close": 140.22008 * scale},
+        ]
+    )
+proxy_gap, proxy_intraday = evaluator.build_continuous_execution_proxy(
+    pd.DataFrame(proxy_rows), products=("M", "A")
 )
-proxy_gap, proxy_intraday = evaluator.build_continuous_execution_proxy(proxy_raw, products=("A",))
+assert list(proxy_gap.columns) == ["A", "M"]
+assert list(proxy_intraday.columns) == ["A", "M"]
 assert abs(proxy_gap.loc[idx[1], "A"] - 0.10) < 1e-12
 assert abs(proxy_intraday.loc[idx[1], "A"] - 0.03) < 1e-12
 assert abs(proxy_gap.loc[idx[2], "A"] - 0.19) < 1e-12
 assert abs(proxy_intraday.loc[idx[2], "A"] - 0.04) < 1e-12
 assert evaluator.PRISTINE_FINAL_OOS is False
 
-print("return-target specific-ranked intraday-meta tests passed")
+print("return-target specific-ranked deterministic-order tests passed")
