@@ -36,9 +36,11 @@ def build_runtime_engine(
 
     if config.directional.enabled:
         from .directional_engine import DirectionalTradingEngine
-        from .directional_runtime import DirectionalPortfolioManager
+        from .execution_aligned_runtime import (
+            ExecutionAlignedDirectionalPortfolioManager,
+        )
 
-        manager = DirectionalPortfolioManager(
+        manager = ExecutionAlignedDirectionalPortfolioManager(
             config.directional,
             broker,
             risk_manager,
