@@ -245,6 +245,8 @@ def test_directional_engine_records_broker_order_and_trade_callbacks_after_posit
     )
     engine._handle_order_event(order)
     assert manager.quality_orders == [order]
+    # Terminal order status must not finalize the cycle before its Trade callback.
+    assert manager.quality_finalize_calls == 0
 
     trade = Trade(
         "t-1",
@@ -270,4 +272,4 @@ def test_directional_engine_records_broker_order_and_trade_callbacks_after_posit
     assert recorded_trade == trade
     assert kwargs["commission"] == 1.5
     assert kwargs["commission_source"] == "broker_trade"
-    assert manager.quality_finalize_calls >= 2
+    assert manager.quality_finalize_calls == 1
