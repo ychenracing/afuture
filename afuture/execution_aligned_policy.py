@@ -1,9 +1,11 @@
-"""Frozen execution-aligned directional portfolio policy.
+"""Frozen specific-ranked directional portfolio policy.
 
-The candidate pool was selected on the already-observed 2024-08-21..2026-08-20
-specific-contract next-open history. Live template rotation remains causal: template
-signals use the previous close and meta scores use only completed continuous-contract
-close->open/open->close execution-proxy returns. Portfolio gross notional is capped at 2x.
+The template pool was selected on the already-observed 2024-08-21..2026-08-20
+specific-contract next-open history. Daily live rotation remains causal: each template
+signal uses the previous close and the meta allocator ranks templates only from completed
+continuous-contract open->close returns. Ignoring continuous overnight gaps prevents roll
+jumps in the signal feed from becoming meta-performance evidence. Gross notional is
+capped at 2x before the shared account/margin/microstructure gates apply.
 """
 from __future__ import annotations
 
@@ -21,72 +23,108 @@ from .directional import (
 )
 
 BASE_COST_BPS = 5.0
+META_LOOKBACK = 10
+META_REBALANCE = 5
+META_COUNT = 3
+META_SCORE_SOURCE = "continuous_intraday_proxy"
 
 _EXECUTION_TEMPLATE_IDS = (
-    "momentum_s20_f0_k1_r10_g2",
     "breakout_s120_f0_k1_r1_g2",
-    "breakout_s40_f0_k1_r2_g2",
-    "acceleration_s20_f5_k1_r10_g2",
-    "moving_average_s60_f0_k1_r2_g2",
+    "tsmom_s40_f0_k1_r2_g2",
     "moving_average_s60_f0_k1_r5_g2",
-    "acceleration_s20_f3_k1_r10_g2",
-    "tsmom_s20_f0_k1_r10_g2",
-    "breakout_s60_f0_k1_r2_g2",
+    "breakout_s5_f0_k1_r2_g2",
     "breakout_s60_f0_k1_r1_g2",
     "moving_average_s60_f0_k1_r1_g2",
-    "moving_average_s60_f0_k3_r2_g2",
-    "tsmom_s40_f0_k3_r10_g2",
-    "moving_average_s40_f0_k1_r10_g2",
-    "breakout_s120_f0_k1_r2_g2",
+    "reversal_s0_f10_k1_r2_g2",
+    "acceleration_s40_f5_k2_r2_g2",
     "tsmom_s40_f0_k2_r5_g2",
-    "momentum_s20_f0_k3_r10_g2",
-    "moving_average_s40_f0_k1_r2_g2",
-    "acceleration_s40_f5_k3_r10_g2",
-    "tsmom_s40_f0_k2_r10_g2",
-    "breakout_s5_f0_k1_r5_g2",
-    "breakout_s20_f0_k1_r2_g2",
-    "acceleration_s40_f5_k2_r5_g2",
-    "acceleration_s40_f5_k2_r10_g2",
-    "moving_average_s60_f0_k2_r2_g2",
-    "breakout_s40_f0_k1_r1_g2",
-    "tsmom_s40_f0_k5_r10_g2",
+    "acceleration_s10_f3_k1_r10_g2",
+    "moving_average_s60_f0_k1_r2_g2",
+    "moving_average_s60_f0_k1_r10_g2",
     "tsmom_s40_f0_k2_r2_g2",
+    "acceleration_s20_f5_k3_r10_g2",
+    "breakout_s40_f0_k5_r10_g2",
+    "breakout_s5_f0_k1_r5_g2",
+    "acceleration_s40_f5_k2_r5_g2",
+    "breakout_s40_f0_k1_r1_g2",
+    "moving_average_s120_f0_k1_r2_g2",
+    "reversal_s0_f1_k5_r10_g2",
     "breakout_s40_f0_k2_r1_g2",
     "tsmom_s40_f0_k3_r5_g2",
     "acceleration_s40_f5_k2_r1_g2",
     "moving_average_s120_f0_k2_r5_g2",
+    "acceleration_s40_f5_k3_r2_g2",
     "breakout_s20_f0_k1_r5_g2",
+    "moving_average_s120_f0_k1_r10_g2",
     "moving_average_s120_f0_k1_r1_g2",
+    "reversal_s0_f5_k5_r10_g2",
     "acceleration_s20_f5_k1_r5_g2",
-    "tsmom_s40_f0_k5_r2_g2",
     "momentum_s20_f0_k1_r5_g2",
     "tsmom_s40_f0_k2_r1_g2",
+    "moving_average_s120_f0_k2_r2_g2",
     "moving_average_s40_f0_k1_r1_g2",
-    "moving_average_s120_f0_k2_r10_g2",
-    "acceleration_s40_f5_k5_r10_g2",
-    "moving_average_s40_f0_k5_r2_g2",
-    "momentum_s40_f0_k1_r2_g2",
-    "momentum_s20_f0_k2_r10_g2",
-    "acceleration_s40_f5_k1_r2_g2",
+    "tsmom_s40_f0_k2_r10_g2",
+    "moving_average_s40_f0_k2_r10_g2",
+    "acceleration_s40_f5_k2_r10_g2",
     "moving_average_s40_f0_k5_r5_g2",
     "breakout_s40_f0_k3_r1_g2",
-    "tsmom_s20_f0_k5_r10_g2",
+    "acceleration_s10_f3_k2_r10_g2",
     "acceleration_s120_f10_k5_r1_g2",
     "moving_average_s60_f0_k3_r1_g2",
+    "breakout_s60_f0_k5_r10_g2",
     "reversal_s0_f1_k1_r5_g2",
     "moving_average_s120_f0_k1_r5_g2",
-    "moving_average_s40_f0_k5_r10_g2",
+    "reversal_s0_f5_k2_r10_g2",
     "moving_average_s60_f0_k2_r1_g2",
-    "tsmom_s10_f0_k2_r10_g2",
-    "moving_average_s120_f0_k3_r2_g2",
+    "momentum_s20_f0_k1_r10_g2",
+    "tsmom_s40_f0_k3_r2_g2",
+    "reversal_s0_f1_k3_r10_g2",
     "reversal_s0_f1_k2_r5_g2",
-    "breakout_s40_f0_k3_r2_g2",
-    "breakout_s40_f0_k2_r2_g2",
-    "acceleration_s20_f3_k3_r10_g2",
-    "acceleration_s120_f10_k5_r2_g2",
+    "breakout_s10_f0_k1_r2_g2",
     "tsmom_s40_f0_k1_r5_g2",
-    "acceleration_s20_f3_k5_r10_g2",
-    "moving_average_s120_f0_k5_r2_g2",
+    "acceleration_s20_f5_k1_r10_g2",
+    "breakout_s10_f0_k1_r5_g2",
+    "tsmom_s40_f0_k1_r1_g2",
+    "moving_average_s120_f0_k3_r5_g2",
+    "moving_average_s120_f0_k2_r10_g2",
+    "moving_average_s40_f0_k5_r10_g2",
+    "acceleration_s20_f5_k2_r5_g2",
+    "acceleration_s20_f5_k3_r5_g2",
+    "moving_average_s120_f0_k2_r1_g2",
+    "acceleration_s40_f5_k1_r1_g2",
+    "breakout_s120_f0_k5_r10_g2",
+    "reversal_s0_f1_k2_r10_g2",
+    "momentum_s120_f0_k1_r10_g2",
+    "tsmom_s40_f0_k3_r1_g2",
+    "breakout_s20_f0_k5_r10_g2",
+    "moving_average_s120_f0_k3_r1_g2",
+    "acceleration_s40_f5_k3_r5_g2",
+    "breakout_s40_f0_k5_r5_g2",
+    "tsmom_s10_f0_k2_r10_g2",
+    "acceleration_s40_f5_k3_r1_g2",
+    "tsmom_s40_f0_k1_r10_g2",
+    "tsmom_s40_f0_k3_r10_g2",
+    "breakout_s40_f0_k5_r2_g2",
+    "moving_average_s60_f0_k3_r2_g2",
+    "breakout_s60_f0_k2_r1_g2",
+    "acceleration_s120_f20_k5_r10_g2",
+    "moving_average_s60_f0_k2_r10_g2",
+    "acceleration_s40_f5_k3_r10_g2",
+    "reversal_s0_f10_k1_r5_g2",
+    "tsmom_s3_f0_k1_r10_g2",
+    "acceleration_s20_f5_k2_r10_g2",
+    "reversal_s0_f10_k1_r1_g2",
+    "momentum_s120_f0_k2_r5_g2",
+    "acceleration_s60_f10_k3_r1_g2",
+    "breakout_s5_f0_k1_r1_g2",
+    "breakout_s60_f0_k5_r2_g2",
+    "breakout_s60_f0_k5_r1_g2",
+    "reversal_s0_f1_k3_r5_g2",
+    "moving_average_s60_f0_k2_r2_g2",
+    "breakout_s20_f0_k3_r10_g2",
+    "acceleration_s120_f10_k5_r5_g2",
+    "breakout_s40_f0_k1_r5_g2",
+    "reversal_s0_f5_k3_r10_g2",
 )
 _EXECUTION_TEMPLATES = tuple(_parse_template_id(item) for item in _EXECUTION_TEMPLATE_IDS)
 
@@ -102,19 +140,16 @@ def _clean_prices(frame: pd.DataFrame, products: tuple[str, ...]) -> pd.DataFram
     return result.where(result > 0.0)
 
 
-def _execution_proxy_stream(
+def _intraday_proxy_stream(
     open_prices: pd.DataFrame,
     close: pd.DataFrame,
     weights: pd.DataFrame,
     *,
     cost_bps: float = BASE_COST_BPS,
 ) -> pd.Series:
-    gap = open_prices.div(close.shift(1)) - 1.0
     intraday = close.div(open_prices) - 1.0
-    gap = gap.mask(gap.abs() > MAX_ABS_DAILY_RETURN).fillna(0.0)
     intraday = intraday.mask(intraday.abs() > MAX_ABS_DAILY_RETURN).fillna(0.0)
-    old_weights = weights.shift(1).fillna(0.0)
-    pnl = (old_weights * gap).sum(axis=1) + (weights * intraday).sum(axis=1)
+    pnl = (weights * intraday).sum(axis=1)
     turnover = weights.diff().abs().sum(axis=1)
     if len(turnover):
         turnover.iloc[0] = float(weights.iloc[0].abs().sum())
@@ -124,9 +159,10 @@ def _execution_proxy_stream(
 @dataclass(frozen=True)
 class ExecutionAlignedAggressivePolicy:
     products: tuple[str, ...]
-    meta_lookback: int = 5
-    meta_rebalance: int = 10
-    meta_count: int = 4
+    meta_lookback: int = META_LOOKBACK
+    meta_rebalance: int = META_REBALANCE
+    meta_count: int = META_COUNT
+    meta_score_source: str = META_SCORE_SOURCE
     template_ids: tuple[str, ...] = _EXECUTION_TEMPLATE_IDS
 
     def __post_init__(self) -> None:
@@ -134,6 +170,13 @@ class ExecutionAlignedAggressivePolicy:
             raise ValueError("execution-aligned policy products cannot be empty")
         if self.template_ids != _EXECUTION_TEMPLATE_IDS:
             raise ValueError("execution-aligned template pool is frozen")
+        if (
+            self.meta_lookback != META_LOOKBACK
+            or self.meta_rebalance != META_REBALANCE
+            or self.meta_count != META_COUNT
+            or self.meta_score_source != META_SCORE_SOURCE
+        ):
+            raise ValueError("execution-aligned meta policy is frozen")
 
     def weight_history(
         self,
@@ -150,7 +193,7 @@ class ExecutionAlignedAggressivePolicy:
         for template_id, template in zip(self.template_ids, _EXECUTION_TEMPLATES):
             weights = _template_weight_path(returns, template)
             paths[template_id] = weights
-            streams[template_id] = _execution_proxy_stream(
+            streams[template_id] = _intraday_proxy_stream(
                 open_prices,
                 close,
                 weights,
