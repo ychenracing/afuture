@@ -7,9 +7,10 @@ from .engine import TradingEngine
 from .models import Order, RuntimeMode, Tick, Trade
 
 
+_DAILY_CIRCUIT_REASON = "daily loss limit reached"
 _ACCOUNT_RISK_REASONS = {
     "equity is not positive",
-    "daily loss limit reached",
+    _DAILY_CIRCUIT_REASON,
     "drawdown limit reached",
     "margin ratio limit reached",
     "available cash reserve too low",
@@ -23,10 +24,21 @@ class DirectionalTradingEngine(TradingEngine):
         super().__init__(*args, **kwargs)
         self.directional_manager = directional_manager
         self._directional_initialized = False
+        setter = getattr(
+            self.directional_manager,
+            "set_completed_return_provider",
+            None,
+        )
+        if callable(setter):
+            setter(lambda: tuple(self.state.recent_daily_returns))
 
     def initialize_after_ready(self) -> None:
         super().initialize_after_ready()
-        if not self._initialized or self.halted or self._directional_initialized:
+        if not self._initialized:
+            return
+        if self.halted:
+            self._try_daily_circuit_recovery(self.broker.get_account())
+        if self.halted or self._directional_initialized:
             return
         try:
             self.directional_manager.bootstrap(self._reference_now())
@@ -80,6 +92,20 @@ class DirectionalTradingEngine(TradingEngine):
             self.emergency_stop(f"directional rebalance failed: {exc}")
 
     def emergency_stop(self, reason: str) -> None:
+        if reason == _DAILY_CIRCUIT_REASON:
+            circuit_day = str(self.state.trading_day or "")
+            if not circuit_day:
+                try:
+                    circuit_day = str(self.broker.get_account().trading_day or "")
+                except Exception:
+                    circuit_day = ""
+            self.state.directional_daily_circuit_day = circuit_day
+        else:
+            # Any reason other than the known recoverable daily circuit invalidates
+            # automatic recovery. Total drawdown, margin/cash and infrastructure faults
+            # therefore remain manual/fail-closed halts.
+            self.state.directional_daily_circuit_day = ""
+
         if (
             reason in _ACCOUNT_RISK_REASONS
             and hasattr(self, "directional_manager")
@@ -88,6 +114,72 @@ class DirectionalTradingEngine(TradingEngine):
             self.enter_reduce_only(reason)
             return
         super().emergency_stop(reason)
+
+    def _try_daily_circuit_recovery(self, account) -> bool:
+        marker = str(self.state.directional_daily_circuit_day or "")
+        current_day = str(getattr(account, "trading_day", "") or "")
+        if not marker or not current_day or current_day == marker:
+            return False
+        if not self.halted or self.state.runtime_mode != RuntimeMode.HALTED.value:
+            return False
+        if not self.broker.is_ready() or self.broker.get_active_orders():
+            return False
+        if self.directional_manager.has_risk():
+            return False
+        if not self._metadata_verified_session or not self.state.metadata_verified:
+            return False
+
+        decision = self.risk_manager.check_account(account)
+        self.state.equity_high_watermark = self.risk_manager.high_watermark
+        if not decision.allowed:
+            self.emergency_stop(decision.reason)
+            return False
+        if not self.reconcile_startup():
+            return False
+        if not self.state_store.can_clear_kill_switch(self.state):
+            return False
+
+        self.state.kill_switch = False
+        self.state.kill_reason = ""
+        self.state.runtime_mode = RuntimeMode.RUNNING.value
+        self.state.reduce_reason = ""
+        self.state.directional_daily_circuit_day = ""
+        self.halted = False
+        self._persist()
+        return True
+
+    def _handle_account_event(self, account) -> None:
+        super()._handle_account_event(account)
+        if self.halted and self.state.directional_daily_circuit_day:
+            self._try_daily_circuit_recovery(account)
+
+    def _advance_trading_day(self, account) -> None:
+        old_day = str(self.state.trading_day or "")
+        new_day = str(getattr(account, "trading_day", "") or "")
+        old_day_start = float(self.state.day_start_equity or 0.0)
+        old_last_day = str(self.state.last_account_trading_day or "")
+        old_last_equity = float(self.state.last_account_equity or 0.0)
+
+        if (
+            new_day
+            and old_day
+            and new_day != old_day
+            and old_last_day == old_day
+            and old_day_start > 0
+            and old_last_equity > 0
+        ):
+            completed_return = old_last_equity / old_day_start - 1.0
+            values = [
+                float(value)
+                for value in self.state.recent_daily_returns[-1:]
+            ]
+            values.append(float(completed_return))
+            self.state.recent_daily_returns = values[-2:]
+
+        super()._advance_trading_day(account)
+        if new_day:
+            self.state.last_account_equity = float(account.equity)
+            self.state.last_account_trading_day = new_day
 
     def _capture_quality_trade(self, trade: Trade) -> None:
         # Directional expectations are registered at submission time. They are enough to
