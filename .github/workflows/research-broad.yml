@@ -1,0 +1,66 @@
+name: research-broad
+
+# Independent L3 breadth screen. It deliberately does not fetch the expensive
+# specific-contract 60-minute evidence used by research-2y.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "tools/fetch_broad_daily_universe.py"
+      - "tools/evaluate_broad_relative_families.py"
+      - "tools/test_broad_relative_families.py"
+      - ".github/workflows/research-broad.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: research-broad-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  broad-screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install akshare pandas
+      - name: Verify broad research causality and risk calibration
+        run: python tools/test_broad_relative_families.py
+      - name: Fetch broad continuous daily factor universe
+        run: python tools/fetch_broad_daily_universe.py
+      - name: Screen market-neutral relative-value families
+        run: |
+          python tools/evaluate_broad_relative_families.py
+          python - <<'PY'
+          import json
+          report = json.load(open("runtime/broad_relative_family_report.json", encoding="utf-8"))
+          assert report["candidate_count"] == 16
+          assert report["coverage"]["products"] >= 20
+          assert report["pristine_final_oos"] is False
+          assert report["historical_l1_available"] is False
+          assert "target_met" in report["target"]
+          print(json.dumps({
+              "coverage": report["coverage"],
+              "prior_selected": report["prior_selected"],
+              "current_selected": report["current_selected"],
+              "prior_forward_train": report["prior_forward_train"],
+              "selected_leverage": report["selected_leverage"],
+              "selected_stress": report["selected_stress"],
+              "target": report["target"],
+          }, ensure_ascii=False, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: broad-relative-value-evidence
+          path: |
+            runtime/broad_daily_universe.csv
+            runtime/broad_daily_universe_summary.csv
+            runtime/broad_daily_universe_failures.txt
+            runtime/broad_relative_family_report.json
+          retention-days: 14
