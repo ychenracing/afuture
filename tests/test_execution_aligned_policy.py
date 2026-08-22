@@ -1,0 +1,55 @@
+import numpy as np
+import pandas as pd
+
+from afuture.execution_aligned_policy import ExecutionAlignedAggressivePolicy
+
+
+def _history(periods: int = 220):
+    dates = pd.date_range("2025-01-01", periods=periods, freq="B")
+    close = pd.DataFrame(
+        {
+            "A": 100 * np.cumprod([1.006 if i % 7 else 0.98 for i in range(periods)]),
+            "M": 100 * np.cumprod([0.996 if i % 5 else 1.018 for i in range(periods)]),
+            "RB": 100 * np.cumprod([1.004 if i % 4 else 0.985 for i in range(periods)]),
+            "CU": 100 * np.cumprod([0.997 if i % 6 else 1.016 for i in range(periods)]),
+        },
+        index=dates,
+    )
+    overnight = np.where(np.arange(periods) % 3 == 0, 1.004, 0.998)
+    open_prices = close.shift(1).mul(overnight, axis=0)
+    open_prices.iloc[0] = close.iloc[0]
+    return open_prices, close
+
+
+def test_execution_aligned_policy_is_causal_and_capped_at_two_x():
+    open_prices, close = _history()
+    policy = ExecutionAlignedAggressivePolicy(products=tuple(close.columns))
+    weights = policy.weight_history(open_prices, close)
+    assert float(weights.abs().sum(axis=1).max()) <= 2.0 + 1e-12
+
+    changed_open = open_prices.copy()
+    changed_close = close.copy()
+    changed_open.iloc[-1] *= [2.0, 0.5, 1.8, 0.6]
+    changed_close.iloc[-1] *= [3.0, 0.4, 2.5, 0.5]
+    changed = policy.weight_history(changed_open, changed_close)
+    pd.testing.assert_series_equal(weights.iloc[-1], changed.iloc[-1])
+
+
+def test_execution_aligned_policy_uses_frozen_meta_shape():
+    policy = ExecutionAlignedAggressivePolicy(products=("A", "M"))
+    assert policy.meta_lookback == 5
+    assert policy.meta_rebalance == 10
+    assert policy.meta_count == 4
+    assert len(policy.template_ids) == 64
+
+
+def test_execution_proxy_changes_meta_evidence_without_future_leakage():
+    open_prices, close = _history()
+    policy = ExecutionAlignedAggressivePolicy(products=tuple(close.columns))
+    baseline = policy.weight_history(open_prices, close)
+
+    altered_open = open_prices.copy()
+    altered_open.iloc[-30:-1] = altered_open.iloc[-30:-1] * 1.03
+    altered = policy.weight_history(altered_open, close)
+    # Historical opens are legitimate past execution evidence and may change later targets.
+    assert not baseline.iloc[-1].equals(altered.iloc[-1])
