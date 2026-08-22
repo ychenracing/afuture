@@ -5,6 +5,11 @@ keeps the exact frozen weights but adds integer lots, contract multipliers, prev
 activity selection, contract roll semantics, account drawdown/daily-loss behavior and an
 explicit margin proxy. It never searches parameters and does not claim historical broker
 margin schedules are known.
+
+Each published reporting window is an independent account experiment: the frozen signal
+path is unchanged, while account equity, positions, margin state and high-watermark reset
+to the configured initial capital/flat state at that window's first day. This prevents a
+Kill Switch in an earlier regime from contaminating a later standalone window.
 """
 from __future__ import annotations
 
@@ -82,23 +87,13 @@ def _metrics(values: pd.Series) -> dict:
     }
 
 
-def _window_metrics(series: pd.Series, name: str) -> dict:
-    start, end = WINDOWS[name]
-    return _metrics(series.loc[pd.Timestamp(start) : pd.Timestamp(end)])
-
-
-def _simulation_report(
-    result: ProductionSimulationResult,
-    *,
-    cost_bps: float,
-    margin_rate_proxy: float,
-) -> dict:
+def _result_stats(result: ProductionSimulationResult) -> dict:
     returns = (
         result.daily["daily_return"].astype(float)
         if not result.daily.empty
         else pd.Series(dtype=float)
     )
-    windows = {name: _window_metrics(returns, name) for name in WINDOWS}
+    stats = _metrics(returns)
     margin_reject_days = (
         int((result.daily["margin_reject"].astype(str) != "").sum())
         if not result.daily.empty
@@ -116,17 +111,75 @@ def _simulation_report(
         ratio = ratio.replace([float("inf"), -float("inf")], pd.NA).dropna()
         max_gross_ratio = float(ratio.max()) if not ratio.empty else 0.0
     return {
-        "cost_bps": float(cost_bps),
-        "margin_rate_proxy": float(margin_rate_proxy),
-        "margin_estimate_buffer": 1.25,
-        "initial_capital": INITIAL_CAPITAL,
+        **stats,
         "final_equity": float(result.final_equity),
         "first_divergence": str(result.first_divergence),
         "halted": halted,
         "margin_reject_days": margin_reject_days,
         "max_realized_gross_notional_ratio": max_gross_ratio,
-        "windows": windows,
     }
+
+
+def _simulation_report(
+    simulator: DirectionalProductionAcceptance,
+    specific_raw: pd.DataFrame,
+    weights: pd.DataFrame,
+    *,
+    cost_bps: float,
+    margin_rate_proxy: float,
+) -> tuple[dict, pd.DataFrame]:
+    windows: dict[str, dict] = {}
+    daily_by_window: dict[str, pd.DataFrame] = {}
+    for name, (start, end) in WINDOWS.items():
+        window_weights = weights.loc[
+            pd.Timestamp(start) : pd.Timestamp(end)
+        ].copy()
+        result = simulator.simulate(
+            specific_raw,
+            window_weights,
+            cost_bps=cost_bps,
+        )
+        windows[name] = _result_stats(result)
+        daily_by_window[name] = result.daily.copy()
+
+    if "full_recent" in windows:
+        principal_name = "full_recent"
+    elif windows:
+        principal_name = next(reversed(windows))
+    else:
+        principal_name = ""
+
+    principal = windows.get(
+        principal_name,
+        {
+            "final_equity": INITIAL_CAPITAL,
+            "first_divergence": "",
+            "halted": False,
+            "margin_reject_days": 0,
+            "max_realized_gross_notional_ratio": 0.0,
+        },
+    )
+    principal_daily = daily_by_window.get(principal_name, pd.DataFrame())
+    return (
+        {
+            "cost_bps": float(cost_bps),
+            "margin_rate_proxy": float(margin_rate_proxy),
+            "margin_estimate_buffer": 1.25,
+            "initial_capital": INITIAL_CAPITAL,
+            "state_reset_per_window": True,
+            "window_account_semantics": "independent_initial_capital_flat_start",
+            "principal_window": principal_name,
+            "final_equity": float(principal["final_equity"]),
+            "first_divergence": str(principal["first_divergence"]),
+            "halted": bool(principal["halted"]),
+            "margin_reject_days": int(principal["margin_reject_days"]),
+            "max_realized_gross_notional_ratio": float(
+                principal["max_realized_gross_notional_ratio"]
+            ),
+            "windows": windows,
+        },
+        principal_daily,
+    )
 
 
 def evaluate_with_weights(
@@ -147,17 +200,17 @@ def evaluate_with_weights(
             margin_rate_proxy=STRESS_MARGIN_PROXY,
         )
     )
-    base_result = base_sim.simulate(
-        specific_raw, weights, cost_bps=BASE_COST_BPS
+    base, base_daily = _simulation_report(
+        base_sim,
+        specific_raw,
+        weights,
+        cost_bps=BASE_COST_BPS,
+        margin_rate_proxy=BASE_MARGIN_PROXY,
     )
-    stress_result = stress_sim.simulate(
-        specific_raw, weights, cost_bps=STRESS_COST_BPS
-    )
-    base = _simulation_report(
-        base_result, cost_bps=BASE_COST_BPS, margin_rate_proxy=BASE_MARGIN_PROXY
-    )
-    stress = _simulation_report(
-        stress_result,
+    stress, stress_daily = _simulation_report(
+        stress_sim,
+        specific_raw,
+        weights,
         cost_bps=STRESS_COST_BPS,
         margin_rate_proxy=STRESS_MARGIN_PROXY,
     )
@@ -173,8 +226,11 @@ def evaluate_with_weights(
                     proxy["annualized_return"]
                 ),
                 "annualized_return_delta": float(
-                    proxy["annualized_return"] - historical["annualized_return"]
+                    proxy["annualized_return"]
+                    - historical["annualized_return"]
                 ),
+                "float_total_return": float(historical["total_return"]),
+                "production_proxy_total_return": float(proxy["total_return"]),
                 "float_max_drawdown": float(historical["max_drawdown"]),
                 "production_proxy_max_drawdown": float(proxy["max_drawdown"]),
                 "max_drawdown_delta": float(
@@ -187,6 +243,7 @@ def evaluate_with_weights(
         "selection_frozen": True,
         "parameter_search": False,
         "margin_is_historical_truth": False,
+        "state_reset_per_window": True,
         "mechanics": {
             "integer_lots": True,
             "frozen_contract_multipliers": True,
@@ -194,7 +251,10 @@ def evaluate_with_weights(
             "reduction_before_open": True,
             "daily_loss_gate": True,
             "high_watermark_drawdown_gate": True,
+            "current_margin_gate": True,
+            "available_cash_gate": True,
             "permanent_halt_after_risk_breach": True,
+            "state_reset_per_window": True,
         },
         "base": base,
         "stress": stress,
@@ -203,9 +263,10 @@ def evaluate_with_weights(
             "historical daily L1 bid/ask/depth and partial fills are unavailable",
             "margin uses an explicit proxy rather than historical broker schedules",
             "daily bars cannot identify the exact intraday instant at which an account risk gate would fire",
+            "each published window resets account state to initial capital and flat positions; first-day prior holdings are not inherited",
         ],
-        "_base_daily": base_result.daily,
-        "_stress_daily": stress_result.daily,
+        "_base_daily": base_daily,
+        "_stress_daily": stress_daily,
     }
 
 
@@ -214,13 +275,19 @@ def evaluate(specific_raw: pd.DataFrame, continuous_raw: pd.DataFrame) -> dict:
     # Unit tests for mechanics therefore need only the package's normal dev dependencies.
     import evaluate_execution_aligned_target as float_l4
 
+    # The policy weights are generated once from the full frozen history and are never
+    # re-fit by reporting window. Only account state is reset per standalone experiment.
     weights = float_l4.generate_execution_signal_weights(continuous_raw)
     historical = float_l4.evaluate(specific_raw, continuous_raw)
     return evaluate_with_weights(specific_raw, weights, float_report=historical)
 
 
 def _jsonable(report: dict) -> dict:
-    return {key: value for key, value in report.items() if not key.startswith("_")}
+    return {
+        key: value
+        for key, value in report.items()
+        if not key.startswith("_")
+    }
 
 
 def main() -> None:
@@ -233,8 +300,13 @@ def main() -> None:
         if not path.exists()
     ]
     if missing:
-        raise SystemExit(f"directional production mechanics inputs missing: {missing}")
-    report = evaluate(pd.read_csv(specific_path), pd.read_csv(continuous_path))
+        raise SystemExit(
+            f"directional production mechanics inputs missing: {missing}"
+        )
+    report = evaluate(
+        pd.read_csv(specific_path),
+        pd.read_csv(continuous_path),
+    )
     report["_base_daily"].to_csv(
         runtime / "directional_production_base_daily.csv"
     )
@@ -243,7 +315,12 @@ def main() -> None:
     )
     output = runtime / "directional_production_mechanics_report.json"
     output.write_text(
-        json.dumps(_jsonable(report), ensure_ascii=False, indent=2, sort_keys=True),
+        json.dumps(
+            _jsonable(report),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ),
         encoding="utf-8",
     )
     print(json.dumps(_jsonable(report), ensure_ascii=False, indent=2))
