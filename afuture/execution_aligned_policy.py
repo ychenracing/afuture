@@ -3,9 +3,8 @@
 The template pool was selected on the already-observed 2024-08-21..2026-08-20
 specific-contract next-open history. Daily live rotation remains causal: each template
 signal uses the previous close and the meta allocator ranks templates only from completed
-continuous-contract open->close returns. Ignoring continuous overnight gaps prevents roll
-jumps in the signal feed from becoming meta-performance evidence. Gross notional is
-capped at 2x before the shared account/margin/microstructure gates apply.
+continuous-contract open->close returns. Product ordering is frozen alphabetically so
+stable ranking ties cannot change the strategy. Gross notional is capped at 2x.
 """
 from __future__ import annotations
 
@@ -132,7 +131,7 @@ _EXECUTION_TEMPLATES = tuple(_parse_template_id(item) for item in _EXECUTION_TEM
 def _clean_prices(frame: pd.DataFrame, products: tuple[str, ...]) -> pd.DataFrame:
     result = frame.copy()
     result.columns = [str(item).upper() for item in result.columns]
-    requested = [str(item).upper() for item in products]
+    requested = sorted({str(item).upper() for item in products})
     missing = sorted(set(requested) - set(result.columns))
     if missing:
         raise ValueError(f"directional OHLC history missing products: {missing}")
@@ -213,9 +212,9 @@ class ExecutionAlignedAggressivePolicy:
                 selected = (
                     [
                         int(item)
-                        for item in valid[np.argsort(-row[valid], kind="stable")][
-                            : self.meta_count
-                        ]
+                        for item in valid[
+                            np.argsort(-row[valid], kind="stable")
+                        ][: self.meta_count]
                     ]
                     if valid.size
                     else []
