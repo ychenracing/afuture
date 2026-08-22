@@ -1,21 +1,15 @@
 name: research-return-target
 
+# Expensive L3 milestone gate. The 2026-08-22 return-target evidence is frozen;
+# rerun manually only after a material change to the research methodology or universe.
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - "tools/evaluate_return_target_portfolio.py"
-      - "tools/test_return_target_portfolio.py"
-      - "tools/evaluate_aggressive_directional.py"
-      - "tools/test_aggressive_directional.py"
-      - "tools/fetch_broad_daily_universe.py"
-      - ".github/workflows/research-return-target.yml"
 
 permissions:
   contents: read
 
 concurrency:
-  group: research-return-target-${{ github.event.pull_request.number || github.ref }}
+  group: research-return-target-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
