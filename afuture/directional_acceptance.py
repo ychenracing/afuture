@@ -184,15 +184,22 @@ class DirectionalProductionAcceptance:
         equity: float,
         day_start_equity: float,
         high_watermark: float,
+        margin: float = 0.0,
     ) -> str:
         if equity <= 0 or day_start_equity <= 0 or high_watermark <= 0:
             return "equity is not positive"
         daily_loss = max(0.0, day_start_equity - equity) / day_start_equity
         drawdown = max(0.0, high_watermark - equity) / high_watermark
+        margin_ratio = max(0.0, float(margin)) / equity
+        available_ratio = (equity - max(0.0, float(margin))) / equity
         if daily_loss + 1e-12 >= self.config.max_daily_loss_ratio:
             return "daily loss limit reached"
         if drawdown + 1e-12 >= self.config.max_total_drawdown_ratio:
             return "drawdown limit reached"
+        if margin_ratio > self.config.max_margin_ratio:
+            return "margin ratio limit reached"
+        if available_ratio < self.config.min_available_ratio:
+            return "available cash reserve too low"
         return ""
 
     @staticmethod
@@ -210,14 +217,8 @@ class DirectionalProductionAcceptance:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
         frame = frame.dropna(
             subset=[
-                "date",
-                "delivery",
-                "product",
-                "symbol",
-                "open",
-                "close",
-                "volume",
-                "hold",
+                "date", "delivery", "product", "symbol",
+                "open", "close", "volume", "hold",
             ]
         )
         return frame[
@@ -353,16 +354,13 @@ class DirectionalProductionAcceptance:
                 )
                 continue
 
-            # Existing contracts earn their own prior-close -> current-open gap.
             open_prices: dict[str, float] = {}
             close_prices: dict[str, float] = {}
             missing_existing = False
             for symbol, volume in list(lots.items()):
                 row = by_day_symbol.get((day, symbol))
                 if row is None or symbol not in previous_close:
-                    risk_reason = (
-                        f"missing same-contract next price: {symbol}"
-                    )
+                    risk_reason = f"missing same-contract next price: {symbol}"
                     first_divergence = first_divergence or risk_reason
                     missing_existing = True
                     break
@@ -372,9 +370,7 @@ class DirectionalProductionAcceptance:
                 close_prices[symbol] = close_price
                 equity += (
                     open_price - float(previous_close[symbol])
-                ) * int(volume) * PRODUCT_MULTIPLIERS[
-                    self._product(symbol)
-                ]
+                ) * int(volume) * PRODUCT_MULTIPLIERS[self._product(symbol)]
             if missing_existing:
                 halted = True
                 output_rows.append(
@@ -392,21 +388,20 @@ class DirectionalProductionAcceptance:
                 )
                 continue
 
-            # The production day-start baseline precedes the session's price move.
-            # Therefore the overnight gap counts against the daily-loss limit.
+            # Production observes account equity/margin at the session open before
+            # normal target rebalance. A favorable gap also establishes a new HWM.
+            high_watermark = max(high_watermark, equity)
+            current_margin = self._margin(lots, open_prices) if lots else 0.0
             risk_reason = self.account_risk_reason(
                 equity=equity,
                 day_start_equity=day_start_equity,
                 high_watermark=high_watermark,
+                margin=current_margin,
             )
             if risk_reason and lots:
                 first_divergence = first_divergence or risk_reason
-                closing = {
-                    symbol: -volume for symbol, volume in lots.items()
-                }
-                close_turnover = self._turnover(
-                    closing, open_prices
-                )
+                closing = {symbol: -volume for symbol, volume in lots.items()}
+                close_turnover = self._turnover(closing, open_prices)
                 turnover_notional += close_turnover
                 equity -= close_turnover * cost_rate
                 lots.clear()
@@ -440,12 +435,7 @@ class DirectionalProductionAcceptance:
                     for product, value in product_weights.items()
                     if abs(value) > 1e-15
                 }
-                unavailable_products = (
-                    required_products - set(selected_symbols)
-                )
-                # Match live semantics: a non-zero target with no executable
-                # next contract cannot add/roll risk, but it also cannot turn an
-                # existing same-product position into an artificial target=0.
+                unavailable_products = required_products - set(selected_symbols)
                 for symbol, volume in lots.items():
                     if self._product(symbol) in unavailable_products:
                         target[symbol] = int(volume)
@@ -483,45 +473,34 @@ class DirectionalProductionAcceptance:
                         equity -= opening_turnover * cost_rate
                         self._apply_deltas(lots, phase.openings)
                     else:
-                        first_divergence = (
-                            first_divergence or margin_reject
-                        )
+                        first_divergence = first_divergence or margin_reject
 
                 intraday_pnl = 0.0
                 for symbol, volume in lots.items():
-                    if (
-                        symbol not in open_prices
-                        or symbol not in close_prices
-                    ):
+                    if symbol not in open_prices or symbol not in close_prices:
                         continue
                     intraday_pnl += (
                         close_prices[symbol] - open_prices[symbol]
-                    ) * int(volume) * PRODUCT_MULTIPLIERS[
-                        self._product(symbol)
-                    ]
+                    ) * int(volume) * PRODUCT_MULTIPLIERS[self._product(symbol)]
                 equity += intraday_pnl
                 high_watermark = max(high_watermark, equity)
+                close_margin = self._margin(lots, close_prices) if lots else 0.0
                 risk_reason = self.account_risk_reason(
                     equity=equity,
                     day_start_equity=day_start_equity,
                     high_watermark=high_watermark,
+                    margin=close_margin,
                 )
                 if risk_reason and lots:
                     first_divergence = first_divergence or risk_reason
-                    close_turnover = self._turnover(
-                        lots, close_prices
-                    )
+                    close_turnover = self._turnover(lots, close_prices)
                     turnover_notional += close_turnover
                     equity -= close_turnover * cost_rate
                     lots.clear()
                     halted = True
 
-            valuation_prices = (
-                close_prices if close_prices else open_prices
-            )
-            margin = (
-                self._margin(lots, valuation_prices) if lots else 0.0
-            )
+            valuation_prices = close_prices if close_prices else open_prices
+            margin = self._margin(lots, valuation_prices) if lots else 0.0
             gross_notional = float(
                 sum(
                     abs(int(volume))
@@ -553,14 +532,9 @@ class DirectionalProductionAcceptance:
         if daily.empty:
             daily = pd.DataFrame(
                 columns=[
-                    "equity",
-                    "daily_return",
-                    "turnover_notional",
-                    "gross_notional",
-                    "margin",
-                    "risk_reason",
-                    "margin_reject",
-                    "halted",
+                    "equity", "daily_return", "turnover_notional",
+                    "gross_notional", "margin", "risk_reason",
+                    "margin_reject", "halted",
                 ]
             )
         else:
