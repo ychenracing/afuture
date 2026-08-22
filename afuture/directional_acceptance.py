@@ -194,14 +194,17 @@ class DirectionalProductionAcceptance:
         drawdown = max(0.0, high_watermark - equity) / high_watermark
         margin_ratio = max(0.0, float(margin)) / equity
         available_ratio = (equity - max(0.0, float(margin))) / equity
-        if daily_loss + 1e-12 >= self.config.max_daily_loss_ratio:
-            return "daily loss limit reached"
+        # Hard account solvency/risk gates outrank the recoverable daily circuit.
+        # Otherwise a large one-day loss could mask a simultaneous total-drawdown or
+        # margin breach and incorrectly make the account eligible to auto-recover.
         if drawdown + 1e-12 >= self.config.max_total_drawdown_ratio:
             return "drawdown limit reached"
         if margin_ratio > self.config.max_margin_ratio:
             return "margin ratio limit reached"
         if available_ratio < self.config.min_available_ratio:
             return "available cash reserve too low"
+        if daily_loss + 1e-12 >= self.config.max_daily_loss_ratio:
+            return "daily loss limit reached"
         return ""
 
     @staticmethod
