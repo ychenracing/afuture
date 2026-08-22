@@ -92,18 +92,20 @@ costed = base.apply_next_open_product_weights(gap, intraday, weights, cost_bps=1
 assert abs((path.iloc[1] - costed.iloc[1]) - 0.001) < 1e-12
 assert abs((path.iloc[2] - costed.iloc[2]) - 0.002) < 1e-12
 
-# Continuous meta evidence uses completed close->open/open->close history.
+# Continuous meta evidence uses completed close->open/open->close history. Keep the
+# synthetic gap below the 20% outlier boundary so floating-point representation cannot
+# accidentally exercise the outlier filter instead of the timing semantics.
 proxy_raw = pd.DataFrame(
     [
         {"date": idx[0], "product": "A", "open": 100.0, "close": 100.0},
         {"date": idx[1], "product": "A", "open": 110.0, "close": 113.3},
-        {"date": idx[2], "product": "A", "open": 135.96, "close": 141.3984},
+        {"date": idx[2], "product": "A", "open": 134.827, "close": 140.22008},
     ]
 )
 proxy_gap, proxy_intraday = evaluator.build_continuous_execution_proxy(proxy_raw, products=("A",))
 assert abs(proxy_gap.loc[idx[1], "A"] - 0.10) < 1e-12
 assert abs(proxy_intraday.loc[idx[1], "A"] - 0.03) < 1e-12
-assert abs(proxy_gap.loc[idx[2], "A"] - 0.20) < 1e-12
+assert abs(proxy_gap.loc[idx[2], "A"] - 0.19) < 1e-12
 assert abs(proxy_intraday.loc[idx[2], "A"] - 0.04) < 1e-12
 assert evaluator.PRISTINE_FINAL_OOS is False
 
