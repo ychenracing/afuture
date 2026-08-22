@@ -4,10 +4,10 @@ import pandas as pd
 import pytest
 
 from afuture.directional import DirectionalConfig
-from afuture.execution_aligned_policy import FROZEN_PRODUCTS
 from afuture.execution_aligned_runtime import (
     ExecutionAlignedDirectionalPortfolioManager,
     ExecutionAlignedSignalHistory,
+    FROZEN_PRODUCTS,
 )
 from afuture.models import AccountSnapshot
 from afuture.risk import RiskConfig, RiskManager
