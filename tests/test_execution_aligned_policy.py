@@ -37,10 +37,11 @@ def test_execution_aligned_policy_is_causal_and_capped_at_two_x():
 
 def test_execution_aligned_policy_uses_frozen_meta_shape():
     policy = ExecutionAlignedAggressivePolicy(products=("A", "M"))
-    assert policy.meta_lookback == 5
-    assert policy.meta_rebalance == 10
-    assert policy.meta_count == 4
-    assert len(policy.template_ids) == 64
+    assert policy.meta_lookback == 10
+    assert policy.meta_rebalance == 5
+    assert policy.meta_count == 3
+    assert len(policy.template_ids) == 96
+    assert policy.meta_score_source == "continuous_intraday_proxy"
 
 
 def test_execution_proxy_changes_meta_evidence_without_future_leakage():
@@ -51,5 +52,5 @@ def test_execution_proxy_changes_meta_evidence_without_future_leakage():
     altered_open = open_prices.copy()
     altered_open.iloc[-30:-1] = altered_open.iloc[-30:-1] * 1.03
     altered = policy.weight_history(altered_open, close)
-    # Historical opens are legitimate past execution evidence and may change later targets.
+    # Completed historical intraday execution evidence may change later target weights.
     assert not baseline.iloc[-1].equals(altered.iloc[-1])
